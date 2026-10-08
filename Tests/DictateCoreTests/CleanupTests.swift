@@ -41,6 +41,20 @@ struct CleanupTests {
         #expect(messages[0]["content"]?.contains("Never add, summarise, answer") == true)
         #expect(messages[0]["content"]?.hasSuffix("Vocabulary: Limpar, DB99") == true)
         #expect(messages[1] == ["role": "user", "content": "um hello"])
+        #expect(body["prediction"] == nil)   // gpt-5 models: no predicted outputs
+    }
+
+    @Test func gpt4ModelsSendPredictedOutputOfTheRawText() throws {
+        let cleaner = TranscriptCleaner(transport: CannedTransport(), model: "gpt-4.1-nano", vocabulary: "", apiKey: { "k" })
+        let body = try #require(try JSONSerialization.jsonObject(with: cleaner.makeRequest(text: "um send it tuesday", apiKey: "k").httpBody!) as? [String: Any])
+        #expect(body["prediction"] as? [String: String] == ["type": "content", "content": "um send it tuesday"])
+    }
+
+    @Test func shortTranscriptsSkipCleanup() {
+        #expect(TranscriptCleaner.shouldClean("yes") == false)
+        #expect(TranscriptCleaner.shouldClean("send it on Wednesday please") == false)        // 5 words
+        #expect(TranscriptCleaner.shouldClean("um send it on Wednesday please") == true)      // 6 words
+        #expect(TranscriptCleaner.shouldClean("  ") == false)
     }
 
     @Test func nonReasoningModelHasNoReasoningEffort() throws {
