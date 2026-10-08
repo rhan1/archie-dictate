@@ -2,6 +2,31 @@ import Foundation
 
 public protocol HTTPTransport: Sendable {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+    /// Same as `send`, plus ms from request start to the response's first
+    /// byte when the transport can measure it.
+    func sendTimed(_ request: URLRequest) async throws -> (Data, HTTPURLResponse, Int?)
+}
+
+extension HTTPTransport {
+    public func sendTimed(_ request: URLRequest) async throws -> (Data, HTTPURLResponse, Int?) {
+        let (data, response) = try await send(request)
+        return (data, response, nil)
+    }
+}
+
+/// Collects URLSessionTaskMetrics for one task.
+final class MetricsCollector: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var metrics: URLSessionTaskMetrics?
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        lock.withLock { self.metrics = metrics }
+    }
+    var firstByteMs: Int? {
+        lock.withLock {
+            guard let t = metrics?.transactionMetrics.last, let start = t.fetchStartDate, let first = t.responseStartDate else { return nil }
+            return Int(first.timeIntervalSince(start) * 1000)
+        }
+    }
 }
 
 public struct URLSessionTransport: HTTPTransport {
@@ -22,6 +47,15 @@ public struct URLSessionTransport: HTTPTransport {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         return (data, http)
+    }
+
+    public func sendTimed(_ request: URLRequest) async throws -> (Data, HTTPURLResponse, Int?) {
+        let collector = MetricsCollector()
+        let (data, response) = try await session.data(for: request, delegate: collector)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        // didFinishCollecting can land just after data(for:) returns.
+        for _ in 0..<20 where collector.firstByteMs == nil { try? await Task.sleep(nanoseconds: 1_000_000) }
+        return (data, http, collector.firstByteMs)
     }
 }
 

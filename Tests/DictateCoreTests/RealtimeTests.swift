@@ -38,7 +38,7 @@ private let quiet = [Int16](repeating: 0, count: 2_400)        // 100 ms, silent
 @Suite("Realtime")
 struct RealtimeTests {
     @Test func sessionUpdateShape() throws {
-        let json = try #require(try JSONSerialization.jsonObject(with: Data(RealtimeTranscriber.sessionUpdate(prompt: "Limpar, DB99").utf8)) as? [String: Any])
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(RealtimeTranscriber.sessionUpdate().utf8)) as? [String: Any])
         #expect(json["type"] as? String == "session.update")
         let session = try #require(json["session"] as? [String: Any])
         #expect(session["type"] as? String == "transcription")
@@ -49,7 +49,7 @@ struct RealtimeTests {
         #expect(format["rate"] as? Int == 24_000)
         let transcription = try #require(input["transcription"] as? [String: Any])
         #expect(transcription["model"] as? String == "gpt-4o-transcribe")
-        #expect(transcription["prompt"] as? String == "Limpar, DB99")
+        #expect(transcription["prompt"] == nil)   // the model echoed it back live (00:27)
         #expect(transcription["language"] as? String == "en")
     }
 
@@ -60,7 +60,7 @@ struct RealtimeTests {
 
     @Test func framesKeepOrderAndFinishJoinsSegments() async throws {
         let socket = FakeSocket()
-        let rt = RealtimeTranscriber(transport: socket, prompt: "", apiKey: { "k" })
+        let rt = RealtimeTranscriber(transport: socket, apiKey: { "k" })
         // Audio queued BEFORE the socket opens must still be sent, in order, after session.update.
         rt.append(speech)
         try await rt.open()
@@ -84,7 +84,7 @@ struct RealtimeTests {
 
     @Test func quietTailIsNotCommitted() async throws {
         let socket = FakeSocket()
-        let rt = RealtimeTranscriber(transport: socket, prompt: "", apiKey: { "k" })
+        let rt = RealtimeTranscriber(transport: socket, apiKey: { "k" })
         try await rt.open()
         for _ in 0..<12 { rt.append(speech) }
         for _ in 0..<5 { rt.append(quiet) }          // segment commit, then a silent tail
@@ -98,7 +98,7 @@ struct RealtimeTests {
 
     @Test func serverErrorFailsFinish() async throws {
         let socket = FakeSocket()
-        let rt = RealtimeTranscriber(transport: socket, prompt: "", apiKey: { "k" })
+        let rt = RealtimeTranscriber(transport: socket, apiKey: { "k" })
         try await rt.open()
         rt.append(speech)
         let finishing = Task { try await rt.finish(timeout: 2) }
@@ -110,24 +110,24 @@ struct RealtimeTests {
     @Test func openTimesOutWhenHandshakeIsSlow() async {
         let socket = FakeSocket()
         socket.connectDelay = 0.5
-        let rt = RealtimeTranscriber(transport: socket, prompt: "", apiKey: { "k" })
+        let rt = RealtimeTranscriber(transport: socket, apiKey: { "k" })
         await #expect(throws: RealtimeError.timeout) { try await rt.open(timeout: 0.1) }
         #expect(rt.hasFailed)
     }
 
     @Test func openRejectsUnexpectedFirstFrame() async {
         let socket = FakeSocket(inbox: [#"{"type":"error","error":{"code":"invalid_api_key"}}"#])
-        let rt = RealtimeTranscriber(transport: socket, prompt: "", apiKey: { "k" })
+        let rt = RealtimeTranscriber(transport: socket, apiKey: { "k" })
         await #expect(throws: RealtimeError.connect("error")) { try await rt.open() }
     }
 
     @Test func missingKeyFailsOpen() async {
-        let rt = RealtimeTranscriber(transport: FakeSocket(), prompt: "", apiKey: { throw TranscriptionError.missingKey })
+        let rt = RealtimeTranscriber(transport: FakeSocket(), apiKey: { throw TranscriptionError.missingKey })
         await #expect(throws: RealtimeError.missingKey) { try await rt.open() }
     }
 
     @Test func finishTimesOutWithoutCompletion() async throws {
-        let rt = RealtimeTranscriber(transport: FakeSocket(), prompt: "", apiKey: { "k" })
+        let rt = RealtimeTranscriber(transport: FakeSocket(), apiKey: { "k" })
         try await rt.open()
         rt.append(speech)
         await #expect(throws: RealtimeError.timeout) { try await rt.finish(timeout: 0.1) }
@@ -159,5 +159,26 @@ struct PauseSegmenterTests {
         var s = PauseSegmenter(enabled: false)
         for _ in 0..<12 { _ = s.shouldCommit(after: speech) }
         for _ in 0..<5 { #expect(s.shouldCommit(after: quiet) == false) }
+    }
+}
+
+@Suite("PromptEcho")
+struct PromptEchoTests {
+    let vocab = "Limpar, TurnoutWatch, Raza, Politrace, GrantWatch, DB99, Archie, Jarvis, Codex, agy, Warp, Claude, Fable, Opus, Sonnet"
+
+    @Test func verbatimEchoIsCaught() {
+        #expect(PromptEcho.isEcho(vocab, vocabulary: vocab))
+        #expect(PromptEcho.isEcho("Limpar, TurnoutWatch, Raza, Politrace, GrantWatch, DB99, Archie, Jarvis, Codex, agy, Warp, Claude, Fable, Opus, Sonnet.", vocabulary: vocab))
+    }
+
+    @Test func partialEchoOverSixtyPercentIsCaught() {
+        // 10 of 15 terms (67 %)
+        #expect(PromptEcho.isEcho("Limpar TurnoutWatch Raza Politrace GrantWatch DB99 Archie Jarvis Codex agy", vocabulary: vocab))
+    }
+
+    @Test func realDictationMentioningSomeTermsPasses() {
+        #expect(!PromptEcho.isEcho("Ask Archie and Jarvis whether the Limpar and Politrace runs finished, then ping Raza.", vocabulary: vocab))
+        #expect(!PromptEcho.isEcho("Send it Wednesday.", vocabulary: vocab))
+        #expect(!PromptEcho.isEcho("anything", vocabulary: ""))
     }
 }
