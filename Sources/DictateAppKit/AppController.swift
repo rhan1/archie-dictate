@@ -26,7 +26,7 @@ public final class AppController {
     private var chunked: GroqChunkedTranscriber?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
-    private lazy var capture = CaptureLifecycle(engine: recorder)
+    private lazy var capture = CaptureLifecycle(engine: recorder, scheduler: captureScheduler)
     /// Media keeps playing, muted while recording. Pausing is the fallback
     /// for devices without a settable output mute flag.
     private let muter = OutputMuter(device: SystemOutputMute())
@@ -34,7 +34,6 @@ public final class AppController {
     private var muteWatchdog: DispatchWorkItem?
     private var signalSource: DispatchSourceSignal?
     private var mediaLog: [String] = []
-    private var prewarmExpiry: DispatchWorkItem?
     /// L4 lever: bypasses the network with a fixed transcript.
     private let fakeTranscript = ProcessInfo.processInfo.environment["DICTATE_FAKE_TRANSCRIPT"]
     /// Opt-in QA comparison; the detached Groq request never delays paste.
@@ -46,8 +45,8 @@ public final class AppController {
     private var recordingTarget: InsertionTarget?
     private var lastDictation: String?
     private var lastDictationTimer: Timer?
-    private var capTimer: Timer?
-    private var generation = 0
+    private var generation = CaptureEpoch()
+    private let captureScheduler = CaptureDispatchScheduler()
     private var micStarting = false
     private var micAvailable = false
     private var pillOutcome: PillOutcome?
@@ -97,10 +96,6 @@ public final class AppController {
             self.inserter.insert(text)
         }
         recorder.onLevel = { [weak self] level in self?.pill.push(level: level) }
-        recorder.onFirstBuffer = { [weak self] in
-            guard let self else { return }
-            self.capture.bufferArrived(at: ProcessInfo.processInfo.systemUptime)
-        }
 
         let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         let tapOK = hotkeys.start()
@@ -236,25 +231,28 @@ public final class AppController {
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.capture.firstTapAsync(start: { try await self.recorder.startAsync(device: $0) },
-                isCancelled: { self.generation != token || self.machine.state != .idle })
+                isCancelled: { self.generation !== token || self.machine.state != .idle })
         }
     }
 
     private func configureCapture() {
         capture.note = { AppController.note($0) }
         capture.dropHooks = { [weak self] in self?.recorder.onPCMChunk = nil }
-        capture.cancelExpiry = { [weak self] in
-            self?.prewarmExpiry?.cancel()
-            self?.prewarmExpiry = nil
-        }
-        capture.scheduleExpiry = { [weak self] in
-            guard let self else { return }
-            let work = DispatchWorkItem { [weak self] in
-                guard let self, self.machine.state == .idle else { return }
-                self.capture.end(.prewarmExpired)
+        capture.onEpochChanged = { [weak self] token in
+            self?.recorder.onFirstBuffer = { [weak self] in
+                self?.capture.bufferArrived(at: ProcessInfo.processInfo.systemUptime, epoch: token)
             }
-            self.prewarmExpiry = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + CaptureWarmup.prewarmTimeout, execute: work)
+            self?.recorder.onCaptureFailure = { [weak self] in self?.capture.engineFailed(epoch: token) }
+        }
+        // Also bind the initial prewarm epoch before any recording has begun.
+        capture.onEpochChanged?(capture.epoch)
+        capture.onFailure = { [weak self] in
+            guard let self, self.fakeTranscript == nil else { return }
+            self.fail(reason: "mic_\(self.micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
+        }
+        capture.onMaxDuration = { [weak self] in
+            guard let self else { return }
+            self.perform(self.machine.maxDurationReached())
         }
         capture.onEffect = { [weak self] effect in
             guard let self else { return }
@@ -332,11 +330,17 @@ public final class AppController {
     }
     private func cancel() {
         if pillOutcome != nil { outcomeEvent(.dismissTap) }
-        else { perform(machine.cancel()) }
+        else {
+            if machine.state == .idle { capture.end(.cancel) }
+            perform(machine.cancel())
+        }
     }
     private func escape() {
         if pillOutcome != nil { outcomeEvent(.escape) }
-        else { perform(machine.cancel()) }
+        else {
+            if machine.state == .idle { capture.end(.cancel) }
+            perform(machine.cancel())
+        }
     }
 
     private func perform(_ action: DictationAction) {
@@ -354,7 +358,7 @@ public final class AppController {
         clearOutcome()
         logKeyStates()
         recordingTarget = Self.frontmostTarget()
-        generation += 1
+        generation = CaptureEpoch()
         let token = generation
         recordingStarted = Date()
         micStarting = true
@@ -362,11 +366,11 @@ public final class AppController {
         statusItem.setRecording(true)
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let cancelled = { self.generation != token || self.machine.state != .recording }
+            let cancelled = { self.generation !== token || self.machine.state != .recording }
             let ready = await self.capture.beginRecordingAsync(at: ProcessInfo.processInfo.systemUptime,
                 start: { try await self.recorder.startAsync(device: $0) },
-                rebuild: { await self.recorder.rebuildAsync() },
-                wait: { seconds in try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) },
+                rebuild: { try await self.recorder.rebuildAsync() },
+                wait: { seconds in await self.captureScheduler.wait(seconds) },
                 isCancelled: cancelled)
             guard !cancelled() else { return }
             self.micStarting = false
@@ -378,11 +382,6 @@ public final class AppController {
             self.recorder.resetCapture() // drop all pre-roll, including recovery audio
             self.attachTranscribers()
             self.traceFocus("pill shown")
-            self.capTimer?.invalidate()
-            self.capTimer = Timer.scheduledTimer(withTimeInterval: DictationLimits.maxDuration, repeats: false) { [weak self] _ in
-                guard let self else { return }
-                self.perform(self.machine.maxDurationReached())
-            }
         }
     }
 
@@ -423,7 +422,6 @@ public final class AppController {
             cancelAll()
             return
         }
-        capTimer?.invalidate()
         statusItem.setRecording(false)
         let finishedAt = Date()
         let finishClock = DispatchTime.now()
@@ -528,7 +526,7 @@ public final class AppController {
             let finalTimeline = timeline
             let finalResult = result
             await MainActor.run {
-                guard myGeneration == self.generation, self.machine.state == .transcribing else { return }
+                guard myGeneration === self.generation, self.machine.state == .transcribing else { return }
                 self.machine.transcriptionFinished()
                 let latency = Int(Date().timeIntervalSince(finishedAt) * 1000)
                 let entry = { (chars: Int, app: String, outcome: DictationOutcome) -> DictationLogEntry in
@@ -686,8 +684,7 @@ public final class AppController {
 
     private func cancelAll() {
         micStarting = false
-        capTimer?.invalidate()
-        generation += 1
+        generation = CaptureEpoch()
         statusItem.setRecording(false)
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
         capture.end(.cancel) // discard: nothing is kept
@@ -702,9 +699,7 @@ public final class AppController {
     }
 
     private func fail(reason: String, duration: TimeInterval, bytes: Int, latencyMs: Int) {
-        capTimer?.invalidate()
-        capTimer = nil
-        generation += 1
+        generation = CaptureEpoch()
         micStarting = false
         machine = DictationStateMachine()
         capture.end(.fail)
