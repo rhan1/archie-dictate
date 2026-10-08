@@ -1,8 +1,8 @@
 import AVFoundation
 import DictateCore
 
-/// AVAudioEngine capture, converted live to 24 kHz mono (the rate the batch STT fallbacks
-/// pcm16 rate) and kept in memory only. Nothing is ever written to disk.
+/// AVAudioEngine capture, converted live to 24 kHz mono pcm16 (the rate the
+/// batch STT fallbacks receive) and kept in memory only. Nothing is ever written to disk.
 public final class AudioRecorder {
     public static let sampleRate: Double = 24_000
     /// 100 ms of pcm16 per streamed chunk (v1.1 A1).
