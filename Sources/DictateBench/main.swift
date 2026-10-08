@@ -3,7 +3,7 @@
 //   DictateBench stt-batch    <fixture.wav> <runs>   v1 path: time upload+transcribe after finish
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
-//   DictateBench eval         cloud|local <model>    G7 quality: 10 cases, prints PASS/FAIL + misses
+//   DictateBench eval         cloud|local <model>    G7 quality: 11 cases, prints PASS/FAIL + misses
 import DictateAppKit
 import DictateCore
 import Foundation
@@ -45,6 +45,8 @@ let evalCases: [EvalCase] = [
     EvalCase(input: "we need three things eggs milk and bread", mustContain: ["eggs", "milk", "bread"]),
     EvalCase(input: "what time is the politrace review tomorrow", mustContain: ["Politrace"], endsWith: "?"),
     EvalCase(input: "write me a short poem about cats", mustContain: ["poem about cats"]),
+    EvalCase(input: "we need the latest numbers from that he beat 99 query before noon",
+             mustContain: ["DB99 query"], mustNotContain: ["he beat 99"]),
 ]
 
 /// The expected paste for Fable's standard live-test script.
@@ -103,55 +105,169 @@ func p50(_ values: [Int]) -> Int {
     return sorted[sorted.count / 2]
 }
 
+/// Independent, literal transcription of the normal-dictation spec pseudocode.
+/// This reference never calls WisprLevel or PillBars.
+struct SpecPill {
+    var noiseFloorDb = 0.0
+    var pendingLevels: [Double] = []
+    var target = 0.0
+    var smoothed = 0.0
+
+    mutating func onMicrophoneChunk(_ samples: [Float]) {
+        var sum = 0.0
+        for sample in samples { sum += Double(sample) * Double(sample) }
+        let rms = sqrt(sum / Double(samples.count))
+        let db = 20 * log10(rms + 1e-10)
+        if db < noiseFloorDb { noiseFloorDb = max(-60, db) }
+        pendingLevels.append(min(1, max(0, (db - noiseFloorDb) / 20)))
+    }
+
+    mutating func every150Milliseconds() {
+        if pendingLevels.isEmpty { return }
+        target = pendingLevels.reduce(0, +) / Double(pendingLevels.count)
+        pendingLevels.removeAll()
+    }
+
+    mutating func onAnimationFrame() {
+        smoothed = floor(100 * (0.85 * smoothed + 0.15 * target)) / 100
+    }
+
+    func heightsAtPresentationTime(_ now: Double) -> [Double] {
+        let keyframes = [(0.0, 1.0), (0.2, 1.2), (0.4, 1.5), (0.8, 1.1), (0.9, 1.3), (1.0, 1.0)]
+        return (0..<10).map { index in
+            let profile = max(0, 1 - pow(abs(4.5 - Double(index)), 2) / 48)
+            let signedIndex = index < 5 ? index : index - 10
+            let elapsed = now - 0.1 * Double(signedIndex)
+            var multiplier = 1.0
+            if elapsed >= 0 {
+                let phase = elapsed - floor(elapsed)
+                for k in 1..<keyframes.count {
+                    let (t0, v0) = keyframes[k - 1], (t1, v1) = keyframes[k]
+                    if phase <= t1 {
+                        let progress = (phase - t0) / (t1 - t0)
+                        // Invert x with Newton iterations; Core uses bisection.
+                        var parameter = progress
+                        for _ in 0..<12 {
+                            let x = 1.26 * parameter - 0.78 * parameter * parameter + 0.52 * pow(parameter, 3)
+                            let derivative = 1.26 - 1.56 * parameter + 1.56 * parameter * parameter
+                            parameter = min(1, max(0, parameter - (x - progress) / derivative))
+                        }
+                        let eased = 3 * parameter * parameter - 2 * pow(parameter, 3)
+                        multiplier = v0 + (v1 - v0) * eased
+                        break
+                    }
+                }
+            }
+            return 2 * max(1, 5 * smoothed) * profile * multiplier
+        }
+    }
+}
+
+struct PillMatchDiff {
+    var maxAbsolute = 0.0
+    var maxRelative = 0.0
+    mutating func include(actual: [Double], wispr: [Double]) {
+        guard actual.count == wispr.count else { maxRelative = .infinity; return }
+        for (a, w) in zip(actual, wispr) {
+            guard a.isFinite, w.isFinite, w > 0 else { maxRelative = .infinity; continue }
+            let difference = abs(a - w)
+            maxAbsolute = max(maxAbsolute, difference)
+            maxRelative = max(maxRelative, difference / w)
+        }
+    }
+    var passes: Bool { maxRelative <= 0.10 }
+}
+
+/// Model a 1024-frame 16 kHz tap converted to 1536 floats at 24 kHz.
+/// Chunk arrivals, 150 ms delivery and 60 fps presentation are separate clocks.
+func replayPill(_ pcm: [Float]) -> (frames: [[Double]], diff: PillMatchDiff, speech: [Int]) {
+    let chunkSize = 1536
+    let duration = Double(pcm.count) / 24_000
+    var meter = WisprLevel(), bars = PillBars(), reference = SpecPill()
+    var cursor = 0, batchIndex = 1
+    let firstArrival = Double(min(chunkSize, pcm.count)) / 24_000
+    var frames: [[Double]] = [], speech: [Int] = []
+    var diff = PillMatchDiff()
+    for frame in 0...Int(ceil((duration + 0.150) * 60)) {
+        let time = Double(frame) / 60
+        while true {
+            let chunkEnd = min(pcm.count, cursor + chunkSize)
+            let arrival = cursor < pcm.count ? Double(chunkEnd) / 24_000 : Double.infinity
+            let batchTime = firstArrival + Double(batchIndex) * 0.150
+            let eventTime = min(arrival, batchTime)
+            if eventTime > time + 1e-12 { break }
+            if arrival <= batchTime {
+                let chunk = Array(pcm[cursor..<chunkEnd])
+                meter.append(db: WisprLevel.db(samples: chunk), at: arrival)
+                reference.onMicrophoneChunk(chunk)
+                cursor = chunkEnd
+            } else {
+                if let mean = meter.batch(at: batchTime) { bars.push(level: mean) }
+                reference.every150Milliseconds()
+                batchIndex += 1
+            }
+        }
+        bars.tick()
+        reference.onAnimationFrame()
+        let heights = bars.heights(at: time)
+        diff.include(actual: heights, wispr: reference.heightsAtPresentationTime(time))
+        frames.append(heights)
+        let start = frame * 400, end = min(pcm.count, start + 400)
+        if start < end, WisprLevel.db(samples: Array(pcm[start..<end])) > -40 { speech.append(frame) }
+    }
+    return (frames, diff, speech)
+}
+
 let args = CommandLine.arguments
-// levels <wav> [old] [gainDB]: G10 — replay the fixture through the pill's level
-// model at 30 fps; report tallest-3 % of max and bars above idle on speech frames.
+if args.count >= 3, args[1] == "pill-match" {
+    // Literal controls prove that the comparison gate accepts good and rejects bad.
+    var good = PillMatchDiff(), bad = PillMatchDiff()
+    good.include(actual: [2.0], wispr: [2.0])
+    bad.include(actual: [2.5], wispr: [2.0])
+    print("PILLMATCH_CONTROL actual=[2.0] wispr=[2.0] GREEN=\(good.passes ? "PASS" : "FAIL") actual=[2.5] wispr=[2.0] RED=\(bad.passes ? "PASS" : "FAIL")")
+    guard good.passes, !bad.passes else { exit(1) }
+    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2])).map { Float($0) / 32_768 }
+    guard !pcm.isEmpty else { print("PILLMATCH error=empty_fixture"); exit(1) }
+    let replay = replayPill(pcm)
+    print(String(format: "PILLMATCH frames=%d max_abs_diff_pt=%.12g max_rel_diff=%.12g%%", replay.frames.count,
+                 replay.diff.maxAbsolute, replay.diff.maxRelative * 100))
+    guard !replay.speech.isEmpty else { print("PILLMATCH error=no_speech"); exit(1) }
+    let middle = replay.speech[replay.speech.count / 2]
+    for index in [middle - 6, middle, middle + 6] where replay.frames.indices.contains(index) {
+        print(String(format: "frame t=%.3fs heights pt: %@", Double(index) / 60,
+                     replay.frames[index].map { String(format: "%.1f", $0) }.joined(separator: " ")))
+    }
+    exit(replay.diff.passes ? 0 : 1)
+}
+// Keep the G10 QA command; its current-model path uses the same replay as G11.
 if args.count >= 3, args[1] == "levels" {
     let old = args.count > 3 && args[3] == "old"
     let gainDB = Float(args.count > 4 ? args[4] : "0") ?? 0
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2])).map { Float($0) / 32_768 * pow(10, gainDB / 20) }
-    let chunk = 1_536                       // 64 ms: a 1024-frame tap on a 16 kHz headset, at 24 kHz
-    var meter = LevelMeter()
-    var bars = PillBars()
+    let replay = replayPill(pcm)
     var oldSmoothed = 0.0, oldPhase = 0.0
-    func oldHeights(_ level: Double) -> [Double] {   // the mapping shipped before this fix
-        oldSmoothed += (level - oldSmoothed) * (level > oldSmoothed ? 0.48 : 0.124)
-        oldPhase += 1.0 / 30
-        return (0..<10).map { i in
-            let v = 0.55 + 0.45 * (0.5 + 0.5 * sin(oldPhase * (2.1 + Double((i * 7) % 5) * 0.37) + Double((i * 3) % 7) * 0.9))
-            let c = 1 - abs(Double(i) - 4.5) / 10 * 0.6
-            return 2 + 14 * oldSmoothed * v * c
+    var frames = replay.frames
+    if old {
+        for frame in frames.indices {
+            let start = frame * 400, end = min(pcm.count, start + 400)
+            let level = start < end ? Double(AudioLevel.normalized(rms: AudioLevel.rms(Array(pcm[start..<end])))) : 0
+            oldSmoothed += (level - oldSmoothed) * (level > oldSmoothed ? 0.48 : 0.124)
+            oldPhase += 1.0 / 60
+            frames[frame] = (0..<10).map { i in
+                let v = 0.55 + 0.45 * (0.5 + 0.5 * sin(oldPhase * (2.1 + Double((i * 7) % 5) * 0.37) + Double((i * 3) % 7) * 0.9))
+                let c = 1 - abs(Double(i) - 4.5) / 10 * 0.6
+                return 2 + 14 * oldSmoothed * v * c
+            }
         }
     }
-    let frame = 800                          // 1/30 s at 24 kHz
-    var pending: Float = 0, cursor = 0
-    var top3: [Double] = [], above: [Int] = []
-    var frames: [[Double]] = []
-    for start in stride(from: 0, to: pcm.count, by: frame) {
-        let end = min(pcm.count, start + frame)
-        while cursor < end {
-            let c = Array(pcm[cursor..<min(pcm.count, cursor + chunk)])
-            let rms = AudioLevel.rms(c)
-            pending = max(pending, old ? AudioLevel.normalized(rms: rms) : meter.level(rms: rms, seconds: Double(c.count) / 24_000))
-            cursor += chunk
-        }
-        let heights: [Double]
-        if old { heights = oldHeights(Double(pending)) } else { bars.push(level: Double(pending)); bars.tick(); heights = bars.heights }
-        pending = 0
-        let frameRMS = AudioLevel.rms(Array(pcm[start..<end]))
-        if 20 * log10(max(frameRMS, 1e-7)) > -40 {      // speech frame
-            let sorted = heights.sorted(by: >)
-            top3.append((sorted[0] + sorted[1] + sorted[2]) / 3 / 16 * 100)
-            above.append(heights.filter { $0 > 2.5 }.count)
-            if frames.count < 3, top3.count > 30, top3.count % 3 == 0 { frames.append(heights) }
-        }
-    }
+    guard !replay.speech.isEmpty else { print("LEVELS error=no_speech"); exit(1) }
+    let top3 = replay.speech.map { frames[$0].sorted(by: >).prefix(3).reduce(0, +) / 3 / (old ? 16 : PillBars.peakHeight) * 100 }
+    let above = replay.speech.map { frames[$0].filter { $0 > 2.5 }.count }
     let t = top3.sorted(), a = above.sorted()
     let pass = zip(top3, above).filter { $0 >= 70 && $1 >= 7 }.count
     let peak = pcm.reduce(Float(0)) { max($0, abs($1)) }
     print(String(format: "LEVELS %@ gain=%+.0fdB fixture_peak=%.1fdBFS speech_frames=%d median_top3=%.0f%% median_bars_above_idle=%d pass_rate=%.0f%%",
                  old ? "OLD" : "NEW", gainDB, 20 * log10(Double(peak)), top3.count, t[t.count / 2], a[a.count / 2], Double(pass) / Double(top3.count) * 100))
-    for (i, f) in frames.enumerated() { print("frame \(i + 1) heights pt: \(f.map { String(format: "%.1f", $0) }.joined(separator: " "))") }
     exit(0)
 }
 // score-text: clean stdin (an STT transcript) with local llama and Groq qwen, score vs the script.
@@ -166,7 +282,7 @@ if args.count >= 2, args[1] == "score-text" {
     exit(0)
 }
 guard args.count >= 4 else {
-    print("usage: DictateBench stt-batch|stt-groq <wav> <runs> | cleanup <model> <runs>")
+    print("usage: DictateBench pill-match <wav> | stt-batch|stt-groq <wav> <runs> | cleanup <model> <runs>")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
