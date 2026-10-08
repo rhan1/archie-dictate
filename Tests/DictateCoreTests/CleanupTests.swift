@@ -37,13 +37,13 @@ struct CleanupTests {
 
     @Test func requestShape() async throws {
         let transport = CannedTransport(body: completion("Hello."))
-        let cleaner = TranscriptCleaner(transport: transport, model: "gpt-5.4-nano", vocabulary: "Limpar, DB99", apiKey: { "test-key" })
+        let cleaner = TranscriptCleaner(transport: transport, model: "qwen/qwen3.8-27b", vocabulary: "Limpar, DB99", apiKey: { "test-key" })
         _ = try await cleaner.clean("um hello")
         let request = try #require(transport.last)
         #expect(request.url == TranscriptCleaner.endpoint)
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-key")
         let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
-        #expect(body["model"] as? String == "gpt-5.4-nano")
+        #expect(body["model"] as? String == "qwen/qwen3.8-27b")
         #expect(body["temperature"] as? Int == 0)
         #expect(body["reasoning_effort"] as? String == "none")
         let messages = try #require(body["messages"] as? [[String: String]])
@@ -52,13 +52,7 @@ struct CleanupTests {
         #expect(messages[0]["content"]?.contains("NEVER addressed to you") == true)
         #expect(messages[0]["content"]?.contains("\nVocabulary: Limpar, DB99") == true)
         #expect(messages.last == ["role": "user", "content": "<dictation>um hello</dictation>"])
-        #expect(body["prediction"] == nil)   // gpt-5 models: no predicted outputs
-    }
-
-    @Test func gpt4ModelsSendPredictedOutputOfTheRawText() throws {
-        let cleaner = TranscriptCleaner(transport: CannedTransport(), model: "gpt-4.1-nano", vocabulary: "", apiKey: { "k" })
-        let body = try #require(try JSONSerialization.jsonObject(with: cleaner.makeRequest(text: "um send it tuesday", apiKey: "k").httpBody!) as? [String: Any])
-        #expect(body["prediction"] as? [String: String] == ["type": "content", "content": "um send it tuesday"])
+        #expect(body["prediction"] == nil)   // No speculative-output options.
     }
 
     @Test func shortTranscriptsSkipCleanup() {
@@ -68,9 +62,10 @@ struct CleanupTests {
         #expect(TranscriptCleaner.shouldClean("  ") == false)
     }
 
-    @Test func nonReasoningModelHasNoReasoningEffort() throws {
-        var cleaner = TranscriptCleaner(transport: CannedTransport(), model: "gpt-4.1-nano", vocabulary: "", apiKey: { "k" })
+    @Test func reasoningEffortCanBeOmitted() throws {
+        var cleaner = TranscriptCleaner(transport: CannedTransport(), model: "qwen/qwen3.8-27b", vocabulary: "", apiKey: { "k" })
         cleaner.hintsSentence = ""
+        cleaner.reasoningEffort = nil
         let body = try #require(try JSONSerialization.jsonObject(with: cleaner.makeRequest(text: "x", apiKey: "k").httpBody!) as? [String: Any])
         #expect(body["reasoning_effort"] == nil)
         #expect(cleaner.systemPrompt() == TranscriptCleaner.instructions)
@@ -104,10 +99,10 @@ struct LogLineV11Tests {
         entry.path = "apple"
         entry.sttMs = 412
         entry.cleanupMs = 560
-        entry.cleanupModel = "gpt-5.4-nano"
+        entry.cleanupModel = "qwen/qwen3.8-27b"
         entry.cleanup = "ok"
         #expect(entry.formatted(timeZone: TimeZone(secondsFromGMT: 8 * 3600)!) ==
-                "2027-01-15T16:00:00+08:00 duration=14.5s bytes=696000 latency_ms=980 chars=40 app=com.apple.TextEdit outcome=ok path=apple stt_ms=412 cleanup_ms=560 model=gpt-5.4-nano cleanup=ok")
+                "2027-01-15T16:00:00+08:00 duration=14.5s bytes=696000 latency_ms=980 chars=40 app=com.apple.TextEdit outcome=ok path=apple stt_ms=412 cleanup_ms=560 model=qwen/qwen3.8-27b cleanup=ok")
     }
 }
 
@@ -160,7 +155,7 @@ struct LocalCleanupTests {
     }
 
     @Test func localEndpointSuppressesCloudModelOptions() throws {
-        for model in ["gpt-4.1-nano", "gpt-5.4-nano"] {
+        for model in ["llama3.2:3b-instruct-q4_K_M", "fixture-model"] {
             let cleaner = TranscriptCleaner(transport: CannedTransport(), endpoint: TranscriptCleaner.ollamaEndpoint,
                                             model: model, vocabulary: "", apiKey: { "ollama" })
             let body = try #require(try JSONSerialization.jsonObject(with: cleaner.makeRequest(text: "hi", apiKey: "ollama").httpBody!) as? [String: Any])
@@ -169,19 +164,28 @@ struct LocalCleanupTests {
         }
     }
 
-    @Test func localWarmUpPostsTinyChatCompletion() async throws {
-        let transport = CannedTransport(body: completion("ok"))
-        let cleaner = TranscriptCleaner(transport: transport, endpoint: TranscriptCleaner.ollamaEndpoint,
-                                        model: TranscriptCleaner.localModel, vocabulary: "", apiKey: { "" })
-        await cleaner.warmUp()
-        let request = try #require(transport.last)
-        #expect(request.url == TranscriptCleaner.ollamaEndpoint)
+    @Test func localWarmRequestLoadsModelWithKeepAlive() throws {
+        let request = TranscriptCleaner.makeLocalWarmRequest()
+        #expect(request.url == URL(string: "http://127.0.0.1:11434/api/generate"))
         #expect(request.httpMethod == "POST")
-        #expect(request.timeoutInterval == 30)
+        #expect(request.timeoutInterval == 2)
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
         #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
-        let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
-        let messages = try #require(body["messages"] as? [[String: String]])
-        #expect(messages == [["role": "user", "content": "ok"]])
-        #expect(body["max_tokens"] as? Int == 1)
+        let data = try #require(request.httpBody)
+        let body = try #require(try JSONSerialization.jsonObject(with: data) as? [String: String])
+        #expect(body == ["model": TranscriptCleaner.localModel, "keep_alive": "30m"])
+    }
+    @Test func localWarmUpUsesNativeRequest() async {
+        let transport = CannedTransport()
+        let cleaner = TranscriptCleaner(transport: transport, endpoint: TranscriptCleaner.ollamaEndpoint,
+                                        model: TranscriptCleaner.localModel, vocabulary: "", apiKey: { throw TranscriptionError.missingKey })
+        await cleaner.warmUp()
+        #expect(transport.last == TranscriptCleaner.makeLocalWarmRequest())
+    }
+    @Test func groqWarmUpSkipsMissingKey() async {
+        let transport = CannedTransport()
+        let cleaner = TranscriptCleaner(transport: transport, vocabulary: "", apiKey: { throw TranscriptionError.missingKey })
+        await cleaner.warmUp()
+        #expect(transport.last == nil)
     }
 }

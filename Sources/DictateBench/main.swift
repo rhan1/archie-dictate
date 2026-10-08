@@ -1,9 +1,9 @@
 // Latency harness for gate G6 and the A3 cleanup-model choice. Prints only
 // counts and milliseconds — never transcript text, never the key.
-//   DictateBench stt-batch    <fixture.wav> <runs>   v1 path: time upload+transcribe after finish
+//   DictateBench stt-groq     <fixture.wav> <runs>   time batch Groq transcription
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
-//   DictateBench eval         cloud|local <model>    G7 quality: 11 cases, prints PASS/FAIL + misses
+//   DictateBench eval         groq|local <model>    G7 quality: 11 cases, prints PASS/FAIL + misses
 import DictateAppKit
 import DictateCore
 import Foundation
@@ -24,9 +24,6 @@ func requireKey(_ name: String) {
         exit(2)
     }
 }
-
-let key: @Sendable () throws -> String = { try environmentKey("OPENAI_API_KEY") }
-let groqKey: @Sendable () throws -> String = { try environmentKey("GROQ_API_KEY") }
 
 func makeLocalCleaner(model: String) -> TranscriptCleaner {
     var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 30), endpoint: TranscriptCleaner.ollamaEndpoint,
@@ -290,11 +287,14 @@ if args.count >= 2 {
     switch args[1] {
     case "score-text": requireKey("GROQ_API_KEY")
     case "stt-groq" where args.count >= 4, "stt-groq-chunked" where args.count >= 4: requireKey("GROQ_API_KEY")
-    case "stt-batch" where args.count >= 4: requireKey("OPENAI_API_KEY")
     case "cleanup" where args.count >= 4:
-        requireKey(ProcessInfo.processInfo.environment["BENCH_GROQ"] == "1" ? "GROQ_API_KEY" : "OPENAI_API_KEY")
-    case "eval" where args.count >= 4 && args[2] != "local":
-        requireKey(args[2] == "groq" ? "GROQ_API_KEY" : "OPENAI_API_KEY")
+        requireKey("GROQ_API_KEY")
+    case "eval" where args.count >= 4:
+        guard ["groq", "local"].contains(args[2]) else {
+            print("eval backend must be groq or local")
+            exit(2)
+        }
+        if args[2] == "groq" { requireKey("GROQ_API_KEY") }
     default: break
     }
 }
@@ -304,13 +304,13 @@ if args.count >= 2, args[1] == "score-text" {
     print("RAW \(scriptScore(raw))")
     let local = makeLocalCleaner(model: TranscriptCleaner.localModel)
     if let out = try? await local.cleanWithStats(raw).text { print("LOCAL-llama3.2:3b \(scriptScore(out))") }
-    var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: "qwen/qwen3.8-27b", vocabulary: prompt, apiKey: groqKey)
+    var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: "qwen/qwen3.8-27b", vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
     groq.reasoningEffort = "none"
     if let out = try? await groq.cleanWithStats(raw).text { print("GROQ-qwen3.8-27b \(scriptScore(out))") }
     exit(0)
 }
 guard args.count >= 4 else {
-    print("usage: DictateBench pill-match <wav> | stt-batch|stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
+    print("usage: DictateBench pill-match <wav> | stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
@@ -323,7 +323,7 @@ case "stt-groq-chunked":
     let transport = URLSessionTransport(timeout: 30)
     for run in 1...runs {
         var chunker = PauseChunker()
-        let engine = GroqChunkedTranscriber(transport: transport, apiKey: groqKey, prompt: prompt)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt)
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
@@ -376,15 +376,12 @@ case "stt-apple":
             print("run \(run) error=\(error)")
         }
     }
-case "stt-batch", "stt-groq":
+case "stt-groq":
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let wav = WAVEncoder.encode(samples: pcm, sampleRate: 24_000)
-    var client = TranscriptionClient(transport: URLSessionTransport(timeout: 60), apiKey: args[1] == "stt-groq" ? groqKey : key)
-    if args[1] == "stt-groq" {
-        client.endpointURL = TranscriptionClient.groqEndpoint
-        client.modelName = ProcessInfo.processInfo.environment["GROQ_STT_MODEL"] ?? "whisper-large-v3-turbo"
-        _ = try? await client.transcribe(wav: WAVEncoder.encode(samples: [Int16](repeating: 0, count: 2_400), sampleRate: 24_000), prompt: "")   // warm TLS
-    }
+    var client = TranscriptionClient(transport: URLSessionTransport(timeout: 60), apiKey: { try environmentKey("GROQ_API_KEY") })
+    client.modelName = ProcessInfo.processInfo.environment["GROQ_STT_MODEL"] ?? TranscriptionClient.model
+    _ = try? await client.transcribe(wav: WAVEncoder.encode(samples: [Int16](repeating: 0, count: 2_400), sampleRate: 24_000), prompt: "")   // warm TLS
     for run in 1...runs {
         let start = DispatchTime.now()
         do {
@@ -399,12 +396,9 @@ case "stt-batch", "stt-groq":
         }
     }
 case "cleanup":
-    let groq = ProcessInfo.processInfo.environment["BENCH_GROQ"] == "1"
-    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: groq ? TranscriptCleaner.groqEndpoint : TranscriptCleaner.endpoint,
-                                    model: args[2], vocabulary: prompt, apiKey: groq ? groqKey : key)
-    cleaner.usePrediction = ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] != "1"
-    cleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"]
-    print("prediction=\(cleaner.usePrediction)")
+    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint,
+                                    model: args[2], vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
+    cleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"] ?? "none"
     // One unmeasured call warms the keep-alive connection, as the app does during recording.
     _ = try? await cleaner.clean(cleanupFixture)
     for run in 1...runs {
@@ -413,7 +407,7 @@ case "cleanup":
             let (text, stats) = try await cleaner.cleanWithStats(cleanupFixture)
             let elapsed = ms(since: start)
             results.append(elapsed)
-            print("run \(run) model=\(args[2]) cleanup_ms=\(elapsed) first_byte_ms=\(stats.firstByteMs ?? -1) pred_accepted=\(stats.acceptedPredictionTokens ?? -1) pred_rejected=\(stats.rejectedPredictionTokens ?? -1) words_in=\(cleanupFixture.split(separator: " ").count) chars_out=\(text.count)")
+            print("run \(run) model=\(args[2]) cleanup_ms=\(elapsed) first_byte_ms=\(stats.firstByteMs ?? -1) words_in=\(cleanupFixture.split(separator: " ").count) chars_out=\(text.count)")
         } catch {
             print("run \(run) model=\(args[2]) error=\(error)")
         }
@@ -435,13 +429,11 @@ case "cleanup-local":
     }
 case "eval":
     let model = args[3]
-    var groqCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: model, vocabulary: prompt, apiKey: groqKey)
-    groqCleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"]
+    var groqCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: model, vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
+    groqCleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"] ?? "none"
     let cleaner: TranscriptCleaner = args[2] == "local"
         ? makeLocalCleaner(model: model)
-        : args[2] == "groq"
-            ? groqCleaner
-            : TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: model, vocabulary: prompt, apiKey: key)
+        : groqCleaner
     await cleaner.warmUp()
     var passed = 0
     for (i, c) in evalCases.enumerated() {
@@ -470,5 +462,5 @@ if !results.isEmpty {
         let cleaned = (try? await makeLocalCleaner(model: TranscriptCleaner.localModel).cleanWithStats(raw).text) ?? raw
         print("SCORE \(scriptScore(cleaned))")
     }
-    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") \(ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] == "1" ? "prediction=off " : "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
+    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
 }
