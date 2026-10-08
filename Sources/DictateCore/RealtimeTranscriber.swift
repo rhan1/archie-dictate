@@ -65,6 +65,20 @@ public enum RealtimeError: Error, Equatable, Sendable {
     }
 }
 
+/// Uptime stamps (ms) for one session, for the per-dictation stderr timeline.
+public struct RealtimeTimeline: Sendable, Equatable {
+    public var openStart: UInt64?
+    public var sessionCreated: UInt64?
+    public var sessionUpdated: UInt64?
+    public var firstAppendSent: UInt64?
+    public var finishCalled: UInt64?
+    public var lastCommitSent: UInt64?
+    public var completed: UInt64?
+    public var appendedSamples = 0
+}
+
+func uptimeMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
+
 /// v1.1 A1: OpenAI Realtime transcription session. Audio streams WHILE the user
 /// speaks. `turn_detection` is null: the app, not server VAD, decides where
 /// segments end (at natural pauses, see `PauseSegmenter`) and when the
@@ -77,7 +91,6 @@ public final class RealtimeTranscriber: @unchecked Sendable {
 
     private let transport: WebSocketTransport
     private let apiKey: @Sendable () throws -> String
-    private let prompt: String
 
     /// Every outbound frame goes through ONE ordered stream, so appends queued
     /// before the socket is open, and every commit, keep their order.
@@ -97,23 +110,25 @@ public final class RealtimeTranscriber: @unchecked Sendable {
     private var committedItems: [String] = []
     private var transcripts: [String: String] = [:]
     private var finishing = false
+    private var stamps = RealtimeTimeline()
 
     /// `segmentAtPauses` commits at natural pauses so earlier speech is
     /// transcribed while the user is still talking (measured: one commit at
     /// the end left ~2.1 s of transcription after the finish tap).
-    public init(transport: WebSocketTransport, prompt: String, segmentAtPauses: Bool = true,
+    public init(transport: WebSocketTransport, segmentAtPauses: Bool = true,
                 apiKey: @escaping @Sendable () throws -> String) {
         self.transport = transport
-        self.prompt = prompt
         self.apiKey = apiKey
         segmenter = PauseSegmenter(enabled: segmentAtPauses)
         (outbound, outboundContinuation) = AsyncStream.makeStream(of: String.self)
     }
 
     /// The `session.update` frame, as a pure value so tests can pin its shape.
-    public static func sessionUpdate(prompt: String) -> String {
-        var transcription: [String: Any] = ["model": model, "language": "en"]
-        if !prompt.isEmpty { transcription["prompt"] = prompt }
+    /// No `prompt`: on the 00:27 live run gpt-4o-transcribe returned the
+    /// vocabulary prompt verbatim instead of the speech. Spelling of names is
+    /// the cleanup pass's job.
+    public static func sessionUpdate() -> String {
+        let transcription: [String: Any] = ["model": model, "language": "en"]
         let payload: [String: Any] = [
             "type": "session.update",
             "session": [
@@ -148,6 +163,7 @@ public final class RealtimeTranscriber: @unchecked Sendable {
 
     public var isConnected: Bool { lock.withLock { connected } }
     static let traceEvents = ProcessInfo.processInfo.environment["DICTATE_TRACE_RT"] == "1"
+    public var timeline: RealtimeTimeline { lock.withLock { stamps } }
     public var hasFailed: Bool { lock.withLock { failure != nil } }
     /// Segments committed so far (for the log and the bench).
     public var segmentCount: Int { lock.withLock { committedItems.count } }
@@ -158,6 +174,7 @@ public final class RealtimeTranscriber: @unchecked Sendable {
         let key: String
         do { key = try apiKey() } catch { throw failed(.missingKey) }
         guard !key.isEmpty else { throw failed(.missingKey) }
+        lock.withLock { stamps.openStart = uptimeMs() }
         // A plain timer, not a task group: a child parked in a continuation
         // would keep the group (and the caller) waiting past the deadline.
         let watchdog = DispatchWorkItem { [weak self] in
@@ -181,10 +198,13 @@ public final class RealtimeTranscriber: @unchecked Sendable {
         }
         watchdog.cancel()
         if let failure = lock.withLock({ failure }) { throw failure }
-        lock.withLock { connected = true }
+        lock.withLock {
+            connected = true
+            stamps.sessionCreated = uptimeMs()
+        }
         Task { await self.receiveLoop() }
         do {
-            try await transport.send(text: Self.sessionUpdate(prompt: prompt))
+            try await transport.send(text: Self.sessionUpdate())
         } catch {
             throw failed(.connect("session.update: \(error)"))
         }
@@ -195,6 +215,7 @@ public final class RealtimeTranscriber: @unchecked Sendable {
     public func append(_ samples: [Int16]) {
         guard !samples.isEmpty else { return }
         lock.lock()
+        stamps.appendedSamples += samples.count
         let commitNow = segmenter.shouldCommit(after: samples)
         if commitNow { commitsSent += 1 }
         // Yield under the lock so frames keep the order decided here.
@@ -228,6 +249,7 @@ public final class RealtimeTranscriber: @unchecked Sendable {
     private func beginFinishing() {
         lock.withLock {
             finishing = true
+            stamps.finishCalled = uptimeMs()
             if segmenter.hasUncommittedSpeech || commitsSent == 0 {
                 commitsSent += 1
                 outboundContinuation.yield(Self.commitFrame)
@@ -249,6 +271,11 @@ public final class RealtimeTranscriber: @unchecked Sendable {
             do { try await transport.send(text: frame) } catch {
                 fail(.server("send_failed"))
                 return
+            }
+            let now = uptimeMs()
+            lock.withLock {
+                if stamps.firstAppendSent == nil, frame.hasPrefix(#"{"type":"input_audio_buffer.append""#) { stamps.firstAppendSent = now }
+                if frame == Self.commitFrame { stamps.lastCommitSent = now }
             }
         }
     }
@@ -272,6 +299,8 @@ public final class RealtimeTranscriber: @unchecked Sendable {
             FileHandle.standardError.write(Data("rt \(DispatchTime.now().uptimeNanoseconds / 1_000_000) \(type) \((json["error"] as? [String: Any])?["message"] ?? "")\n".utf8))
         }
         switch type {
+        case "session.updated":
+            lock.withLock { stamps.sessionUpdated = uptimeMs() }
         case "input_audio_buffer.committed":
             if let item = json["item_id"] as? String { lock.withLock { committedItems.append(item) } }
             checkComplete()
@@ -315,6 +344,7 @@ public final class RealtimeTranscriber: @unchecked Sendable {
         lock.lock()
         guard finalText == nil else { lock.unlock(); return }
         finalText = text
+        stamps.completed = uptimeMs()
         let waiter = self.waiter
         self.waiter = nil
         lock.unlock()

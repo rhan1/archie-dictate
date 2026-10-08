@@ -79,14 +79,27 @@ public struct TranscriptCleaner: Sendable {
         _ = try? await transport.send(request)
     }
 
+    /// Timing and predicted-output usage of one cleanup call (stderr timeline).
+    public struct Stats: Sendable, Equatable {
+        public var firstByteMs: Int?
+        public var acceptedPredictionTokens: Int?
+        public var rejectedPredictionTokens: Int?
+        public var completionTokens: Int?
+    }
+
     public func clean(_ text: String) async throws -> String {
+        try await cleanWithStats(text).text
+    }
+
+    public func cleanWithStats(_ text: String) async throws -> (text: String, stats: Stats) {
         let key: String
         do { key = try apiKey() } catch { throw TranscriptionError.missingKey }
         guard !key.isEmpty else { throw TranscriptionError.missingKey }
         let data: Data
         let response: HTTPURLResponse
+        var stats = Stats()
         do {
-            (data, response) = try await transport.send(makeRequest(text: text, apiKey: key))
+            (data, response, stats.firstByteMs) = try await transport.sendTimed(makeRequest(text: text, apiKey: key))
         } catch let error as URLError {
             throw TranscriptionError.network(error.code == .timedOut ? "timedOut" : "\(error.code.rawValue)")
         } catch {
@@ -105,6 +118,11 @@ public struct TranscriptCleaner: Sendable {
         else { throw TranscriptionError.decode }
         let cleaned = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { throw TranscriptionError.decode }
-        return cleaned
+        let usage = json["usage"] as? [String: Any]
+        let details = usage?["completion_tokens_details"] as? [String: Any]
+        stats.completionTokens = usage?["completion_tokens"] as? Int
+        stats.acceptedPredictionTokens = details?["accepted_prediction_tokens"] as? Int
+        stats.rejectedPredictionTokens = details?["rejected_prediction_tokens"] as? Int
+        return (cleaned, stats)
     }
 }

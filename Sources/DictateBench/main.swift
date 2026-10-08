@@ -53,7 +53,7 @@ case "stt-realtime":
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     print("fixture samples=\(pcm.count) seconds=\(String(format: "%.1f", Double(pcm.count) / 24_000))")
     for run in 1...runs {
-        let transcriber = RealtimeTranscriber(transport: URLSessionWebSocketTransport(), prompt: prompt, apiKey: key)
+        let transcriber = RealtimeTranscriber(transport: URLSessionWebSocketTransport(), apiKey: key)
         let openStart = DispatchTime.now()
         do { try await transcriber.open(timeout: Double(ProcessInfo.processInfo.environment["BENCH_OPEN_TIMEOUT"] ?? "1.5") ?? 1.5) } catch { print("run \(run) open error=\(error)"); continue }
         let openMs = ms(since: openStart)
@@ -89,7 +89,7 @@ case "stt-batch":
     for run in 1...runs {
         let start = DispatchTime.now()
         do {
-            let text = try await client.transcribe(wav: wav, prompt: prompt)
+            let text = try await client.transcribe(wav: wav, prompt: "")
             let elapsed = ms(since: start)
             results.append(elapsed)
             print("run \(run) finish_to_final_ms=\(elapsed) bytes=\(wav.count) chars=\(text.count)")
@@ -106,10 +106,10 @@ case "cleanup":
     for run in 1...runs {
         let start = DispatchTime.now()
         do {
-            let text = try await cleaner.clean(cleanupFixture)
+            let (text, stats) = try await cleaner.cleanWithStats(cleanupFixture)
             let elapsed = ms(since: start)
             results.append(elapsed)
-            print("run \(run) model=\(args[2]) cleanup_ms=\(elapsed) words_in=\(cleanupFixture.split(separator: " ").count) chars_out=\(text.count)")
+            print("run \(run) model=\(args[2]) cleanup_ms=\(elapsed) first_byte_ms=\(stats.firstByteMs ?? -1) pred_accepted=\(stats.acceptedPredictionTokens ?? -1) pred_rejected=\(stats.rejectedPredictionTokens ?? -1) words_in=\(cleanupFixture.split(separator: " ").count) chars_out=\(text.count)")
         } catch {
             print("run \(run) model=\(args[2]) error=\(error)")
         }

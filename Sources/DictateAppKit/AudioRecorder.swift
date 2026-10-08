@@ -15,6 +15,20 @@ public final class AudioRecorder {
     public var onPCMChunk: (([Int16]) -> Void)?
     private var pendingPCM: [Int16] = []
 
+    /// What the capture did, for the per-dictation stderr timeline.
+    public struct CaptureStats {
+        public var device = ""
+        public var startFormat = ""
+        public var engineStartMs = 0
+        public var firstBufferMs: Int?
+        public var formatChanges = 0
+        public var configChanges = 0
+    }
+    public private(set) var stats = CaptureStats()
+    private var startedAt = DispatchTime.now()
+    private var recording = false
+    private var configObserver: NSObjectProtocol?
+
     private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var samples: [Float] = []
@@ -38,13 +52,38 @@ public final class AudioRecorder {
     }
 
     public func start() throws {
-        lock.lock(); samples.removeAll(keepingCapacity: true); pendingPCM.removeAll(); lock.unlock()
+        lock.lock()
+        samples.removeAll(keepingCapacity: true)
+        pendingPCM.removeAll()
+        stats = CaptureStats()
+        lock.unlock()
+        startedAt = DispatchTime.now()
+        stats.device = AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown"
+        try installTapAndStart()
+        stats.engineStartMs = elapsedMs()
+        recording = true
+        // A Bluetooth headset switches profile (A2DP -> HFP) when its mic opens,
+        // which reconfigures the engine mid-recording; re-tap on the new format.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.recording else { return }
+            self.stats.configChanges += 1
+            self.engine.inputNode.removeTap(onBus: 0)
+            try? self.installTapAndStart()
+        }
+    }
+
+    private func installTapAndStart() throws {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw RecorderError.noInput
         }
-        converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        if stats.startFormat.isEmpty {
+            stats.startFormat = "\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch"
+        }
+        lock.withLock { converter = AVAudioConverter(from: inputFormat, to: targetFormat) }
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.consume(buffer)
         }
@@ -52,11 +91,18 @@ public final class AudioRecorder {
         try engine.start()
     }
 
+    private func elapsedMs() -> Int {
+        Int((DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds) / 1_000_000)
+    }
+
     /// Stops capture and hands back everything recorded, as 16 kHz mono floats.
     public func stop() -> [Float] {
+        recording = false
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        converter = nil
+        lock.withLock { converter = nil }
         lock.lock()
         let captured = samples
         let remainder = pendingPCM
@@ -68,6 +114,15 @@ public final class AudioRecorder {
     }
 
     private func consume(_ buffer: AVAudioPCMBuffer) {
+        // The converter must match the buffers actually arriving: a format
+        // change under a live tap otherwise yields garbled (resampled-wrong) audio.
+        let converter: AVAudioConverter? = lock.withLock {
+            if stats.firstBufferMs == nil { stats.firstBufferMs = elapsedMs() }
+            if let current = self.converter, current.inputFormat == buffer.format { return current }
+            if self.converter != nil { stats.formatChanges += 1 }
+            self.converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            return self.converter
+        }
         guard let converter else { return }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
