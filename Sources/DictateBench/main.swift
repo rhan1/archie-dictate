@@ -326,6 +326,7 @@ if args.count >= 2, args[1] == "score-text" {
 }
 guard args.count >= 4 else {
     print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png> | pill-match <wav> | stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
+    print("stt-groq-chunked: BENCH_V3=0 uses old 2/3 s limits without fillers; default/BENCH_V3=1 uses V3 3/4 s limits with fillers (synthetic WAV fixtures only)")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
@@ -336,6 +337,10 @@ var lastText: String?
 
 switch args[1] {
 case "stt-groq-chunked":
+    let useV3 = ProcessInfo.processInfo.environment["BENCH_V3"] != "0"
+    let firstMinimumSeconds = useV3 ? 3.0 : 2.0
+    let firstMaximumSeconds = useV3 ? 4.0 : 3.0
+    print("variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) lead_in=\(useV3 ? "on" : "off")")
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let transport = URLSessionTransport(timeout: 30)
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
@@ -347,8 +352,10 @@ case "stt-groq-chunked":
                                     endpoint: TranscriptCleaner.groqEndpoint, model: TranscriptCleaner.defaultModel,
                                     vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
     for run in 1...runs {
-        var chunker = PauseChunker()
-        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt)
+        var chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt,
+                                           fillerLeadIn: useV3, firstMinimumSeconds: firstMinimumSeconds,
+                                           firstMaximumSeconds: firstMaximumSeconds)
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
@@ -369,6 +376,7 @@ case "stt-groq-chunked":
         for chunk in chunker.finish() where chunk.samples.count >= 7_200 { engine.submit(chunk) }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)
+        let opening = String(joined.text.prefix(40)) // Generated fixture text only; never app logging.
         if joined.failedCount == 0, !joined.text.isEmpty {
             if endToEnd {
                 do {
@@ -376,17 +384,17 @@ case "stt-groq-chunked":
                     let pasteMs = ms(since: finish)
                     results.append(pasteMs)
                     lastText = cleaned
-                    print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count)")
+                    print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) opening=\"\(opening)\"")
                 } catch {
-                    print("run \(run) cleanup_error=\((error as? TranscriptionError)?.logReason ?? "error")")
+                    print("run \(run) cleanup_error=\((error as? TranscriptionError)?.logReason ?? "error") opening=\"\(opening)\"")
                 }
             } else {
                 results.append(elapsed)
                 lastText = joined.text
-                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-") opening=\"\(opening)\"")
             }
         } else {
-            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)")
+            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks) opening=\"\(opening)\"")
         }
     }
 case "stt-apple":
