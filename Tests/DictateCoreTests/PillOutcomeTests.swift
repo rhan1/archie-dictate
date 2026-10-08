@@ -56,8 +56,18 @@ struct PillOutcomeTests {
         #expect(pill.label == nil)
         #expect(!pill.handle(.recoverTap).pasteHeldText)
     }
+    @Test func pasteAffordanceOnlyWithText() {
+        #expect(PillOutcome(.held("focus_changed"), hasText: true).showsPasteAffordance)
+        #expect(!PillOutcome(.held("focus_changed")).showsPasteAffordance)
+        #expect(!PillOutcome(.error("mic_start")).showsPasteAffordance)
+        #expect(PillOutcome(.error("network_timedOut"), hasText: true).showsPasteAffordance)
+        #expect(!PillOutcome(.ok, hasText: true).showsPasteAffordance)
+        #expect(!PillOutcome(.rawPasted("rejected:ratio"), hasText: true).showsPasteAffordance)
+    }
     @Test func labels() {
         for (kind, label) in [(PillOutcome.Kind.held("focus_changed"), "held"), (.held("no_stt"), "no speech"),
+                              (.error("mic_start"), "no mic"), (.error("mic_denied"), "no mic"),
+                              (.error("silence"), "no speech"),
                               (.error("missing_key"), "no key"), (.error("network_timedOut"), "timeout"),
                               (.error("cannotConnectToHost"), "offline"), (.error("not connected"), "offline"),
                               (.error("notConnectedToInternet"), "offline"), (.error("network_-1004"), "offline"),

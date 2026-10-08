@@ -214,7 +214,7 @@ public final class AppController {
 
     private func renderOutcome() {
         guard let outcome = pillOutcome, let label = outcome.label else { pill.hide(); return }
-        pill.show(.error, held: outcome.isRecoverable, status: label)
+        pill.show(.error, held: outcome.showsPasteAffordance, status: label)
     }
 
     private func clearOutcome() {
