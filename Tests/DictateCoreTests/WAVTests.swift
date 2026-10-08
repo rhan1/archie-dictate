@@ -62,3 +62,18 @@ struct WAVTests {
         #expect(integer(data, 32, 2) == 4)
     }
 }
+
+@Suite("Silence")
+struct SilenceTests {
+    @Test func zerosAndRoomHissAreSilent() {
+        #expect(AudioLevel.isSilent([]))
+        #expect(AudioLevel.isSilent([Float](repeating: 0, count: 16_000)))
+        #expect(AudioLevel.isSilent([Float](repeating: 0.005, count: 16_000)))
+    }
+
+    @Test func anySpeechPeakIsNotSilent() {
+        var samples = [Float](repeating: 0, count: 16_000)
+        samples[8_000] = -0.2
+        #expect(!AudioLevel.isSilent(samples))
+    }
+}

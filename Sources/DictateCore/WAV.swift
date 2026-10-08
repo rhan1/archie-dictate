@@ -51,6 +51,14 @@ public enum AudioLevel {
         return Float(sqrt(sum / Double(samples.count)))
     }
 
+    /// Peak below -40 dBFS: nothing was said. gpt-4o-transcribe invents text
+    /// for pure silence, so a silent recording must never reach the API.
+    public static let silencePeak: Float = 0.01
+
+    public static func isSilent(_ samples: [Float]) -> Bool {
+        !samples.contains { abs($0) >= silencePeak }
+    }
+
     public static func normalized(rms: Float) -> Float {
         guard !rms.isNaN else { return 0 }
         let decibels = 20 * log10(max(rms, 1e-6))
