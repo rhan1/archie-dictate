@@ -1,7 +1,7 @@
 import Foundation
 
 public enum Vocabulary {
-    public static let seed: [String] = ["Raza", "Limpar", "Politrace", "GrantWatch", "TurnoutWatch", "DB99", "Archie", "Jarvis", "Codex", "agy", "Warp", "Claude", "Fable", "Opus", "Sonnet"]
+    public static let seed: [String] = ["Raza", "Limpar", "Politrace", "GrantWatch", "TurnoutWatch", "DB99", "Archie", "Jarvis", "Codex", "agy", "Warp", "Claude", "Fable", "Opus", "Sonnet", "Wispr Flow", "Groq", "Ollama", "Dictate"]
     public static let maxPromptLength = 800
     private static let stopwords: Set<String> = ["A", "An", "The", "And", "Or", "But", "If", "I", "It", "In", "On", "Of", "To", "For", "With", "When", "Do", "Not", "Add", "See", "Read"]
 

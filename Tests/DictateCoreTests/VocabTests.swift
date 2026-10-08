@@ -55,7 +55,7 @@ struct VocabTests {
         try "**Limpar** `CustomTerm` **Limpar**".write(to: url, atomically: true, encoding: .utf8)
         #expect(Vocabulary.filePrompt(fileURL: url) == "Limpar, CustomTerm")
         #expect(Vocabulary.buildPrompt(fileURL: url) ==
-                "Limpar, CustomTerm, Raza, Politrace, GrantWatch, TurnoutWatch, DB99, Archie, Jarvis, Codex, agy, Warp, Claude, Fable, Opus, Sonnet")
+                "Limpar, CustomTerm, Raza, Politrace, GrantWatch, TurnoutWatch, DB99, Archie, Jarvis, Codex, agy, Warp, Claude, Fable, Opus, Sonnet, Wispr Flow, Groq, Ollama, Dictate")
     }
     @Test func allListMarkersStopwordsAndPunctuation() {
         let markdown = """
