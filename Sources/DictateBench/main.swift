@@ -532,7 +532,7 @@ case "eval", "eval-incremental":
     var passed = 0
     let cases = isIncremental ? evalCases + [incrementalLongCase] : evalCases
     for (i, c) in cases.enumerated() {
-        if i > 0 { try await Task.sleep(nanoseconds: 8_000_000_000) }
+        if i > 0 { try await Task.sleep(nanoseconds: isIncremental ? 20_000_000_000 : 8_000_000_000) }
         do {
             let out: String
             if isIncremental {
