@@ -41,6 +41,8 @@ public final class AudioRecorder {
         commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate, channels: 1, interleaved: false
     )!
     private var lastLevelPost: TimeInterval = 0
+    private var meter = LevelMeter()
+    private var pendingLevel: Float = 0
 
     public init() {}
 
@@ -60,6 +62,7 @@ public final class AudioRecorder {
         samples.removeAll(keepingCapacity: true)
         pendingPCM.removeAll()
         stats = CaptureStats()
+        meter = LevelMeter()
         lock.unlock()
         startedAt = DispatchTime.now()
         stats.device = AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown"
@@ -171,12 +174,18 @@ public final class AudioRecorder {
         lock.unlock()
         for pcm in ready { onPCMChunk?(pcm) }
 
+        // The meter sees every chunk (its peak tracking needs real time); the
+        // pill gets the loudest level since its last 30 fps post.
+        let seconds = Double(chunk.count) / AudioRecorder.sampleRate
         let now = ProcessInfo.processInfo.systemUptime
-        if now - lastLevelPost >= 1.0 / 30.0 {
+        let post: Float? = lock.withLock {
+            pendingLevel = max(pendingLevel, meter.level(rms: AudioLevel.rms(chunk), seconds: seconds))
+            guard now - lastLevelPost >= 1.0 / 30.0 else { return nil }
             lastLevelPost = now
-            let level = AudioLevel.normalized(rms: AudioLevel.rms(chunk))
-            DispatchQueue.main.async { [weak self] in self?.onLevel?(level) }
+            defer { pendingLevel = 0 }
+            return pendingLevel
         }
+        if let post { DispatchQueue.main.async { [weak self] in self?.onLevel?(post) } }
     }
 
     public enum RecorderError: Error { case noInput }
