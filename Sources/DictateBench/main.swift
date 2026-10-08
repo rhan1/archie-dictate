@@ -405,6 +405,7 @@ case "stt-groq-chunked":
             try await feed([Int16](repeating: 0, count: min(2_400, tailSamples - offset)))
         }
         let finish = DispatchTime.now()
+        incremental?.seal()
         for chunk in chunker.finish() where chunk.samples.count >= 7_200 { engine.submit(chunk) }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)

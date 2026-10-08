@@ -441,6 +441,7 @@ public final class AppController {
         let chunkedSession = chunked
         chunked = nil
         let incrementalSession = incrementalCleaner
+        incrementalSession?.seal()   // the last chunk's text lands after this tap
         let myGeneration = generation
         pill.show(.transcribing)
 
