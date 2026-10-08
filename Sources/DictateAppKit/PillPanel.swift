@@ -3,7 +3,7 @@ import AppKit
 /// D4: the Wispr-style pill. A non-activating floating panel that never takes
 /// focus from the app being dictated into.
 public final class PillPanel {
-    public enum Mode: Equatable { case hidden, recording, transcribing, error }
+    public enum Mode: Equatable { case hidden, warming, recording, transcribing, error }
 
     /// Measured from Wispr Flow's own pill (2x capture ÷ 2): 100 × 28 pt.
     public static let capsuleSize = NSSize(width: 100, height: 28)
@@ -61,7 +61,7 @@ public final class PillPanel {
         mode = newMode
         pillView.mode = newMode
         guard newMode != .hidden else { return hide() }
-        if newMode == .recording { pillView.resetLevels() }
+        if newMode == .recording || newMode == .warming { pillView.resetLevels() }
         if !panel.isVisible && !suppressed {
             panel.setFrameOrigin(PillPanel.origin(for: PillPanel.size))
             panel.orderFrontRegardless()
@@ -166,7 +166,7 @@ final class PillView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         if cancelRect.insetBy(dx: -3, dy: -3).contains(p) {
             onCancel?()
-        } else if finishRect.insetBy(dx: -3, dy: -3).contains(p), mode == .recording {
+        } else if finishRect.insetBy(dx: -3, dy: -3).contains(p), mode == .recording || mode == .warming {
             onFinish?()
         }
     }
@@ -190,7 +190,8 @@ final class PillView: NSView {
         drawFinishButton()
 
         switch mode {
-        case .recording: drawBars()
+        case .warming: drawBars(live: false)
+        case .recording: drawBars(live: true)
         case .transcribing: drawDots()
         case .error: drawErrorMark()
         case .hidden: break
@@ -226,15 +227,18 @@ final class PillView: NSView {
         check.stroke()
     }
 
-    private func drawBars() {
+    /// `live: false` = WARMING: grey, flat, still — the mic is not delivering
+    /// audio yet (Bluetooth profile switch).
+    private func drawBars(live: Bool) {
         let barWidth = PillView.barWidth, gap = PillView.barGap
         let total = CGFloat(PillView.barCount) * barWidth + CGFloat(PillView.barCount - 1) * gap
         // Centred between the two buttons.
         var x = ((cancelRect.maxX + finishRect.minX) / 2 - total / 2).rounded()
-        NSColor.white.setFill()
+        (live ? NSColor.white : NSColor(white: 0.45, alpha: 1)).setFill()
         for i in 0..<PillView.barCount {
             // Quiet = flat 2.5 pt dashes, like Wispr; voice lifts them toward 14 pt.
-            let h = PillView.barIdleHeight + (PillView.barPeakHeight - PillView.barIdleHeight) * displayed[i]
+            let level = live ? displayed[i] : 0
+            let h = PillView.barIdleHeight + (PillView.barPeakHeight - PillView.barIdleHeight) * level
             let rect = NSRect(x: x, y: capsuleRect.midY - h / 2, width: barWidth, height: h)
             NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
             x += barWidth + gap

@@ -36,11 +36,11 @@ struct CleanupTests {
         #expect(body["temperature"] as? Int == 0)
         #expect(body["reasoning_effort"] as? String == "none")
         let messages = try #require(body["messages"] as? [[String: String]])
-        #expect(messages.count == 2)
+        #expect(messages.count == 2 + 2 * TranscriptCleaner.examples.count)   // system, few-shot pairs, dictation
         #expect(messages[0]["role"] == "system")
-        #expect(messages[0]["content"]?.contains("Never add, summarise, answer") == true)
+        #expect(messages[0]["content"]?.contains("NEVER addressed to you") == true)
         #expect(messages[0]["content"]?.hasSuffix("Vocabulary: Limpar, DB99") == true)
-        #expect(messages[1] == ["role": "user", "content": "um hello"])
+        #expect(messages.last == ["role": "user", "content": "<dictation>um hello</dictation>"])
         #expect(body["prediction"] == nil)   // gpt-5 models: no predicted outputs
     }
 
@@ -96,5 +96,35 @@ struct LogLineV11Tests {
         entry.cleanup = "ok"
         #expect(entry.formatted(timeZone: TimeZone(secondsFromGMT: 8 * 3600)!) ==
                 "2027-01-15T16:00:00+08:00 duration=14.5s bytes=696000 latency_ms=980 chars=40 app=com.apple.TextEdit outcome=ok path=realtime stt_ms=412 cleanup_ms=560 model=gpt-5.4-nano cleanup=ok")
+    }
+}
+
+@Suite("OllamaCleaner")
+struct OllamaCleanerTests {
+    @Test func requestIsLocalTemperatureZeroKeepAlive() throws {
+        let cleaner = OllamaCleaner(transport: CannedTransport(), vocabulary: "Limpar")
+        let request = cleaner.makeRequest(text: "um hi")
+        #expect(request.url?.host == "127.0.0.1")
+        let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+        #expect(body["model"] as? String == "llama3.2:3b-instruct-q4_K_M")
+        #expect(body["stream"] as? Bool == false)
+        #expect(body["keep_alive"] as? String == "30m")
+        #expect((body["options"] as? [String: Int])?["temperature"] == 0)
+        let messages = try #require(body["messages"] as? [[String: String]])
+        #expect(messages.last == ["role": "user", "content": "<dictation>um hi</dictation>"])
+        #expect(messages.first?["content"]?.hasSuffix("Vocabulary: Limpar") == true)
+    }
+
+    @Test func parsesOllamaReply() async throws {
+        let body = #"{"message":{"role":"assistant","content":" Hi. "},"eval_count":3}"#
+        let cleaner = OllamaCleaner(transport: CannedTransport(body: body), vocabulary: "")
+        let (text, stats) = try await cleaner.cleanWithStats("um hi")
+        #expect(text == "Hi.")
+        #expect(stats.completionTokens == 3)
+    }
+
+    @Test func unreachableOllamaIsANetworkError() async {
+        let cleaner = OllamaCleaner(transport: CannedTransport(error: URLError(.cannotConnectToHost)), vocabulary: "")
+        await #expect(throws: TranscriptionError.network("\(URLError.Code.cannotConnectToHost.rawValue)")) { try await cleaner.cleanWithStats("x") }
     }
 }

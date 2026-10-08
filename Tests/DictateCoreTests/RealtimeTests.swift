@@ -155,6 +155,21 @@ struct PauseSegmenterTests {
         #expect(s.hasUncommittedSpeech)
     }
 
+    @Test func noisyHeadsetDipCountsAsQuietRelativeToSpeech() {
+        var s = PauseSegmenter()
+        let loud = [Int16](repeating: 8_000, count: 2_400)     // ~ -12 dBFS speech
+        let floor = [Int16](repeating: 1_000, count: 2_400)    // ~ -30 dBFS headset floor: NOT under -40 dBFS
+        for _ in 0..<12 { _ = s.shouldCommit(after: loud) }
+        #expect(s.shouldCommit(after: floor) == false)
+        #expect(s.shouldCommit(after: floor) == true)           // 200 ms of relative quiet
+    }
+
+    @Test func longSegmentCommitsOnAHundredMillisecondDip() {
+        var s = PauseSegmenter()
+        for _ in 0..<31 { _ = s.shouldCommit(after: speech) }  // 3.1 s fluent speech
+        #expect(s.shouldCommit(after: quiet) == true)           // one 100 ms dip is enough now
+    }
+
     @Test func disabledNeverCommits() {
         var s = PauseSegmenter(enabled: false)
         for _ in 0..<12 { _ = s.shouldCommit(after: speech) }
@@ -182,3 +197,4 @@ struct PromptEchoTests {
         #expect(!PromptEcho.isEcho("anything", vocabulary: ""))
     }
 }
+
