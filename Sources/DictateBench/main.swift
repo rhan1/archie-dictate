@@ -314,6 +314,8 @@ guard args.count >= 4 else {
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
+guard runs > 0 else { print("runs must be positive"); exit(2) }
+let endToEnd = args[1] == "stt-groq-chunked" && ProcessInfo.processInfo.environment["BENCH_E2E"] == "1"
 var results: [Int] = []
 var lastText: String?
 
@@ -321,30 +323,53 @@ switch args[1] {
 case "stt-groq-chunked":
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let transport = URLSessionTransport(timeout: 30)
+    let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
+    guard let tailMs = Int(tailValue), (0...60_000).contains(tailMs) else {
+        print("BENCH_TAIL_MS must be an integer from 0 to 60000")
+        exit(2)
+    }
+    let cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5),
+                                    endpoint: TranscriptCleaner.groqEndpoint, model: TranscriptCleaner.defaultModel,
+                                    vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
     for run in 1...runs {
         var chunker = PauseChunker()
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt)
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
-            for chunk in chunker.append(samples) { engine.submit(chunk) }
             fed += samples.count
             let deadline = started + UInt64(Double(fed) / 24_000 * 1_000_000_000)
             let now = DispatchTime.now().uptimeNanoseconds
             if deadline > now { try await Task.sleep(nanoseconds: deadline - now) }
+            for chunk in chunker.append(samples) { engine.submit(chunk) }
         }
         for offset in stride(from: 0, to: pcm.count, by: 2_400) {
             try await feed(Array(pcm[offset..<min(pcm.count, offset + 2_400)]))
         }
-        for _ in 0..<15 { try await feed([Int16](repeating: 0, count: 2_400)) }
+        let tailSamples = tailMs * 24
+        for offset in stride(from: 0, to: tailSamples, by: 2_400) {
+            try await feed([Int16](repeating: 0, count: min(2_400, tailSamples - offset)))
+        }
         let finish = DispatchTime.now()
         for chunk in chunker.finish() where chunk.samples.count >= 7_200 { engine.submit(chunk) }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)
-        if joined.failedCount == 0 {
-            results.append(elapsed)
-            lastText = joined.text
-            print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+        if joined.failedCount == 0, !joined.text.isEmpty {
+            if endToEnd {
+                do {
+                    let cleaned = try await cleaner.clean(joined.text)
+                    let pasteMs = ms(since: finish)
+                    results.append(pasteMs)
+                    lastText = cleaned
+                    print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count)")
+                } catch {
+                    print("run \(run) cleanup_error=\((error as? TranscriptionError)?.logReason ?? "error")")
+                }
+            } else {
+                results.append(elapsed)
+                lastText = joined.text
+                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+            }
         } else {
             print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)")
         }
@@ -462,5 +487,7 @@ if !results.isEmpty {
         let cleaned = (try? await makeLocalCleaner(model: TranscriptCleaner.localModel).cleanWithStats(raw).text) ?? raw
         print("SCORE \(scriptScore(cleaned))")
     }
-    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
+    let pasteMetric = endToEnd ? " finish_to_paste_ms=\(p50(results))" : ""
+    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") n=\(results.count) p50_ms=\(p50(results))\(pasteMetric) min_ms=\(results.min()!) max_ms=\(results.max()!)")
 }
+if endToEnd, results.count != runs { exit(1) }

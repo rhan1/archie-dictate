@@ -64,7 +64,7 @@ cat << 'PLIST' > "$CONTENTS/Info.plist"
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Dictate records only between your two Left-Option double-taps, then sends the audio to OpenAI for transcription. Nothing is saved.</string>
+	<string>Dictate records only while you dictate (between ⌥⌥ and the finishing ⌥ tap) and sends the audio to Groq for transcription, with Apple's on-device recognition as a fallback. Nothing is saved.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
