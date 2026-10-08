@@ -127,6 +127,12 @@ public final class AppController {
         let myGeneration = generation
         pill.show(.transcribing)
 
+        if fakeTranscript == nil, AudioLevel.isSilent(samples) {
+            machine.transcriptionFinished()
+            fail(reason: "silence", duration: duration, bytes: wav.count, latencyMs: 0)
+            return
+        }
+
         let fake = fakeTranscript
         let prompt = self.prompt
         let client = self.client
