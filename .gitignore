@@ -5,3 +5,4 @@
 *.local
 build.env
 Resources/vocab-hints.txt
+.swarm/
