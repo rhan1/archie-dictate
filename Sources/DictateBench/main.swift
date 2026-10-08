@@ -11,8 +11,22 @@ import Foundation
 let vocabURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".claude/projects/-Users-razakhan/memory/reference-raza-vocabulary.md")
 let prompt = Vocabulary.buildPrompt(fileURL: vocabURL)
-let key: @Sendable () throws -> String = { try KeychainAPIKey.read() }
-let groqKey: @Sendable () throws -> String = { try KeychainAPIKey.read(service: "groq-api") }
+func environmentKey(_ name: String) throws -> String {
+    guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
+        throw TranscriptionError.missingKey
+    }
+    return value
+}
+
+func requireKey(_ name: String) {
+    guard (try? environmentKey(name)) != nil else {
+        print("missing \(name) — run via tools/bench.sh")
+        exit(2)
+    }
+}
+
+let key: @Sendable () throws -> String = { try environmentKey("OPENAI_API_KEY") }
+let groqKey: @Sendable () throws -> String = { try environmentKey("GROQ_API_KEY") }
 
 func makeLocalCleaner(model: String) -> TranscriptCleaner {
     var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 30), endpoint: TranscriptCleaner.ollamaEndpoint,
@@ -270,6 +284,19 @@ if args.count >= 3, args[1] == "levels" {
     print(String(format: "LEVELS %@ gain=%+.0fdB fixture_peak=%.1fdBFS speech_frames=%d median_top3=%.0f%% median_bars_above_idle=%d pass_rate=%.0f%%",
                  old ? "OLD" : "NEW", gainDB, 20 * log10(Double(peak)), top3.count, t[t.count / 2], a[a.count / 2], Double(pass) / Double(top3.count) * 100))
     exit(0)
+}
+// Fail before reading fixtures/stdin or contacting any provider when its key is absent.
+if args.count >= 2 {
+    switch args[1] {
+    case "score-text": requireKey("GROQ_API_KEY")
+    case "stt-groq" where args.count >= 4: requireKey("GROQ_API_KEY")
+    case "stt-batch" where args.count >= 4: requireKey("OPENAI_API_KEY")
+    case "cleanup" where args.count >= 4:
+        requireKey(ProcessInfo.processInfo.environment["BENCH_GROQ"] == "1" ? "GROQ_API_KEY" : "OPENAI_API_KEY")
+    case "eval" where args.count >= 4 && args[2] != "local":
+        requireKey(args[2] == "groq" ? "GROQ_API_KEY" : "OPENAI_API_KEY")
+    default: break
+    }
 }
 // score-text: clean stdin (an STT transcript) with local llama and Groq qwen, score vs the script.
 if args.count >= 2, args[1] == "score-text" {

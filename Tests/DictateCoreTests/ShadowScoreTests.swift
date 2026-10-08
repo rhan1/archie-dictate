@@ -3,6 +3,13 @@ import DictateCore
 
 @Suite("ShadowScore")
 struct ShadowScoreTests {
+    @Test func shadowLineIncludesFinalPastedNameCount() {
+        #expect(ShadowScore.line(appleNames: 1, pastedNames: 4, groqNames: 3, milliseconds: 287) ==
+                "shadow=groq names_apple=1/4 names_pasted=4/4 names_groq=3/4 shadow_ms=287")
+        #expect(ShadowScore.line(appleNames: 0, pastedNames: 0, groqNames: 0, milliseconds: 0) ==
+                "shadow=groq names_apple=0/4 names_pasted=0/4 names_groq=0/4 shadow_ms=0")
+    }
+
     @Test func identicalScript() {
         #expect(ShadowScore.overlap(ShadowScore.script) == 1)
         #expect(ShadowScore.overlap(ShadowScore.script.uppercased()) == 1)

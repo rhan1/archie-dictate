@@ -315,6 +315,7 @@ public final class AppController {
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
             var pipeline = PipelineReport()
+            var shadow: Task<(appleNames: Int, groqNames: Int, milliseconds: Int), Never>?
             var result: Result<String, Error>
             if let fake {
                 result = .success(fake)
@@ -325,12 +326,12 @@ public final class AppController {
                 if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
                    ShadowScore.overlap(raw) >= 0.60 {
                     let appleNames = ShadowScore.nameCount(raw)
-                    Task.detached {
+                    shadow = Task.detached {
                         let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: 24_000)
                         let start = DispatchTime.now()
                         let groqRaw = (try? await groqSTT.transcribe(wav: wav, prompt: vocabularyPrompt)) ?? ""
                         let elapsed = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
-                        Self.note("shadow=groq names_apple=\(appleNames)/4 names_groq=\(ShadowScore.nameCount(groqRaw))/4 shadow_ms=\(elapsed)")
+                        return (appleNames, ShadowScore.nameCount(groqRaw), elapsed)
                     }
                 }
                 if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
@@ -343,6 +344,14 @@ public final class AppController {
                     pipeline.cleanupModel = outcome.model
                     timeline.cleanup = outcome.stats
                     pipeline.cleanupMs = Int(Date().timeIntervalSince(cleanStart) * 1000)
+                }
+            }
+            if let shadow, case .success(let raw) = result {
+                let pastedNames = ShadowScore.nameCount(pipeline.text ?? raw)
+                Task.detached {
+                    let counts = await shadow.value
+                    Self.note(ShadowScore.line(appleNames: counts.appleNames, pastedNames: pastedNames,
+                                              groqNames: counts.groqNames, milliseconds: counts.milliseconds))
                 }
             }
             let report = pipeline
