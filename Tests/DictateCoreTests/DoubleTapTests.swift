@@ -168,3 +168,56 @@ struct DictationStateMachineTests {
         #expect(machine.state == .recording)
     }
 }
+
+/// v1.1 A2: ⌥⌥ starts, ONE clean ⌥ tap finishes.
+@Suite("SingleTapFinish")
+struct SingleTapFinishTests {
+    private func run(_ events: [KeyEvent], machine: inout DictationStateMachine, detector: inout DoubleTapDetector) -> [DictationAction] {
+        events.map { machine.handle(detector.process($0)) }.filter { $0 != .none }
+    }
+
+    @Test func doubleTapStartsThenSingleTapFinishes() {
+        var machine = DictationStateMachine()
+        var detector = DoubleTapDetector()
+        let start = run([press(0), release(0.05), press(0.2), release(0.25)], machine: &machine, detector: &detector)
+        #expect(start == [.startRecording])
+        let finish = run([press(4.0), release(4.06)], machine: &machine, detector: &detector)
+        #expect(finish == [.finishRecording])
+        #expect(machine.state == .transcribing)
+    }
+
+    @Test func singleTapWhileIdleDoesNothing() {
+        var machine = DictationStateMachine()
+        var detector = DoubleTapDetector()
+        #expect(run([press(0), release(0.05)], machine: &machine, detector: &detector).isEmpty)
+        #expect(machine.state == .idle)
+    }
+
+    @Test func chordWhileRecordingIsIgnored() {
+        var machine = DictationStateMachine()
+        var detector = DoubleTapDetector()
+        _ = run([press(0), release(0.05), press(0.2), release(0.25)], machine: &machine, detector: &detector)
+        // ⌥← word-jump while recording: Option down, an arrow key, Option up.
+        let chord = run([press(3.0), .keyDown(keyCode: 123, time: 3.1), release(3.2)], machine: &machine, detector: &detector)
+        #expect(chord.isEmpty)
+        #expect(machine.state == .recording)
+    }
+
+    @Test func heldOptionWhileRecordingIsIgnored() {
+        var machine = DictationStateMachine()
+        var detector = DoubleTapDetector()
+        _ = run([press(0), release(0.05), press(0.2), release(0.25)], machine: &machine, detector: &detector)
+        #expect(run([press(3.0), release(3.8)], machine: &machine, detector: &detector).isEmpty)
+        #expect(machine.state == .recording)
+    }
+
+    @Test func detectorReportsTapThenDoubleTap() {
+        var detector = DoubleTapDetector()
+        #expect(detector.process(press(0)) == .none)
+        #expect(detector.process(release(0.05)) == .tap)
+        #expect(detector.process(press(0.2)) == .none)
+        #expect(detector.process(release(0.25)) == .doubleTap)
+        #expect(detector.process(press(1.0)) == .none)
+        #expect(detector.process(release(1.05)) == .tap)
+    }
+}

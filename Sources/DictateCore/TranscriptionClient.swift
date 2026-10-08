@@ -5,17 +5,20 @@ public protocol HTTPTransport: Sendable {
 }
 
 public struct URLSessionTransport: HTTPTransport {
-    private let timeout: TimeInterval
-    public init(timeout: TimeInterval = 60) { self.timeout = timeout }
+    /// One session per transport so keep-alive connections are reused: a fresh
+    /// session per request paid a TLS handshake on every call.
+    private let session: URLSession
 
-    public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    public init(timeout: TimeInterval = 60) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
+        session = URLSession(configuration: configuration)
+    }
+
+    public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         return (data, http)
