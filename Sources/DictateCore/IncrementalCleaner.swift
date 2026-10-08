@@ -22,6 +22,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private var failed = false
     private var failure: String?
     private var closed = false
+    private var sealed = false
     private var cancelled = false
     private var pending: Task<Void, Never>?
     private var finalTask: Task<Result, Never>?
@@ -43,7 +44,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     // Lock held. Reserve both the task and its range before another arrival.
     private func schedule() {
         let end = max(0, contiguous - 2)
-        guard !closed, !failed, pending == nil,
+        guard !closed, !sealed, !failed, pending == nil,
               end - covered >= (covered == 0 ? 1 : 2) else { return }
         let text = raw(from: covered, to: end)
         let context = prefix
@@ -81,6 +82,10 @@ public final class IncrementalCleaner: @unchecked Sendable {
 
     /// Seal before awaiting the current call, so queued speech is handled in
     /// exactly one final tail request. Repeated finish calls share that task.
+    /// The finish tap: no new intermediate call may start (the final chunk's
+    /// text lands after this); a call already in flight completes.
+    public func seal() { lock.withLock { sealed = true } }
+
     public func finish(totalChunks: Int) async -> Result {
         let task = lock.withLock {
             if let finalTask { return finalTask }
