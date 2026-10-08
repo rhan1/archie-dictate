@@ -30,6 +30,7 @@ struct EvalCase {
     var mustContain: [String] = []
     var mustNotContain: [String] = []      // case-insensitive, word-ish
     var endsWith: String? = nil
+    var mustPass = false
 }
 
 let evalCases: [EvalCase] = [
@@ -38,7 +39,7 @@ let evalCases: [EvalCase] = [
              mustNotContain: ["um", "uh", "like", "Tuesday", "Tuesday, no"], endsWith: "?"),
     EvalCase(input: "um so uh I think we should like ship it today you know", mustContain: ["ship it today"], mustNotContain: ["um", "uh", "you know"]),
     EvalCase(input: "send the invoice on Monday, no wait, Thursday", mustContain: ["Thursday"], mustNotContain: ["Monday"]),
-    EvalCase(input: "Let's meet at three. Actually, sorry, make that four.", mustContain: ["four"], mustNotContain: ["three"]),
+    EvalCase(input: "Let's meet at three. Actually, sorry, make that four.", mustContain: ["four"], mustNotContain: ["three"], mustPass: true),
     EvalCase(input: "email John, I mean Jane, about the budget", mustContain: ["Jane", "budget"], mustNotContain: ["John"]),
     EvalCase(input: "we matched the orgs to limp r last night", mustContain: ["Limpar"], mustNotContain: ["limp r"]),
     EvalCase(input: "is turnout watch still up", mustContain: ["TurnoutWatch"], endsWith: "?"),
@@ -391,9 +392,11 @@ case "eval":
             let misses = score(c, out)
             if misses.isEmpty { passed += 1 }
             print("case \(i + 1) \(misses.isEmpty ? "PASS" : "FAIL") \(misses.joined(separator: "; "))")
+            if c.mustPass, !misses.isEmpty { print("MUSTPASS FAIL case \(i + 1)") }
             if !misses.isEmpty, ProcessInfo.processInfo.environment["EVAL_SHOW"] == "1" { print("   out: \(out)") }
         } catch {
             print("case \(i + 1) ERROR \(error)")
+            if c.mustPass { print("MUSTPASS FAIL case \(i + 1)") }
         }
     }
     print("EVAL \(args[2]) \(model) \(passed)/\(evalCases.count)")
