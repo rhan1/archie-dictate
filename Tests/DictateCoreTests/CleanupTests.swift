@@ -89,42 +89,87 @@ struct LogLineV11Tests {
     @Test func v11FieldsAppendInOrder() {
         var entry = DictationLogEntry(time: Date(timeIntervalSince1970: 1_800_000_000), durationSeconds: 14.5, audioBytes: 696_000,
                                       latencyMs: 980, chars: 40, frontmostBundleID: "com.apple.TextEdit", outcome: .ok)
-        entry.path = "realtime"
+        entry.path = "apple"
         entry.sttMs = 412
         entry.cleanupMs = 560
         entry.cleanupModel = "gpt-5.4-nano"
         entry.cleanup = "ok"
         #expect(entry.formatted(timeZone: TimeZone(secondsFromGMT: 8 * 3600)!) ==
-                "2027-01-15T16:00:00+08:00 duration=14.5s bytes=696000 latency_ms=980 chars=40 app=com.apple.TextEdit outcome=ok path=realtime stt_ms=412 cleanup_ms=560 model=gpt-5.4-nano cleanup=ok")
+                "2027-01-15T16:00:00+08:00 duration=14.5s bytes=696000 latency_ms=980 chars=40 app=com.apple.TextEdit outcome=ok path=apple stt_ms=412 cleanup_ms=560 model=gpt-5.4-nano cleanup=ok")
     }
 }
 
-@Suite("OllamaCleaner")
-struct OllamaCleanerTests {
-    @Test func requestIsLocalTemperatureZeroKeepAlive() throws {
-        let cleaner = OllamaCleaner(transport: CannedTransport(), vocabulary: "Limpar")
-        let request = cleaner.makeRequest(text: "um hi")
+@Suite("LocalCleanup")
+struct LocalCleanupTests {
+    @Test func requestIsLocalTemperatureZero() throws {
+        var cleaner = TranscriptCleaner(transport: CannedTransport(), endpoint: TranscriptCleaner.ollamaEndpoint,
+                                        model: TranscriptCleaner.localModel, vocabulary: "Limpar", apiKey: { "ollama" })
+        cleaner.reasoningEffort = "none"
+        let request = cleaner.makeRequest(text: "um hi", apiKey: "ollama")
         #expect(request.url?.host == "127.0.0.1")
+        #expect(request.url?.path == "/v1/chat/completions")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer ollama")
         let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
         #expect(body["model"] as? String == "llama3.2:3b-instruct-q4_K_M")
-        #expect(body["stream"] as? Bool == false)
-        #expect(body["keep_alive"] as? String == "30m")
-        #expect((body["options"] as? [String: Int])?["temperature"] == 0)
+        #expect(body["temperature"] as? Int == 0)
+        #expect(body["prediction"] == nil)
+        #expect(body["reasoning_effort"] == nil)
         let messages = try #require(body["messages"] as? [[String: String]])
         #expect(messages.last == ["role": "user", "content": "<dictation>um hi</dictation>"])
         #expect(messages.first?["content"]?.hasSuffix("Vocabulary: Limpar") == true)
     }
 
-    @Test func parsesOllamaReply() async throws {
-        let body = #"{"message":{"role":"assistant","content":" Hi. "},"eval_count":3}"#
-        let cleaner = OllamaCleaner(transport: CannedTransport(body: body), vocabulary: "")
+    @Test func parsesChatCompletionReply() async throws {
+        let body = #"{"choices":[{"message":{"role":"assistant","content":" Hi. "}}],"usage":{"completion_tokens":3}}"#
+        let cleaner = TranscriptCleaner(transport: CannedTransport(body: body), endpoint: TranscriptCleaner.ollamaEndpoint,
+                                        model: TranscriptCleaner.localModel, vocabulary: "", apiKey: { "ollama" })
         let (text, stats) = try await cleaner.cleanWithStats("um hi")
         #expect(text == "Hi.")
         #expect(stats.completionTokens == 3)
     }
 
-    @Test func unreachableOllamaIsANetworkError() async {
-        let cleaner = OllamaCleaner(transport: CannedTransport(error: URLError(.cannotConnectToHost)), vocabulary: "")
+    @Test func unreachableLocalHostIsANetworkError() async {
+        let cleaner = TranscriptCleaner(transport: CannedTransport(error: URLError(.cannotConnectToHost)),
+                                        endpoint: TranscriptCleaner.ollamaEndpoint, model: TranscriptCleaner.localModel,
+                                        vocabulary: "", apiKey: { "ollama" })
         await #expect(throws: TranscriptionError.network("\(URLError.Code.cannotConnectToHost.rawValue)")) { try await cleaner.cleanWithStats("x") }
+    }
+
+    @Test func localCleanupDoesNotRequireAKey() async throws {
+        for key: @Sendable () throws -> String in [{ "" }, { throw TranscriptionError.missingKey }] {
+            let transport = CannedTransport(body: completion("Hi."))
+            let cleaner = TranscriptCleaner(transport: transport, endpoint: TranscriptCleaner.ollamaEndpoint,
+                                            model: TranscriptCleaner.localModel, vocabulary: "", apiKey: key)
+            #expect(try await cleaner.clean("um hi") == "Hi.")
+            #expect(transport.last?.value(forHTTPHeaderField: "Authorization") == nil)
+        }
+        let cloud = TranscriptCleaner(transport: CannedTransport(body: completion("Hi.")), vocabulary: "", apiKey: { "" })
+        await #expect(throws: TranscriptionError.missingKey) { try await cloud.clean("um hi") }
+    }
+
+    @Test func localEndpointSuppressesCloudModelOptions() throws {
+        for model in ["gpt-4.1-nano", "gpt-5.4-nano"] {
+            let cleaner = TranscriptCleaner(transport: CannedTransport(), endpoint: TranscriptCleaner.ollamaEndpoint,
+                                            model: model, vocabulary: "", apiKey: { "ollama" })
+            let body = try #require(try JSONSerialization.jsonObject(with: cleaner.makeRequest(text: "hi", apiKey: "ollama").httpBody!) as? [String: Any])
+            #expect(body["prediction"] == nil)
+            #expect(body["reasoning_effort"] == nil)
+        }
+    }
+
+    @Test func localWarmUpPostsTinyChatCompletion() async throws {
+        let transport = CannedTransport(body: completion("ok"))
+        let cleaner = TranscriptCleaner(transport: transport, endpoint: TranscriptCleaner.ollamaEndpoint,
+                                        model: TranscriptCleaner.localModel, vocabulary: "", apiKey: { "" })
+        await cleaner.warmUp()
+        let request = try #require(transport.last)
+        #expect(request.url == TranscriptCleaner.ollamaEndpoint)
+        #expect(request.httpMethod == "POST")
+        #expect(request.timeoutInterval == 30)
+        #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
+        let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+        let messages = try #require(body["messages"] as? [[String: String]])
+        #expect(messages == [["role": "user", "content": "ok"]])
+        #expect(body["max_tokens"] as? Int == 1)
     }
 }
