@@ -14,6 +14,8 @@ public struct PauseChunker: Sendable {
 
     public static let sampleRate = 24_000
     public static let windowSamples = 1_200
+    private let firstMinimumSamples: Int
+    private let firstMaximumSamples: Int
     private var samples: [Int16] = []
     private var windows: [Double] = []
     private var floor = WisprLevel()
@@ -21,12 +23,15 @@ public struct PauseChunker: Sendable {
     private var nextIndex = 0
     private var finished = false
 
-    public init() {}
+    public init(firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0) {
+        firstMinimumSamples = Int((firstMinimumSeconds * Double(Self.sampleRate)).rounded())
+        firstMaximumSamples = Int((firstMaximumSeconds * Double(Self.sampleRate)).rounded())
+    }
 
     public mutating func append(_ pcm: [Int16]) -> [Chunk] {
         guard !finished else { return [] }
         var emitted: [Chunk] = []
-        // Consume incrementally, so even a large input obeys the 3 s / 6 s caps.
+        // Consume incrementally, so even a large input obeys each chunk's cap.
         var cursor = 0
         while cursor < pcm.count {
             let needed = Self.windowSamples - (samples.count % Self.windowSamples)
@@ -49,9 +54,9 @@ public struct PauseChunker: Sendable {
                 quietStart = nil
             }
             let firstChunk = nextIndex == 0
-            let minimum = (firstChunk ? 2 : 4) * Self.sampleRate
+            let minimum = firstChunk ? firstMinimumSamples : 4 * Self.sampleRate
             let quietSamples = firstChunk ? 3_600 : 6_000
-            let maximum = (firstChunk ? 3 : 6) * Self.sampleRate
+            let maximum = firstChunk ? firstMaximumSamples : 6 * Self.sampleRate
             if let quietStart {
                 // Silence beginning before the minimum must also supply the
                 // required quiet run AFTER that minimum boundary.
