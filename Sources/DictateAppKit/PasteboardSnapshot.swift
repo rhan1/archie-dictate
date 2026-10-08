@@ -22,6 +22,12 @@ public struct PasteboardSnapshot: Equatable {
         return PasteboardSnapshot(items: items)
     }
 
+    /// A copy made while the paste recipient was reading belongs to the user.
+    public func restore(to pasteboard: NSPasteboard, ifUnchangedSince changeCount: Int) {
+        guard pasteboard.changeCount == changeCount else { return }
+        restore(to: pasteboard)
+    }
+
     public func restore(to pasteboard: NSPasteboard) {
         pasteboard.clearContents()
         guard !items.isEmpty else { return }

@@ -18,14 +18,14 @@ private final class CannedTransport: HTTPTransport, @unchecked Sendable {
 }
 
 private func completion(_ content: String) -> String {
-    let data = try! JSONSerialization.data(withJSONObject: ["choices": [["message": ["role": "assistant", "content": content]]]])
+    let data = try! JSONSerialization.data(withJSONObject: ["choices": [["finish_reason": "stop", "message": ["role": "assistant", "content": content]]]])
     return String(decoding: data, as: UTF8.self)
 }
 
 @Suite("Cleanup")
 struct CleanupTests {
     @Test func requestShape() async throws {
-        let transport = CannedTransport(body: completion("ok"))
+        let transport = CannedTransport(body: completion("Hello."))
         let cleaner = TranscriptCleaner(transport: transport, model: "gpt-5.4-nano", vocabulary: "Limpar, DB99", apiKey: { "test-key" })
         _ = try await cleaner.clean("um hello")
         let request = try #require(transport.last)
@@ -120,7 +120,7 @@ struct LocalCleanupTests {
     }
 
     @Test func parsesChatCompletionReply() async throws {
-        let body = #"{"choices":[{"message":{"role":"assistant","content":" Hi. "}}],"usage":{"completion_tokens":3}}"#
+        let body = #"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":" Hi. "}}],"usage":{"completion_tokens":3}}"#
         let cleaner = TranscriptCleaner(transport: CannedTransport(body: body), endpoint: TranscriptCleaner.ollamaEndpoint,
                                         model: TranscriptCleaner.localModel, vocabulary: "", apiKey: { "ollama" })
         let (text, stats) = try await cleaner.cleanWithStats("um hi")
