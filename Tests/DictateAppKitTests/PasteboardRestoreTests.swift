@@ -73,13 +73,24 @@ struct PasteboardRestoreTests {
         #expect(pb.string(forType: .string) == "SENTINEL-CLIP")
     }
 
-    @Test func pillGeometryMatchesSpec() {
-        #expect(PillPanel.size == NSSize(width: 250, height: 52))
+    @Test func pillGeometryMatchesWispr() {
+        #expect(PillPanel.capsuleSize == NSSize(width: 100, height: 28))
         #expect(PillPanel.dockGap == 24)
         let view = PillView(frame: NSRect(origin: .zero, size: PillPanel.size))
-        #expect(view.cancelRect.width == 36)
-        #expect(view.finishRect.width == 36)
-        #expect(view.cancelRect.maxX < view.finishRect.minX)
-        #expect(view.cancelRect.midY == 26)
+        let capsule = view.capsuleRect
+        #expect(capsule.size == NSSize(width: 100, height: 28))
+        #expect(view.cancelRect.size == NSSize(width: 18, height: 18))
+        #expect(view.finishRect.size == NSSize(width: 18, height: 18))
+        #expect(view.cancelRect.minX - capsule.minX == 5)
+        #expect(capsule.maxX - view.finishRect.maxX == 5)
+        #expect(view.cancelRect.midY == capsule.midY)
+        #expect(PillView.barCount == 8)
+        #expect(PillView.barWidth + PillView.barGap == 4)
+        #expect(PillView.barIdleHeight == 2.5)
+        #expect(PillView.barPeakHeight == 14)
+        // 8 bars at 4 pt pitch fit between the buttons.
+        let strip = CGFloat(PillView.barCount) * PillView.barWidth + CGFloat(PillView.barCount - 1) * PillView.barGap
+        #expect(strip == 30)
+        #expect(strip < view.finishRect.minX - view.cancelRect.maxX)
     }
 }
