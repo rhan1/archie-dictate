@@ -171,9 +171,12 @@ public struct TranscriptCleaner: Sendable {
             cleaned = String(cleaned[end.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard !cleaned.contains("<"), !cleaned.contains(">") else { throw TranscriptionError.rejected("tags") }
-        let inputCount = Double(text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
-        let outputCount = Double(cleaned.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
-        guard !cleaned.isEmpty, outputCount >= Self.ratioFloor(for: text) * inputCount,
+        let ratioInput = revision == nil ? text : IncrementalCleaner.lastSentence(context) + " " + text
+        let ratioOutput = revision.map { $0 + " " + cleaned } ?? cleaned
+        let inputCount = Double(ratioInput.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
+        let outputCount = Double(ratioOutput.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
+        guard revision != nil || !cleaned.isEmpty,
+              outputCount >= Self.ratioFloor(for: ratioInput) * inputCount,
               outputCount <= 1.5 * inputCount else { throw TranscriptionError.rejected("ratio") }
         stats.completionTokens = (json["usage"] as? [String: Any])?["completion_tokens"] as? Int
         return (cleaned, revision, stats)

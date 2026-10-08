@@ -29,6 +29,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     public init(cleaner: TranscriptCleaner) { self.cleaner = cleaner }
     public var needsFallback: Bool { lock.withLock { failed } }
     public var callCount: Int { lock.withLock { calls } }
+    public var fallbackReason: String? { lock.withLock { failed ? failure : nil } }
 
     public func append(index: Int, text: String) {
         lock.withLock {
@@ -133,19 +134,23 @@ public final class IncrementalCleaner: @unchecked Sendable {
     }
 
     /// Sentence boundaries deliberately use only . ? ! followed by space/end.
+    public static func lastSentence(_ text: String) -> String {
+        let chars = Array(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        var start = 0
+        for index in chars.indices where ".?!".contains(chars[index]) {
+            if index + 1 < chars.count, chars[index + 1] == " " {
+                var next = index + 1
+                while next < chars.count, chars[next] == " " { next += 1 }
+                if next < chars.count { start = next }
+            }
+        }
+        return String(chars.dropFirst(start))
+    }
+
     public static func join(prefix: String, revision: String?, tail: String) -> String {
         var prefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
         if let revision {
-            let chars = Array(prefix)
-            var start = 0
-            for index in chars.indices where ".?!".contains(chars[index]) {
-                if index + 1 < chars.count, chars[index + 1] == " " {
-                    var next = index + 1
-                    while next < chars.count, chars[next] == " " { next += 1 }
-                    if next < chars.count { start = next }
-                }
-            }
-            prefix = String(chars.prefix(start)) + revision
+            prefix = String(prefix.dropLast(lastSentence(prefix).count)) + revision
         }
         return (prefix + " " + tail).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }

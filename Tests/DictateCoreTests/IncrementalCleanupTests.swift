@@ -125,6 +125,51 @@ struct IncrementalCleanupTests {
         #expect(result.mode == "incremental")
     }
 
+    @Test func finalRevisionAbsorbsTail() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        let prefix = "Keep the deck. And let's do the review meeting on Thursday at 3."
+        let rawTail = "with the whole team, and then we can decide whether the launch date still works for everyone involved. For more information, visit www.blog.com.au"
+        for (index, text) in [prefix, rawTail, ""].enumerated() {
+            incremental.append(index: index, text: text)
+        }
+        try await transport.wait(1)
+        try await transport.respond(0, prefix)
+        await incremental.waitForPending()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await transport.user(1) == "<context>\(prefix)</context>\n<dictation>\(rawTail)</dictation>")
+        try await transport.respond(1, "<revised>And let's do the review meeting on Friday at 4 with the whole team, and then we can decide whether the launch date still works for everyone involved.</revised>")
+        let result = await finish.value
+        #expect(result.mode == "incremental")
+        #expect(result.fallbackReason == nil)
+        #expect(result.text == "Keep the deck. And let's do the review meeting on Friday at 4 with the whole team, and then we can decide whether the launch date still works for everyone involved.")
+        #expect(result.text?.contains("Thursday at 3") == false)
+    }
+
+    @Test func finalOversizedRevisionRejectedByCombinedRatio() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        let lastSentence = "Meet Thursday at three."
+        let prefix = "Keep the deck. " + lastSentence
+        let rawTail = "Bring the updated slides to the review meeting."
+        for (index, text) in [prefix, rawTail, ""].enumerated() {
+            incremental.append(index: index, text: text)
+        }
+        try await transport.wait(1)
+        try await transport.respond(0, prefix)
+        await incremental.waitForPending()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        let oversized = Array(repeating: lastSentence + " " + rawTail, count: 3).joined(separator: " ")
+        // A valid afterRevised tail isolates the revision's length guard.
+        try await transport.respond(1, "<revised>\(oversized)</revised> " + rawTail)
+        let result = await finish.value
+        #expect(result.mode == "incremental_fallback")
+        #expect(result.text == nil)
+        #expect(result.fallbackReason == "final_rejected_ratio")
+    }
+
     @Test(arguments: ["<revised>Changed.</revised> Send the updated report to the team.", "<revised>broken", "x", String(repeating: "extra ", count: 50)])
     func malformedOrRejectedIntermediateFallsBack(output: String) async throws {
         let transport = IncrementalTransport()

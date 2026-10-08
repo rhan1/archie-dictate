@@ -97,9 +97,37 @@ public struct PauseChunker: Sendable {
         guard !finished else { return [] }
         finished = true
         guard !samples.isEmpty else { return [] }
-        let chunk = Chunk(index: nextIndex, samples: samples)
-        samples.removeAll()
-        windows.removeAll()
+        defer {
+            samples.removeAll()
+            windows.removeAll()
+            quietStart = nil
+        }
+        // A speech-only partial can seed the adaptive floor from speech.
+        // With no window above that floor's quiet band, use its lower bound
+        // rather than discard uncalibrated speech as if it were silence.
+        if windows.allSatisfy({ $0 < floor.floorDB + 8 }) {
+            _ = floor.level(db: -60)
+        }
+        var speechEnd = samples.count
+        while speechEnd > 0 {
+            let start = ((speechEnd - 1) / Self.windowSamples) * Self.windowSamples
+            let window = start / Self.windowSamples
+            let db: Double
+            if speechEnd - start == Self.windowSamples {
+                db = windows[window]
+            } else {
+                let rms = sqrt(samples[start..<speechEnd].reduce(0.0) {
+                    let value = Double($1) / 32768
+                    return $0 + value * value
+                } / Double(speechEnd - start))
+                db = 20 * log10(rms + 1e-10)
+            }
+            guard db < floor.floorDB + 8 else { break }
+            speechEnd = start
+        }
+        guard speechEnd > 0 else { return [] }
+        let count = min(samples.count, speechEnd + 6_000) // At most 250 ms of quiet.
+        let chunk = Chunk(index: nextIndex, samples: Array(samples.prefix(count)))
         return [chunk]
     }
 }

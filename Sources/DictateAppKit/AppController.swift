@@ -515,7 +515,10 @@ public final class AppController {
                     return
                 }
                 timeline.cleanupCalls = incrementalSession?.callCount ?? 0
-                if incrementalSession?.needsFallback == true { pipeline.cleanupMode = "incremental_fallback" }
+                if incrementalSession?.needsFallback == true {
+                    pipeline.cleanupMode = "incremental_fallback"
+                    timeline.cleanupFallbackReason = incrementalSession?.fallbackReason
+                }
                 if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
                     incrementalSession?.cancel()
                     pipeline.cleanup = "skipped:short"
@@ -526,6 +529,7 @@ public final class AppController {
                     guard myGeneration == self.generation, self.machine.state == .transcribing else { return }
                     pipeline.cleanupMode = incremental?.mode ?? "single"
                     timeline.cleanupCalls = incremental?.calls ?? 0
+                    timeline.cleanupFallbackReason = incremental?.fallbackReason
                     if let text = incremental?.text, pipeline.path == "groq-chunked" {
                         pipeline.text = text
                         pipeline.cleanup = "ok"
@@ -671,6 +675,7 @@ public final class AppController {
         var chunked: GroqChunkedTranscriber.Result?
         var cleanupMode = "single"
         var cleanupCalls = 0
+        var cleanupFallbackReason: String?
 
         func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
@@ -685,6 +690,9 @@ public final class AppController {
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
                 "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)",
             ]
+            if cleanupMode == "incremental_fallback" {
+                fields.append("fallback_reason=\(cleanupFallbackReason ?? "unknown")")
+            }
             if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
