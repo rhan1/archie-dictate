@@ -8,6 +8,8 @@ public final class IncrementalCleaner: @unchecked Sendable {
         public let mode: String
         public let calls: Int
         public let stats: TranscriptCleaner.Stats?
+        /// Why incremental mode fell back (labels only, never text).
+        public let fallbackReason: String?
     }
 
     private let lock = NSLock()
@@ -18,6 +20,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private var prefix = ""
     private var calls = 0
     private var failed = false
+    private var failure: String?
     private var closed = false
     private var cancelled = false
     private var pending: Task<Void, Never>?
@@ -58,6 +61,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
             } catch {
                 lock.withLock {
                     failed = true
+                    failure = failure ?? "mid_" + ((error as? TranscriptionError)?.logReason ?? "error")
                     pending = nil
                 }
             }
@@ -85,7 +89,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
                 await inFlight?.value
                 let tail: (String, String)? = lock.withLock {
                     guard !failed, !cancelled, totalChunks > 2, contiguous == totalChunks, !prefix.isEmpty else {
-                        if totalChunks > 2, contiguous != totalChunks { failed = true }
+                        if totalChunks > 2, contiguous != totalChunks { failed = true; failure = failure ?? "gap_\(contiguous)of\(totalChunks)" }
                         return nil
                     }
                     calls += 1
@@ -99,7 +103,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
                                stats: output.stats)
                     }
                 } catch {
-                    lock.withLock { failed = true }
+                    lock.withLock { failed = true; failure = failure ?? "final_" + ((error as? TranscriptionError)?.logReason ?? "error") }
                     return snapshot(text: nil, stats: nil)
                 }
             }
@@ -111,7 +115,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
 
     private func result(text: String?, stats: TranscriptCleaner.Stats?) -> Result {
         Result(text: text, mode: failed ? "incremental_fallback" : text == nil ? "single" : "incremental",
-               calls: calls, stats: stats)
+               calls: calls, stats: stats, fallbackReason: failed ? failure : nil)
     }
     private func snapshot(text: String?, stats: TranscriptCleaner.Stats?) -> Result {
         lock.withLock { result(text: text, stats: stats) }
