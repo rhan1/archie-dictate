@@ -100,7 +100,7 @@ struct PasteboardRestoreTests {
             heights.append((0..<PillView.barCount).map(view.barHeight))
             #expect((0..<PillView.barCount).map(view.barX) == xs)   // no horizontal motion, ever
         }
-        #expect(heights[3].allSatisfy { $0 > PillView.barIdleHeight })      // fast attack
+        #expect(heights[3].contains { $0 > PillView.barIdleHeight })      // common scale rises
         #expect(heights[3] != heights[4])                                    // still alive, not frozen
         #expect(view.smoothed > 0.1 && view.smoothed < 0.9)                  // slow decay after the drop
         #expect(heights.joined().allSatisfy { $0 <= PillView.barPeakHeight })

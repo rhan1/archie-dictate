@@ -38,6 +38,8 @@ public final class AppController {
     private var prewarmExpiry: DispatchWorkItem?
     /// L4 lever: bypasses the network with a fixed transcript.
     private let fakeTranscript = ProcessInfo.processInfo.environment["DICTATE_FAKE_TRANSCRIPT"]
+    /// Opt-in QA comparison; the detached Groq request never delays paste.
+    private let shadowEnabled = ProcessInfo.processInfo.environment["DICTATE_SHADOW"] == "1"
     /// QA lever: notes pill show/hide with the frontmost app (G4) to stderr.
     private let trace = ProcessInfo.processInfo.environment["DICTATE_TRACE"] == "1"
 
@@ -306,6 +308,8 @@ public final class AppController {
         let localCleaner = self.localCleaner
         let groqCleaner = self.groqCleaner
         let groqSTT = self.groqSTT
+        let shadowEnabled = self.shadowEnabled
+        let vocabularyPrompt = self.prompt
         var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
@@ -318,6 +322,17 @@ public final class AppController {
                 let sttStart = Date()
                 result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, openAI: client, report: &pipeline)
                 pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
+                if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
+                   ShadowScore.overlap(raw) >= 0.60 {
+                    let appleNames = ShadowScore.nameCount(raw)
+                    Task.detached {
+                        let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: 24_000)
+                        let start = DispatchTime.now()
+                        let groqRaw = (try? await groqSTT.transcribe(wav: wav, prompt: vocabularyPrompt)) ?? ""
+                        let elapsed = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+                        Self.note("shadow=groq names_apple=\(appleNames)/4 names_groq=\(ShadowScore.nameCount(groqRaw))/4 shadow_ms=\(elapsed)")
+                    }
+                }
                 if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
                     pipeline.cleanup = "skipped:short"
                 } else if case .success(let raw) = result, !raw.isEmpty {

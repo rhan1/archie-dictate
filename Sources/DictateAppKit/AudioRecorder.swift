@@ -8,8 +8,8 @@ public final class AudioRecorder {
     /// 100 ms of pcm16 per streamed chunk (v1.1 A1).
     public static let chunkSamples = 2_400
 
-    /// Called on the main queue with a 0...1 level, ~30 times a second.
-    public var onLevel: ((Float) -> Void)?
+    /// Called on the main queue with the mean level of each nonempty 150 ms batch.
+    public var onLevel: ((Double) -> Void)?
     /// Called on the AUDIO thread with each 100 ms pcm16 chunk, and once more
     /// from `stop()` with the remainder. Must be thread-safe.
     public var onPCMChunk: (([Int16]) -> Void)?
@@ -40,9 +40,8 @@ public final class AudioRecorder {
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate, channels: 1, interleaved: false
     )!
-    private var lastLevelPost: TimeInterval = 0
-    private var meter = LevelMeter()
-    private var pendingLevel: Float = 0
+    private var meter = WisprLevel() // persists for this app-lifetime recorder
+    private var levelTimer: DispatchSourceTimer?
 
     public init() {}
 
@@ -62,7 +61,7 @@ public final class AudioRecorder {
         samples.removeAll(keepingCapacity: true)
         pendingPCM.removeAll()
         stats = CaptureStats()
-        meter = LevelMeter()
+        meter.clearBatch()
         lock.unlock()
         startedAt = DispatchTime.now()
         stats.device = AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown"
@@ -110,6 +109,9 @@ public final class AudioRecorder {
         lock.withLock {
             samples.removeAll(keepingCapacity: true)
             pendingPCM.removeAll()
+            levelTimer?.cancel()
+            levelTimer = nil
+            meter.clearBatch()
         }
     }
 
@@ -126,6 +128,9 @@ public final class AudioRecorder {
         let remainder = pendingPCM
         samples.removeAll()
         pendingPCM.removeAll()
+        levelTimer?.cancel()
+        levelTimer = nil
+        meter.clearBatch()
         lock.unlock()
         if !remainder.isEmpty { onPCMChunk?(remainder) }
         return captured
@@ -174,18 +179,24 @@ public final class AudioRecorder {
         lock.unlock()
         for pcm in ready { onPCMChunk?(pcm) }
 
-        // The meter sees every chunk (its peak tracking needs real time); the
-        // pill gets the loudest level since its last 30 fps post.
-        let seconds = Double(chunk.count) / AudioRecorder.sampleRate
-        let now = ProcessInfo.processInfo.systemUptime
-        let post: Float? = lock.withLock {
-            pendingLevel = max(pendingLevel, meter.level(rms: AudioLevel.rms(chunk), seconds: seconds))
-            guard now - lastLevelPost >= 1.0 / 30.0 else { return nil }
-            lastLevelPost = now
-            defer { pendingLevel = 0 }
-            return pendingLevel
+        guard !chunk.isEmpty else { return }
+        let db = WisprLevel.db(samples: chunk)
+        lock.withLock {
+            let now = ProcessInfo.processInfo.systemUptime
+            meter.append(db: db, at: now)
+            if levelTimer == nil {
+                let timer = DispatchSource.makeTimerSource(queue: .main)
+                timer.schedule(deadline: .now() + WisprLevel.batchSeconds, repeating: WisprLevel.batchSeconds)
+                timer.setEventHandler { [weak self] in self?.postLevelBatch() }
+                levelTimer = timer
+                timer.resume()
+            }
         }
-        if let post { DispatchQueue.main.async { [weak self] in self?.onLevel?(post) } }
+    }
+
+    private func postLevelBatch() {
+        let mean = lock.withLock { meter.batch(at: ProcessInfo.processInfo.systemUptime) }
+        if let mean { onLevel?(mean) }
     }
 
     public enum RecorderError: Error { case noInput }

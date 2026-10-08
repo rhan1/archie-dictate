@@ -55,7 +55,7 @@ public final class PillPanel {
         panel.contentView = pillView
     }
 
-    public func push(level: Float) {
+    public func push(level: Double) {
         guard !demoLevels else { return }
         pillView.push(level: CGFloat(level))
     }
@@ -107,10 +107,10 @@ public final class PillPanel {
 
     private func startAnimating() {
         guard animationTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             if self.demoLevels {
-                self.demoPhase += 1.0 / 30.0
+                self.demoPhase += 1.0 / 60.0
                 self.pillView.push(level: 0.55 + 0.4 * sin(self.demoPhase * 5))
             }
             self.pillView.tick()
@@ -148,6 +148,7 @@ final class PillView: NSView {
     /// Bars never scroll: each one scales about its own centre from one
     /// smoothed level (the model lives in Core so the G10 bench uses it too).
     private var bars = PillBars()
+    private var animationStartedAt = ProcessInfo.processInfo.systemUptime
     var smoothed: CGFloat { CGFloat(bars.smoothed) }
     /// Animation clock for the transcribing dots.
     private var phase: CGFloat = 0
@@ -167,18 +168,21 @@ final class PillView: NSView {
         return NSRect(x: c.maxX - PillView.buttonInset - d, y: c.midY - d / 2, width: d, height: d)
     }
 
-    func resetLevels() { bars.reset() }
+    func resetLevels() {
+        bars.reset()
+        animationStartedAt = ProcessInfo.processInfo.systemUptime
+    }
 
     func push(level: CGFloat) { bars.push(level: Double(level)) }
 
     func tick() {
         bars.tick()
-        phase += 1.0 / 30.0
+        phase += 1.0 / 60.0
         needsDisplay = true
     }
 
     /// Height of bar `i` right now (x never changes; only this does).
-    func barHeight(_ i: Int) -> CGFloat { CGFloat(bars.height(i)) }
+    func barHeight(_ i: Int) -> CGFloat { CGFloat(bars.heights(at: ProcessInfo.processInfo.systemUptime - animationStartedAt)[i]) }
 
     /// x of bar `i` — fixed, centred between the two buttons.
     func barX(_ i: Int) -> CGFloat {
@@ -273,10 +277,10 @@ final class PillView: NSView {
         let barWidth = PillView.barWidth
         (live ? NSColor.white : NSColor(white: 0.45, alpha: 1)).setFill()
         for i in 0..<PillView.barCount {
-            // Quiet = 2 pt dots, like Wispr; voice scales each bar in place.
+            // Every bar grows around the existing fixed vertical centre.
             let h = live ? barHeight(i) : PillView.barIdleHeight
             let rect = NSRect(x: barX(i), y: capsuleRect.midY - h / 2, width: barWidth, height: h)
-            NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
+            NSBezierPath(roundedRect: rect, xRadius: 0.5, yRadius: 0.5).fill()
         }
     }
 
