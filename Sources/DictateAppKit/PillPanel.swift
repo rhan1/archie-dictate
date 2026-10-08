@@ -65,10 +65,11 @@ public final class PillPanel {
     private let demoLevels = ProcessInfo.processInfo.environment["DICTATE_DEMO_LEVELS"] == "1"
     private var demoPhase: CGFloat = 0
 
-    public func show(_ newMode: Mode) {
+    public func show(_ newMode: Mode, held: Bool = false) {
         errorHideWork?.cancel()
         mode = newMode
         pillView.mode = newMode
+        pillView.held = held && newMode == .error
         guard newMode != .hidden else { return hide() }
         if newMode == .recording || newMode == .warming { pillView.resetLevels() }
         if !panel.isVisible && !suppressed {
@@ -128,6 +129,7 @@ final class PillView: NSView {
     var onCancel: (() -> Void)?
     var onFinish: (() -> Void)?
     var mode: PillPanel.Mode = .hidden { didSet { needsDisplay = true } }
+    var held = false { didSet { needsDisplay = true } }
 
     private static let capsuleColor = NSColor.black
     private static let outlineColor = NSColor(srgbRed: 0x20 / 255.0, green: 0x20 / 255.0, blue: 0x1F / 255.0, alpha: 1)
@@ -244,6 +246,17 @@ final class PillView: NSView {
         NSBezierPath(ovalIn: finishRect).fill()
         NSColor.black.setStroke()
         let c = NSPoint(x: finishRect.midX, y: finishRect.midY)
+        if mode == .error, held {
+            let outline = NSBezierPath(rect: NSRect(x: c.x - 3.5, y: c.y - 4, width: 7, height: 8))
+            outline.lineWidth = 1
+            outline.stroke()
+            PillView.finishFill.withAlphaComponent(0.55).setFill()
+            let tab = NSBezierPath(rect: NSRect(x: c.x - 2, y: c.y + 2.5, width: 4, height: 2))
+            tab.lineWidth = 1
+            tab.fill()
+            tab.stroke()
+            return
+        }
         let check = NSBezierPath()
         check.lineWidth = 1.5
         check.lineCapStyle = .round
