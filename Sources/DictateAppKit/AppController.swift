@@ -19,7 +19,10 @@ public final class AppController {
         try KeychainAPIKey.read()   // D2: read at use time, never cached
     }
     private let prompt: String
-    private let cleaner: TranscriptCleaner
+    /// Cleanup runs LOCALLY (Ollama, G7); the cloud model is only the fallback
+    /// when Ollama is unreachable.
+    private let localCleaner: OllamaCleaner
+    private let cloudCleaner: TranscriptCleaner
     /// The Realtime session for the current dictation.
     private var transcriber: RealtimeTranscriber?
     /// One idle Realtime socket kept open so no dictation pays the ~0.7 s
@@ -30,6 +33,10 @@ public final class AppController {
     private var warmTimer: Timer?
     /// Per-dictation facts for the stderr timeline.
     private var socketOrigin = ""
+    /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
+    /// until the first buffer (G8).
+    private var warmup = CaptureWarmup()
+    private var prewarmExpiry: DispatchWorkItem?
     private var recordingStartMs: UInt64 = 0
     /// L4 lever: bypasses the network with a fixed transcript.
     private let fakeTranscript = ProcessInfo.processInfo.environment["DICTATE_FAKE_TRANSCRIPT"]
@@ -48,7 +55,9 @@ public final class AppController {
         prompt = Vocabulary.buildPrompt(fileURL: AppController.vocabularyURL)
         // The vocabulary feeds ONLY the cleanup prompt: given to the STT model
         // it was echoed back verbatim instead of the speech (live, 00:27).
-        cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: TranscriptCleaner.deadline),
+        localCleaner = OllamaCleaner(transport: URLSessionTransport(timeout: 30), model: OllamaCleaner.defaultModel,
+                                     vocabulary: prompt)
+        cloudCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: TranscriptCleaner.deadline),
                                     vocabulary: prompt) { try KeychainAPIKey.read() }
     }
 
@@ -59,6 +68,10 @@ public final class AppController {
         pill.onFinish = { [weak self] in self?.finishButton() }
         statusItem.onToggle = { [weak self] in self?.doubleTap() }
         recorder.onLevel = { [weak self] level in self?.pill.push(level: level) }
+        recorder.onFirstBuffer = { [weak self] in
+            guard let self else { return }
+            self.apply(self.warmup.bufferArrived(at: ProcessInfo.processInfo.systemUptime))
+        }
 
         let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         let tapOK = hotkeys.start()
@@ -70,6 +83,7 @@ public final class AppController {
         if !trusted { watchAccessibilityGrant() }
         if fakeTranscript == nil {
             keepWarm(force: true)
+            Task { [localCleaner] in await localCleaner.warmUp() }
             let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.keepWarm(force: false) }
             RunLoop.main.add(timer, forMode: .common)
             warmTimer = timer
@@ -109,10 +123,40 @@ public final class AppController {
     /// ⌥⌥ starts, one clean ⌥ tap finishes (A2). A clean tap while idle may be
     /// the first half of a double-tap: make sure a warm socket exists.
     private func hotkey(_ signal: TapSignal) {
-        if signal == .tap, machine.state == .idle, fakeTranscript == nil, warmIsHealthy == false {
-            keepWarm(force: true)
+        if signal == .tap, machine.state == .idle {
+            if fakeTranscript == nil, warmIsHealthy == false { keepWarm(force: true) }
+            if fakeTranscript == nil { Task { [localCleaner] in await localCleaner.warmUp() } }
+            prewarmEngine()
         }
         perform(machine.handle(signal))
+    }
+
+    /// First ⌥ tap: start the engine now so a Bluetooth headset's profile
+    /// switch overlaps the second tap. Stopped silently if no ⌥⌥ follows.
+    private func prewarmEngine() {
+        apply(warmup.firstTap())
+        prewarmExpiry?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.machine.state == .idle else { return }
+            self.apply(self.warmup.prewarmExpired())
+        }
+        prewarmExpiry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + CaptureWarmup.prewarmTimeout, execute: work)
+    }
+
+    private func apply(_ effects: [CaptureWarmup.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .startEngine:
+                do { try recorder.start() } catch { AppController.note("engine start failed: \(error)") }
+            case .stopEngine:
+                _ = recorder.stop()
+            case .showWarming:
+                pill.show(.warming)
+            case .showLive:
+                if machine.state == .recording { pill.show(.recording) }
+            }
+        }
     }
 
     private var warmIsHealthy: Bool {
@@ -170,22 +214,21 @@ public final class AppController {
             let session = takeTranscriber()
             transcriber = session
             recorder.onPCMChunk = { pcm in session.append(pcm) }
-            Task { [cleaner] in await cleaner.warmUp() }
+            Task { [localCleaner] in await localCleaner.warmUp() }
         } else {
             recorder.onPCMChunk = nil
         }
-        do {
-            try recorder.start()
-        } catch {
-            if fakeTranscript == nil {
-                machine = DictationStateMachine()
-                dropTranscriber()
-                fail(reason: "mic_\(micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
-                return
-            }
+        prewarmExpiry?.cancel()
+        apply(warmup.recordingStarted(at: ProcessInfo.processInfo.systemUptime))
+        recorder.resetCapture()      // pre-roll from the pre-warm is not part of the dictation
+        if !recorder.isRunning, fakeTranscript == nil {
+            machine = DictationStateMachine()
+            warmup.stopped()
+            dropTranscriber()
+            fail(reason: "mic_\(micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
+            return
         }
         statusItem.setRecording(true)
-        pill.show(.recording)
         traceFocus("pill shown")
         capTimer?.invalidate()
         capTimer = Timer.scheduledTimer(withTimeInterval: DictationLimits.maxDuration, repeats: false) { [weak self] _ in
@@ -206,10 +249,13 @@ public final class AppController {
         let finishedAt = Date()
         let samples = recorder.stop()      // also flushes the last chunk to the socket
         recorder.onPCMChunk = nil
+        let warmMs = warmup.warmMs
+        warmup.stopped()
         let duration = finishedAt.timeIntervalSince(recordingStarted ?? finishedAt)
         let bytes = 44 + samples.count * 2
         let session = transcriber
         transcriber = nil
+        keepWarm(force: true)   // refill the idle socket on EVERY end path (silence/error included)
         let myGeneration = generation
         pill.show(.transcribing)
 
@@ -223,8 +269,9 @@ public final class AppController {
         let fake = fakeTranscript
         let vocabulary = self.prompt
         let client = self.client
-        let cleaner = self.cleaner
-        var timeline = Timeline(capture: recorder.stats, socket: socketOrigin, recordingStartMs: recordingStartMs,
+        let localCleaner = self.localCleaner
+        let cloudCleaner = self.cloudCleaner
+        var timeline = Timeline(warmMs: warmMs, capture: recorder.stats, socket: socketOrigin, recordingStartMs: recordingStartMs,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
@@ -247,15 +294,11 @@ public final class AppController {
                     pipeline.cleanup = "skipped:short"
                 } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
-                    do {
-                        let (text, stats) = try await cleaner.cleanWithStats(raw)
-                        pipeline.text = text
-                        pipeline.cleanup = "ok"
-                        timeline.cleanup = stats
-                    } catch {
-                        pipeline.text = raw
-                        pipeline.cleanup = "skipped:\((error as? TranscriptionError)?.logReason ?? "error")"
-                    }
+                    let outcome = await Self.cleanUp(raw, local: localCleaner, cloud: cloudCleaner)
+                    pipeline.text = outcome.text
+                    pipeline.cleanup = outcome.label
+                    pipeline.cleanupModel = outcome.model
+                    timeline.cleanup = outcome.stats
                     pipeline.cleanupMs = Int(Date().timeIntervalSince(cleanStart) * 1000)
                 }
             }
@@ -273,7 +316,7 @@ public final class AppController {
                         e.path = report.path
                         e.sttMs = report.sttMs
                         e.cleanupMs = report.cleanupMs
-                        e.cleanupModel = report.cleanup == nil ? nil : cleaner.model
+                        e.cleanupModel = report.cleanupModel
                         e.cleanup = report.cleanup
                     }
                     return e
@@ -297,7 +340,6 @@ public final class AppController {
                 }
                 if fake == nil {
                     AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path))
-                    self.keepWarm(force: true)   // refill the idle socket for the next dictation
                 }
             }
         }
@@ -305,8 +347,31 @@ public final class AppController {
 
     enum EchoError: Error { case promptEcho }
 
+    /// Local first. Cloud only when Ollama cannot be reached at all; a local
+    /// overrun or error pastes the raw text (never waits for a second model).
+    private static func cleanUp(_ raw: String, local: OllamaCleaner, cloud: TranscriptCleaner) async
+        -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?) {
+        // ~4 chars per token at ~55 tok/s on this Mac, plus prompt time.
+        let timed = OllamaCleaner(transport: local.transport, model: local.model, vocabulary: local.vocabulary,
+                              deadline: max(2.5, 0.8 + Double(raw.count) / 4 / 45))
+        do {
+            let (text, stats) = try await timed.cleanWithStats(raw)
+            return (text, "ok", local.model, stats)
+        } catch TranscriptionError.network(let code) where code != "timedOut" {
+            do {
+                let (text, stats) = try await cloud.cleanWithStats(raw)
+                return (text, "cloud", cloud.model, stats)
+            } catch {
+                return (raw, "skipped:cloud_\((error as? TranscriptionError)?.logReason ?? "error")", cloud.model, nil)
+            }
+        } catch {
+            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil)
+        }
+    }
+
     /// One stderr line per dictation: where the time went. Counts and ms only.
     struct Timeline {
+        var warmMs: Int?
         var capture: AudioRecorder.CaptureStats
         var socket: String
         var recordingStartMs: UInt64
@@ -325,7 +390,7 @@ public final class AppController {
             let rt = realtime
             return [
                 "timeline:",
-                "device=\"\(capture.device)\"", "fmt=\(capture.startFormat)",
+                "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "fmt=\(capture.startFormat)",
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
@@ -347,6 +412,7 @@ public final class AppController {
 
     /// What happened between the finish tap and the paste, for the log.
     struct PipelineReport {
+        var cleanupModel: String?
         var path = "realtime"
         var sttMs: Int?
         var cleanupMs: Int?
@@ -382,7 +448,9 @@ public final class AppController {
         statusItem.setRecording(false)
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
         _ = recorder.stop()   // discard: nothing is kept
+        warmup.stopped()
         dropTranscriber()
+        keepWarm(force: true)
         pill.hide()
         traceFocus("pill hidden, cancelled")
         log(duration: duration, bytes: 0, latencyMs: 0, chars: 0, app: AppController.frontmostBundleID(), outcome: .cancel)
