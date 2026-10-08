@@ -29,6 +29,7 @@ echo "==> Assembling bundle at $APP_PATH..."
 rm -rf "$CONTENTS"
 mkdir -p "$MACOS" "$CONTENTS/Resources"
 cp "$RELEASE_BIN" "$MACOS/Dictate"
+cp "$REPO_DIR/Resources/vocab-hints.txt" "$CONTENTS/Resources/vocab-hints.txt"
 chmod +x "$MACOS/Dictate"
 
 # LSUIElement: menu-bar only, no Dock icon. The microphone usage string must be

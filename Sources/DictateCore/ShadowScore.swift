@@ -5,6 +5,10 @@ public enum ShadowScore {
     public static let script = "Um, so for the Politrace launch, send the draft to the team on Tuesday, no, Wednesday. We need, like, three things: the Limpar match counts, the DB99 query, and, uh, the screenshots. Can you also check if TurnoutWatch is still running?"
     public static let names = ["Politrace", "Limpar", "DB99", "TurnoutWatch"]
 
+    public static func line(appleNames: Int, pastedNames: Int, groqNames: Int, milliseconds: Int) -> String {
+        "shadow=groq names_apple=\(appleNames)/4 names_pasted=\(pastedNames)/4 names_groq=\(groqNames)/4 shadow_ms=\(milliseconds)"
+    }
+
     private static func tokens(_ text: String) -> [String] {
         text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
     }
