@@ -47,8 +47,12 @@ public final class AppController {
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private var warmup = CaptureWarmup()
-    /// Pauses playing media while dictating; resumes only what it paused.
+    /// Raza (2026-10-09): media keeps PLAYING, muted while he talks. Output
+    /// mute flag only; pausing is the fallback for devices without one.
+    private let muter = OutputMuter(device: SystemOutputMute())
     private let media = MediaPauser(control: SystemMedia())
+    private var muteWatchdog: DispatchWorkItem?
+    private var signalSource: DispatchSourceSignal?
     private var mediaLog: [String] = []
     private var prewarmExpiry: DispatchWorkItem?
     private var recordingStartMs: UInt64 = 0
@@ -111,6 +115,9 @@ public final class AppController {
             RunLoop.main.add(timer, forMode: .common)
             warmTimer = timer
         }
+        // A run that crashed while muted is undone at launch.
+        if let event = muter.recoverIfNeeded() { AppController.note("media=\(event.rawValue) (at launch)") }
+        installTerminationRestore()
         AudioRecorder.requestMicrophoneAccess { [weak self] granted in
             self?.micAvailable = granted
             AppController.note("microphone=\(granted)")
@@ -185,22 +192,60 @@ public final class AppController {
         }
     }
 
-    /// Recording is live: pause media, then check the key did not start
-    /// something else instead.
+    /// Recording is live: mute the output (media keeps playing). Only a device
+    /// with no mute flag falls back to pausing media.
     private func pauseMedia() {
         guard fakeTranscript == nil else { return }
-        mediaLog = [media.pauseIfPlaying().rawValue]
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self, let event = self.media.verifyAfterPause() else { return }
-            self.mediaLog.append(event.rawValue)
+        if let event = muter.recoverIfNeeded() { mediaLog.append(event.rawValue) }
+        let event = muter.mute()
+        switch event {
+        case .muted:
+            mediaLog.append("muted")
+            let watchdog = DispatchWorkItem { [weak self] in
+                guard let self, let restored = self.muter.restore() else { return }
+                AppController.note("mute watchdog fired: \(restored.rawValue)")
+            }
+            muteWatchdog?.cancel()
+            muteWatchdog = watchdog
+            DispatchQueue.main.asyncAfter(deadline: .now() + 330, execute: watchdog)   // 5.5 min
+        case .unsupported:
+            let paused = media.pauseIfPlaying()
+            mediaLog.append(paused == .paused ? "paused:no_mute" : paused.rawValue)
+            if paused == .paused {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    guard let self, let event = self.media.verifyAfterPause() else { return }
+                    self.mediaLog.append(event.rawValue)
+                }
+            }
+        default:
+            mediaLog.append(event.rawValue)
         }
     }
 
-    /// Every end path (paste, cancel, error, silence) resumes what we paused.
+    /// Every end path (paste, cancel, error, silence, cap) restores the mute
+    /// flag on the device we muted, and resumes anything the fallback paused.
     private func resumeMedia() -> String {
+        muteWatchdog?.cancel()
+        if let event = muter.restore() { mediaLog.append(event.rawValue) }
         if let event = media.resumeIfWePaused() { mediaLog.append(event.rawValue) }
         defer { mediaLog = [] }
-        return mediaLog.isEmpty ? "-" : mediaLog.joined(separator: ">")
+        return mediaLog.isEmpty ? "none" : mediaLog.joined(separator: ">")
+    }
+
+    /// Quit (menu) and SIGTERM (launchctl kickstart/bootout) both restore the
+    /// mute flag before the process goes away.
+    private func installTerminationRestore() {
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.muter.restore()
+        }
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.muter.restore()
+            exit(0)
+        }
+        source.resume()
+        signalSource = source
     }
 
     private var warmIsHealthy: Bool {
