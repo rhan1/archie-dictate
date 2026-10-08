@@ -47,6 +47,9 @@ public final class AppController {
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private var warmup = CaptureWarmup()
+    /// Pauses playing media while dictating; resumes only what it paused.
+    private let media = MediaPauser(control: SystemMedia())
+    private var mediaLog: [String] = []
     private var prewarmExpiry: DispatchWorkItem?
     private var recordingStartMs: UInt64 = 0
     /// L4 lever: bypasses the network with a fixed transcript.
@@ -174,9 +177,30 @@ public final class AppController {
             case .showWarming:
                 pill.show(.warming)
             case .showLive:
-                if machine.state == .recording { pill.show(.recording) }
+                if machine.state == .recording {
+                    pill.show(.recording)
+                    pauseMedia()
+                }
             }
         }
+    }
+
+    /// Recording is live: pause media, then check the key did not start
+    /// something else instead.
+    private func pauseMedia() {
+        guard fakeTranscript == nil else { return }
+        mediaLog = [media.pauseIfPlaying().rawValue]
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, let event = self.media.verifyAfterPause() else { return }
+            self.mediaLog.append(event.rawValue)
+        }
+    }
+
+    /// Every end path (paste, cancel, error, silence) resumes what we paused.
+    private func resumeMedia() -> String {
+        if let event = media.resumeIfWePaused() { mediaLog.append(event.rawValue) }
+        defer { mediaLog = [] }
+        return mediaLog.isEmpty ? "-" : mediaLog.joined(separator: ">")
     }
 
     private var warmIsHealthy: Bool {
@@ -278,6 +302,7 @@ public final class AppController {
         recorder.onPCMChunk = nil
         let warmMs = warmup.warmMs
         warmup.stopped()
+        let mediaEvents = resumeMedia()
         let duration = finishedAt.timeIntervalSince(recordingStarted ?? finishedAt)
         let bytes = 44 + samples.count * 2
         let session = transcriber
@@ -303,7 +328,7 @@ public final class AppController {
         let cloudCleaner = self.cloudCleaner
         let groqCleaner = self.groqCleaner
         let groqSTT = self.groqSTT
-        var timeline = Timeline(warmMs: warmMs, capture: recorder.stats, socket: socketOrigin, recordingStartMs: recordingStartMs,
+        var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, socket: socketOrigin, recordingStartMs: recordingStartMs,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
@@ -422,6 +447,7 @@ public final class AppController {
 
     /// One stderr line per dictation: where the time went. Counts and ms only.
     struct Timeline {
+        var media: String
         var warmMs: Int?
         var capture: AudioRecorder.CaptureStats
         var socket: String
@@ -441,7 +467,7 @@ public final class AppController {
             let rt = realtime
             return [
                 "timeline:",
-                "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "fmt=\(capture.startFormat)",
+                "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)", "fmt=\(capture.startFormat)",
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
@@ -500,6 +526,8 @@ public final class AppController {
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
         _ = recorder.stop()   // discard: nothing is kept
         warmup.stopped()
+        let mediaEvents = resumeMedia()
+        if mediaEvents != "-" { AppController.note("cancel media=\(mediaEvents)") }
         dropTranscriber()
         apple?.cancel()
         apple = nil
