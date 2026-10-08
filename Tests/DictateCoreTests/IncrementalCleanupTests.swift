@@ -96,6 +96,29 @@ struct IncrementalCleanupTests {
         }
     }
 
+    /// Live 05:26: the last chunk's text lands AFTER the finish tap; it must not
+    /// start another intermediate call that the final tail call then waits for.
+    @Test func sealAtFinishTapStopsNewIntermediateCalls() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        for index in 0..<3 { incremental.append(index: index, text: chunkText) }
+        try await transport.wait(1)
+        try await transport.respond(0, chunkText)
+        await incremental.waitForPending()
+        incremental.append(index: 3, text: chunkText)
+        incremental.seal()                                   // finish tap
+        incremental.append(index: 4, text: chunkText)        // would make 2 more cleanable
+        incremental.append(index: 5, text: chunkText)
+        #expect(await transport.count == 1)                  // no new intermediate call
+        let finish = Task { await incremental.finish(totalChunks: 6) }
+        try await transport.wait(2)
+        #expect(await transport.count == 2)                  // straight to the final call
+        try await transport.respond(1, Array(repeating: chunkText, count: 5).joined(separator: " "))
+        let result = await finish.value
+        #expect(result.mode == "incremental")
+        #expect(result.calls == 2)
+    }
+
     @Test(arguments: [1, 2]) func shortDictationUsesSinglePath(chunks: Int) async {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
