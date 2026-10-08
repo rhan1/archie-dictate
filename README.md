@@ -4,22 +4,24 @@ Dictate is a menu-bar dictation application for macOS. Press **⌥⌥** (double-
 
 ## Quick start
 
-1. Get a Groq API key at [console.groq.com](https://console.groq.com).
-2. Store the key in your login keychain: `security add-generic-password -s groq-api -a "$USER" -w '<your-groq-key>'`
-3. Install Ollama and start the fallback cleanup model: `brew install ollama && brew services start ollama && ollama pull llama3.2:3b-instruct-q4_K_M`
-4. Install the Swift 6.3.3 toolchain from [swift.org](https://www.swift.org/install/) to `~/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain`.
-5. Create the signing identity: `tools/ensure-signing-identity.sh`
-6. Build the application bundle: `tools/make-app.sh`
-7. Install and launch the agent: `tools/install-launchagent.sh`
-8. Grant **Microphone** and **Accessibility** permissions to `Dictate.app` in **System Settings → Privacy & Security**.
-9. When prompted with a keychain dialog for "Dictate", click **Always Allow**.
-10. Press **⌥⌥** anywhere to try it.
+1. Install the Xcode command line tools (`xcode-select --install`) and [Homebrew](https://brew.sh).
+2. `git clone <repo-url> && cd dictate` — all `tools/` commands run from the repo root.
+3. Get a Groq API key at [console.groq.com](https://console.groq.com).
+4. Store the key in your login keychain: `security add-generic-password -s groq-api -a "$USER" -w '<your-groq-key>'`
+5. Install Ollama and start the fallback cleanup model (optional — offline cleanup fallback): `brew install ollama && brew services start ollama && ollama pull llama3.2:3b-instruct-q4_K_M`
+6. Install the Swift 6.3.3 toolchain from [swift.org](https://www.swift.org/install/) and run the installer with **Install for me only**, so it lands in `~/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain`.
+7. Create the signing identity: `tools/ensure-signing-identity.sh`
+8. Build the application bundle: `tools/make-app.sh`
+9. Install and launch the agent: `tools/install-launchagent.sh`
+10. Grant **Microphone** and **Accessibility** permissions to `Dictate.app` in **System Settings → Privacy & Security**.
+11. When the keychain dialog appears (right after the app first launches during install), click **Always Allow**.
+12. Press **⌥⌥** anywhere to try it.
 
 ## Requirements
 
 - **Operating System & Architecture:** macOS 26 on an Apple Silicon Mac.
 - **Xcode Command Line Tools:** Required for the SDK and linker (`xcode-select --install`).
-- **Swift 6.3.3 Toolchain:** Download the macOS package installer from [swift.org](https://www.swift.org/install/) and install it to `~/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain`. That path is what the build and bench scripts (`tools/*.sh`) use.
+- **Swift 6.3.3 Toolchain:** Download the macOS package installer from [swift.org](https://www.swift.org/install/) and run it with **Install for me only** so it lands in `~/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain`. That path is what the build and bench scripts (`tools/*.sh`) use; a system-wide install goes to `/Library/Developer/Toolchains` and the scripts will not find it.
 - **Homebrew:** Required for installing dependencies ([brew.sh](https://brew.sh)).
 - **Ollama (Optional):** Only needed for the offline cleanup fallback (`llama3.2:3b-instruct-q4_K_M`). If omitted, cloud cleanup operates normally, and Dictate pastes raw transcripts when offline.
 
@@ -43,11 +45,14 @@ Every script in `tools/*.sh` sources `~/Library/Application Support/Dictate/buil
 - `DICTATE_BUNDLE_ID`: Application bundle identifier (defaults to `dev.dictate.app`).
 - `DICTATE_LABEL`: LaunchAgent service label (defaults to the bundle ID, `dev.dictate.app`).
 
-Example `~/Library/Application Support/Dictate/build.env`:
+Create the directory first, then the file:
 ```bash
+mkdir -p "$HOME/Library/Application Support/Dictate"
+cat > "$HOME/Library/Application Support/Dictate/build.env" <<'ENVEOF'
 DICTATE_SIGNING_IDENTITY="Dictate Dev"
 DICTATE_BUNDLE_ID="dev.dictate.app"
 DICTATE_LABEL="dev.dictate.app"
+ENVEOF
 ```
 
 ## Permissions
@@ -56,7 +61,7 @@ Configure the following permissions in macOS:
 
 1. **Microphone & Accessibility:** Grant permissions to `Dictate.app` under **System Settings → Privacy & Security → Microphone** and **System Settings → Privacy & Security → Accessibility**.
 2. **Input Monitoring:** If the hotkey does nothing even with Accessibility granted, also grant `Dictate.app` access under **System Settings → Privacy & Security → Input Monitoring** (macOS occasionally requires this for listen-only event taps).
-3. **Keychain Access:** When the macOS dialog asks for access to the `groq-api` keychain item naming **"Dictate"**, choose **Always Allow**. If a dialog appears naming **"DictateBench"**, select **Deny** (benchmark runs provide keys via the environment rather than keychain prompts).
+3. **Keychain Access:** The "Dictate wants to use groq-api" keychain dialog appears right after the app first launches (during install), not on the first dictation; answer **Always Allow**.
 
 ## Usage
 
@@ -76,16 +81,12 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 - **Automatic Fallback:** Apple on-device speech recognition (`Speech.framework`) serves as the automatic fallback if Groq chunk uploads fail.
 - **Force Apple-Only STT:** To force Apple on-device recognition for the LaunchAgent, set `DICTATE_STT=apple`:
   ```bash
-  # Ensure the EnvironmentVariables dictionary exists:
-  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" ~/Library/LaunchAgents/<label>.plist 2>/dev/null || true
-
-  # Set DICTATE_STT to apple:
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" ~/Library/LaunchAgents/<label>.plist 2>/dev/null
+  /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:DICTATE_STT" ~/Library/LaunchAgents/<label>.plist 2>/dev/null
   /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:DICTATE_STT string apple" ~/Library/LaunchAgents/<label>.plist
-
-  # Restart the LaunchAgent:
-  launchctl kickstart -k "gui/$UID/<label>"
+  launchctl bootout "gui/$UID/<label>" 2>/dev/null; sleep 2; launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/<label>.plist
   ```
-  *(Replace `<label>` with your LaunchAgent label, default `dev.dictate.app`.)*
+  *Note:* launchd only re-reads the plist on bootstrap (a plain restart reuses the cached job). Re-running `tools/install-launchagent.sh` regenerates the plist and drops this override, so repeat these lines after it. `<label>` is `DICTATE_LABEL` (default `dev.dictate.app`).
 
 ## Vocabulary hints
 
@@ -116,7 +117,9 @@ Teach Dictate domain-specific terms, technical names, or phonetic corrections:
 
 ## Benchmarks (optional)
 
-Run benchmarks via `tools/bench.sh`, which signs the benchmark binary and passes the Groq API key securely via the environment:
+Run benchmarks via `tools/bench.sh`, which signs the benchmark binary and passes the Groq API key via the environment. The bench never reads the keychain itself: `tools/bench.sh` fetches the key with the `security` tool and passes it in the environment.
+
+Models: Groq cleanup for `cleanup` / `eval groq` is `qwen/qwen3.8-27b` (the cleanup bench always uses Groq); local cleanup for `cleanup-local` / `eval local` is `llama3.2:3b-instruct-q4_K_M`.
 
 ### Create a Test Audio Fixture
 Create a 24 kHz mono PCM16 audio fixture without playing sound:
@@ -130,7 +133,7 @@ afconvert -f WAVE -d LEI16@24000 -c 1 /tmp/fixture16.wav /tmp/fixture.wav
 - `tools/bench.sh stt-groq-chunked <wav> <runs>`
 - `tools/bench.sh stt-apple <wav> <runs>`
 - `tools/bench.sh stt-groq <wav> <runs>`
-- `BENCH_GROQ=1 tools/bench.sh cleanup <model> <runs>`
+- `tools/bench.sh cleanup <model> <runs>`
 - `tools/bench.sh cleanup-local <model> <runs>`
 - `tools/bench.sh eval groq|local <model>`
 - `tools/bench.sh levels <wav> new|old`
@@ -158,6 +161,7 @@ To remove Dictate:
    ```bash
    rm -rf ~/Library/Application\ Support/Dictate ~/Library/Logs/Dictate
    ```
+5. If wanted, remove the signing certificate: Keychain Access → login → My Certificates → delete "Dictate Dev" (or `security delete-identity -c "Dictate Dev"`).
 
 ## Coming from Wispr Flow
 
