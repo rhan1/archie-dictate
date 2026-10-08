@@ -18,6 +18,12 @@ public struct TranscriptCleaner: Sendable {
         text.split(whereSeparator: { $0.isWhitespace }).count >= minWords
     }
 
+    public static func ratioFloor(for input: String) -> Double {
+        let lowercased = input.lowercased()
+        let cues = ["no,", "actually", "sorry", "i mean", "make that", "scratch that", "wait"]
+        return cues.contains(where: { lowercased.contains($0) }) ? 0.15 : 0.3
+    }
+
     /// Few-shot pairs shared by the cloud and local cleaners. Deliberately NOT
     /// the G7 eval cases (the eval must measure, not memorise).
     public static let examples: [(String, String)] = [
@@ -168,7 +174,7 @@ public struct TranscriptCleaner: Sendable {
         guard !cleaned.isEmpty else { throw TranscriptionError.decode }
         let inputCount = Double(text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
         let outputCount = Double(cleaned.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
-        guard outputCount >= 0.5 * inputCount, outputCount <= 1.5 * inputCount else {
+        guard outputCount >= Self.ratioFloor(for: text) * inputCount, outputCount <= 1.5 * inputCount else {
             throw TranscriptionError.rejected("ratio")
         }
         let usage = json["usage"] as? [String: Any]

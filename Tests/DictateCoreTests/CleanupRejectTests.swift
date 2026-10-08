@@ -50,7 +50,55 @@ struct CleanupRejectTests {
     }
 
     @Test func truncatedMeaningRejectedEvenWithStop() async throws {
-        await expectRejection(try cleaner(output: "Send the report to Alice", reason: "stop"), input: raw, reason: "ratio")
+        await expectRejection(try cleaner(output: "Send report", reason: "stop"), input: raw, reason: "ratio")
+    }
+
+    @Test func selfCorrectionAccepted() async throws {
+        let input = "Let's meet at three. Actually, sorry, make that four."
+        let output = "Let's meet at four."
+        #expect(try await cleaner(output: output, reason: "stop").clean(input) == output)
+    }
+
+    @Test func noCueAtTwentyPercentRejected() async throws {
+        let input = String(repeating: "a", count: 50)
+        let output = String(repeating: "b", count: 10)
+        await expectRejection(try cleaner(output: output, reason: "stop"), input: input, reason: "ratio")
+    }
+
+    @Test func noCueAtThirtyFivePercentAccepted() async throws {
+        let input = "abcdefghijklmnopqrst"
+        let output = "abcdefg"
+        #expect(try await cleaner(output: output, reason: "stop").clean(input) == output)
+    }
+
+    @Test func ratioFloorWithoutCue() {
+        #expect(TranscriptCleaner.ratioFloor(for: "Send the report to Alice.") == 0.3)
+        #expect(TranscriptCleaner.ratioFloor(for: "no") == 0.3)
+        #expect(TranscriptCleaner.ratioFloor(for: "") == 0.3)
+    }
+
+    @Test(arguments: ["no,", "actually", "sorry", "i mean", "make that", "scratch that", "wait"])
+    func ratioFloorForEachCue(cue: String) {
+        #expect(TranscriptCleaner.ratioFloor(for: cue) == 0.15)
+        #expect(TranscriptCleaner.ratioFloor(for: cue.uppercased()) == 0.15)
+    }
+
+    @Test(arguments: ["no,", "actually", "sorry", "i mean", "make that", "scratch that", "wait"])
+    func eachInputCueAllowsTwentyPercent(cue: String) async throws {
+        let input = cue.uppercased() + String(repeating: "a", count: 50 - cue.count)
+        let output = "bbbbbbbbbb"
+        #expect(try await cleaner(output: output, reason: "stop").clean(input) == output)
+    }
+
+    @Test func outputCueDoesNotLowerFloor() async throws {
+        let input = String(repeating: "a", count: 50)
+        await expectRejection(try cleaner(output: "actually", reason: "stop"), input: input, reason: "ratio")
+    }
+
+    @Test func selfCorrectionFloorUsesCollapsedWhitespace() async throws {
+        let input = "WAIT    abcdefghijklmno"
+        #expect(try await cleaner(output: "abc", reason: "stop").clean(input) == "abc")
+        await expectRejection(try cleaner(output: "ab", reason: "stop"), input: input, reason: "ratio")
     }
 
     @Test func expandedOutputRejected() async throws {
@@ -65,13 +113,13 @@ struct CleanupRejectTests {
     @Test func ratioUsesCollapsedWhitespace() async throws {
         let input = "Send     the\n\nreport\tto Alice and do not send it to Bob."
         #expect(try await cleaner(output: raw, reason: "stop").clean(input) == raw)
-        let spaced = "Send" + String(repeating: " ", count: 80) + "the report to Alice"
+        let spaced = "Send" + String(repeating: " ", count: 80) + "the report"
         await expectRejection(try cleaner(output: spaced, reason: "stop"), input: raw, reason: "ratio")
     }
 
     @Test func ratioBoundariesAccepted() async throws {
         let input = "abcdefghij"
-        #expect(try await cleaner(output: "abcde", reason: "stop").clean(input) == "abcde")
+        #expect(try await cleaner(output: "abc", reason: "stop").clean(input) == "abc")
         #expect(try await cleaner(output: "abcdefghijklmno", reason: "stop").clean(input) == "abcdefghijklmno")
     }
 
