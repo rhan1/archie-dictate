@@ -74,23 +74,35 @@ struct PasteboardRestoreTests {
     }
 
     @Test func pillGeometryMatchesWispr() {
-        #expect(PillPanel.capsuleSize == NSSize(width: 100, height: 28))
-        #expect(PillPanel.dockGap == 24)
+        // Measured from Wispr's own pill (2x capture ÷ 2), 2026-10-09 01:01.
+        #expect(PillPanel.capsuleSize == NSSize(width: 102, height: 30))
+        #expect(PillPanel.dockGap == 14)
         let view = PillView(frame: NSRect(origin: .zero, size: PillPanel.size))
         let capsule = view.capsuleRect
-        #expect(capsule.size == NSSize(width: 100, height: 28))
         #expect(view.cancelRect.size == NSSize(width: 18, height: 18))
-        #expect(view.finishRect.size == NSSize(width: 18, height: 18))
-        #expect(view.cancelRect.minX - capsule.minX == 5)
-        #expect(capsule.maxX - view.finishRect.maxX == 5)
+        #expect(view.cancelRect.minX - capsule.minX == 6)
+        #expect(capsule.maxX - view.finishRect.maxX == 6)
         #expect(view.cancelRect.midY == capsule.midY)
-        #expect(PillView.barCount == 8)
+        #expect(PillView.barCount == 10)
         #expect(PillView.barWidth + PillView.barGap == 4)
-        #expect(PillView.barIdleHeight == 2.5)
-        #expect(PillView.barPeakHeight == 14)
-        // 8 bars at 4 pt pitch fit between the buttons.
-        let strip = CGFloat(PillView.barCount) * PillView.barWidth + CGFloat(PillView.barCount - 1) * PillView.barGap
-        #expect(strip == 30)
-        #expect(strip < view.finishRect.minX - view.cancelRect.maxX)
+        #expect(PillView.barIdleHeight == 2)
+        #expect(view.barX(0) - capsule.minX == 32)
+        #expect(view.barX(9) + PillView.barWidth - capsule.minX == 70)
+    }
+
+    @Test func barsScaleInPlaceAndNeverMoveSideways() {
+        let view = PillView(frame: NSRect(origin: .zero, size: PillPanel.size))
+        let xs = (0..<PillView.barCount).map(view.barX)
+        var heights: [[CGFloat]] = []
+        for step in 0..<12 {
+            view.push(level: step < 6 ? 0.9 : 0.1)
+            view.tick()
+            heights.append((0..<PillView.barCount).map(view.barHeight))
+            #expect((0..<PillView.barCount).map(view.barX) == xs)   // no horizontal motion, ever
+        }
+        #expect(heights[3].allSatisfy { $0 > PillView.barIdleHeight })      // fast attack
+        #expect(heights[3] != heights[4])                                    // still alive, not frozen
+        #expect(view.smoothed > 0.1 && view.smoothed < 0.9)                  // slow decay after the drop
+        #expect(heights.joined().allSatisfy { $0 <= PillView.barPeakHeight })
     }
 }
