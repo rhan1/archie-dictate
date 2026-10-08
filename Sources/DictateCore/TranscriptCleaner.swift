@@ -9,6 +9,12 @@ public struct TranscriptCleaner: Sendable {
     /// gpt-4.1-nano 913 ms, gpt-4.1-mini 955, gpt-5.4-nano 1102, gpt-5.4-mini 1135.
     public static let defaultModel = "gpt-4.1-nano"
     public static let deadline: TimeInterval = 2.5
+    /// Raw transcripts this short have little to fix; cleanup is skipped (v1.1).
+    public static let minWords = 6
+
+    public static func shouldClean(_ text: String) -> Bool {
+        text.split(whereSeparator: { $0.isWhitespace }).count >= minWords
+    }
 
     public static let instructions = """
     You clean up dictated text. Rewrite the user's spoken words exactly as they would have typed them: \
@@ -24,6 +30,8 @@ public struct TranscriptCleaner: Sendable {
     public let model: String
     public let vocabulary: String
     public let apiKey: @Sendable () throws -> String
+    /// Predicted outputs on (default); the bench turns it off for before/after.
+    public var usePrediction = true
 
     public init(transport: HTTPTransport, model: String = TranscriptCleaner.defaultModel, vocabulary: String,
                 apiKey: @escaping @Sendable () throws -> String) {
@@ -54,6 +62,9 @@ public struct TranscriptCleaner: Sendable {
         // GPT-5-family models reason by default; "none" is the fastest setting
         // they accept ("minimal" is rejected by gpt-5.4-*).
         if model.hasPrefix("gpt-5") { body["reasoning_effort"] = "none" }
+        // Predicted outputs: the cleaned text is mostly the raw text verbatim,
+        // which is exactly what speculative decoding accelerates (gpt-4.1/4o only).
+        if usePrediction, model.hasPrefix("gpt-4") { body["prediction"] = ["type": "content", "content": text] }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return request
     }

@@ -205,7 +205,9 @@ public final class AppController {
                 let sttStart = Date()
                 result = await Self.transcribe(session: session, samples: samples, client: client, prompt: prompt, report: &pipeline)
                 pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
-                if case .success(let raw) = result, !raw.isEmpty {
+                if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
+                    pipeline.cleanup = "skipped:short"
+                } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
                     do {
                         pipeline.text = try await cleaner.clean(raw)
