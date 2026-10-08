@@ -48,6 +48,7 @@ public final class AppController {
     private var lastDictationTimer: Timer?
     private var capTimer: Timer?
     private var generation = 0
+    private var micStarting = false
     private var micAvailable = false
     private var pillOutcome: PillOutcome?
     private var outcomeText: String?
@@ -230,10 +231,18 @@ public final class AppController {
 
     /// First ⌥ tap: start the engine now so a Bluetooth headset's profile
     /// switch overlaps the second tap. Stopped silently if no ⌥⌥ follows.
-    private func prewarmEngine() { capture.firstTap() }
+    private func prewarmEngine() {
+        let token = generation
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.capture.firstTapAsync(start: { try await self.recorder.startAsync(device: $0) },
+                isCancelled: { self.generation != token || self.machine.state != .idle })
+        }
+    }
 
     private func configureCapture() {
         capture.note = { AppController.note($0) }
+        capture.dropHooks = { [weak self] in self?.recorder.onPCMChunk = nil }
         capture.cancelExpiry = { [weak self] in
             self?.prewarmExpiry?.cancel()
             self?.prewarmExpiry = nil
@@ -346,7 +355,38 @@ public final class AppController {
         logKeyStates()
         recordingTarget = Self.frontmostTarget()
         generation += 1
+        let token = generation
         recordingStarted = Date()
+        micStarting = true
+        pill.show(.warming)
+        statusItem.setRecording(true)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let cancelled = { self.generation != token || self.machine.state != .recording }
+            let ready = await self.capture.beginRecordingAsync(at: ProcessInfo.processInfo.systemUptime,
+                start: { try await self.recorder.startAsync(device: $0) },
+                rebuild: { await self.recorder.rebuildAsync() },
+                wait: { seconds in try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) },
+                isCancelled: cancelled)
+            guard !cancelled() else { return }
+            self.micStarting = false
+            if !ready, self.fakeTranscript == nil {
+                Self.note("warm_phase=\(self.capture.warmup.phase) engine_running=\(self.recorder.isRunning)")
+                self.fail(reason: "mic_\(self.micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
+                return
+            }
+            self.recorder.resetCapture() // drop all pre-roll, including recovery audio
+            self.attachTranscribers()
+            self.traceFocus("pill shown")
+            self.capTimer?.invalidate()
+            self.capTimer = Timer.scheduledTimer(withTimeInterval: DictationLimits.maxDuration, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.perform(self.machine.maxDurationReached())
+            }
+        }
+    }
+
+    private func attachTranscribers() {
         if fakeTranscript == nil {
             let engine = AppleTranscriber()
             apple = engine
@@ -369,24 +409,6 @@ public final class AppController {
         } else {
             recorder.onPCMChunk = nil
         }
-        capture.beginRecording(at: ProcessInfo.processInfo.systemUptime)
-        recorder.resetCapture()      // pre-roll from the pre-warm is not part of the dictation
-        if !recorder.isRunning, fakeTranscript == nil {
-            machine = DictationStateMachine()
-            capture.end(.fail)
-            dropTranscriber()
-            apple?.cancel()
-            apple = nil
-            fail(reason: "mic_\(micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
-            return
-        }
-        statusItem.setRecording(true)
-        traceFocus("pill shown")
-        capTimer?.invalidate()
-        capTimer = Timer.scheduledTimer(withTimeInterval: DictationLimits.maxDuration, repeats: false) { [weak self] _ in
-            guard let self else { return }
-            self.perform(self.machine.maxDurationReached())
-        }
     }
 
     private func dropTranscriber() {
@@ -396,6 +418,11 @@ public final class AppController {
     }
 
     private func endRecording() {
+        if micStarting {
+            machine = DictationStateMachine()
+            cancelAll()
+            return
+        }
         capTimer?.invalidate()
         statusItem.setRecording(false)
         let finishedAt = Date()
@@ -427,7 +454,7 @@ public final class AppController {
         let groqSTT = self.groqSTT
         let shadowEnabled = self.shadowEnabled
         let vocabularyPrompt = self.prompt
-        var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats,
+        var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
@@ -607,6 +634,7 @@ public final class AppController {
         var media: String
         var warmMs: Int?
         var capture: AudioRecorder.CaptureStats
+        var micFallback = false
         var capturedSeconds: Double
         var peakDBFS: Double
         var cleanup: TranscriptCleaner.Stats?
@@ -624,6 +652,7 @@ public final class AppController {
                 "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
             ]
+            if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
@@ -656,6 +685,7 @@ public final class AppController {
     }
 
     private func cancelAll() {
+        micStarting = false
         capTimer?.invalidate()
         generation += 1
         statusItem.setRecording(false)
@@ -672,6 +702,17 @@ public final class AppController {
     }
 
     private func fail(reason: String, duration: TimeInterval, bytes: Int, latencyMs: Int) {
+        capTimer?.invalidate()
+        capTimer = nil
+        generation += 1
+        micStarting = false
+        machine = DictationStateMachine()
+        capture.end(.fail)
+        dropTranscriber()
+        apple?.cancel()
+        apple = nil
+        let mediaEvents = resumeMedia()
+        if mediaEvents != "-" { Self.note("fail media=\(mediaEvents)") }
         statusItem.setRecording(false)
         showOutcome(.error(reason))
         log(duration: duration, bytes: bytes, latencyMs: latencyMs, chars: 0, app: AppController.frontmostBundleID(), outcome: .error(reason))
