@@ -4,6 +4,7 @@
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
 //   DictateBench eval         cloud|local <model>    G7 quality: 10 cases, prints PASS/FAIL + misses
+import DictateAppKit
 import DictateCore
 import Foundation
 
@@ -173,6 +174,33 @@ var results: [Int] = []
 var lastText: String?
 
 switch args[1] {
+case "stt-apple":
+    // F9 / G9: Apple on-device SpeechAnalyzer, the app's own AppleTranscriber,
+    // fed at real-time pace in 100 ms chunks plus a 300 ms tap tail.
+    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
+    await AppleTranscriber.ensureAssets()
+    for run in 1...runs {
+        let engine = AppleTranscriber()
+        try await engine.start()
+        for start in stride(from: 0, to: pcm.count, by: 2_400) {
+            engine.append(Array(pcm[start..<min(pcm.count, start + 2_400)]))
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        for _ in 0..<3 {
+            engine.append([Int16](repeating: 0, count: 2_400))
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let finish = DispatchTime.now()
+        do {
+            let text = try await engine.finish()
+            let elapsed = ms(since: finish)
+            results.append(elapsed)
+            lastText = text
+            print("run \(run) finish_to_final_ms=\(elapsed) chars=\(text.count)")
+        } catch {
+            print("run \(run) error=\(error)")
+        }
+    }
 case "stt-batch", "stt-groq":
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let wav = WAVEncoder.encode(samples: pcm, sampleRate: 24_000)
@@ -185,7 +213,8 @@ case "stt-batch", "stt-groq":
     for run in 1...runs {
         let start = DispatchTime.now()
         do {
-            let text = try await client.transcribe(wav: wav, prompt: "")
+            // GROQ_PROMPT=1: pass the vocabulary as the whisper prompt (name-recall comparison).
+            let text = try await client.transcribe(wav: wav, prompt: ProcessInfo.processInfo.environment["GROQ_PROMPT"] == "1" ? prompt : "")
             let elapsed = ms(since: start)
             results.append(elapsed)
             lastText = text
