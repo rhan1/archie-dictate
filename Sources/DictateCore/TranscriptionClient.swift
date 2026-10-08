@@ -81,13 +81,18 @@ public struct TranscriptionClient: Sendable {
     public let transport: HTTPTransport
     public let apiKey: @Sendable () throws -> String
 
+    public static let groqEndpoint = URL(string: "https://api.groq.com/openai/v1/audio/transcriptions")!
+    /// Overridable per instance (Groq whisper-large-v3-turbo for the bench).
+    public var endpointURL: URL = TranscriptionClient.endpoint
+    public var modelName: String = TranscriptionClient.model
+
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String) {
         self.transport = transport
         self.apiKey = apiKey
     }
 
     public func makeRequest(wav: Data, prompt: String, apiKey: String, boundary: String) -> URLRequest {
-        var request = URLRequest(url: Self.endpoint)
+        var request = URLRequest(url: endpointURL)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -96,7 +101,7 @@ public struct TranscriptionClient: Sendable {
         func part(_ name: String, _ value: String) {
             append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
         }
-        part("model", Self.model)
+        part("model", modelName)
         part("response_format", "json")
         part("language", "en")
         if !prompt.isEmpty { part("prompt", prompt) }

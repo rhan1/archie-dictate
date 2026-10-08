@@ -6,7 +6,7 @@ import PackageDescription
 // is the thin executable that boots it.
 let package = Package(
     name: "Dictate",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS("26.0")],
     products: [
         .executable(name: "Dictate", targets: ["DictateApp"]),
     ],
