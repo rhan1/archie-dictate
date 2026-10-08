@@ -63,30 +63,30 @@ struct PauseChunkerTests {
         [Int16](repeating: value, count: Int((seconds * 24_000).rounded()))
     }
 
-    @Test func firstChunkCutsAfterTwoSecondsAnd150MillisecondsOfQuiet() {
+    @Test func firstChunkCutsAfterThreeSecondsAnd150MillisecondsOfQuiet() {
         var chunker = PauseChunker()
         #expect(chunker.append(pcm(0.1, 0)).isEmpty)
-        #expect(chunker.append(pcm(1.9)).isEmpty)
+        #expect(chunker.append(pcm(2.9)).isEmpty)
         #expect(chunker.append(pcm(0.1, 0)).isEmpty)
         let chunks = chunker.append(pcm(0.05, 0))
         #expect(chunks.count == 1)
-        #expect(chunks.first?.samples.count == 48_000)
+        #expect(chunks.first?.samples.count == 72_000)
         #expect(chunks.first?.index == 0)
     }
 
-    @Test func quietBeforeMinimumWaitsForTwoSecondsPlus150Milliseconds() {
+    @Test func quietBeforeMinimumWaitsForThreeSecondsPlus150Milliseconds() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(1.8))
+        _ = chunker.append(pcm(2.8))
         #expect(chunker.append(pcm(0.2, 0)).isEmpty)
         let chunks = chunker.append(pcm(0.05, 0))
-        #expect(chunks.first?.samples.count == 48_000)
+        #expect(chunks.first?.samples.count == 72_000)
     }
 
     @Test func laterChunksRequireFourSecondsAnd250MillisecondsOfQuiet() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(1.9))
+        _ = chunker.append(pcm(2.9))
         let first = chunker.append(pcm(0.15, 0))
         #expect(first.first?.index == 0)
         #expect(chunker.append(pcm(3.85)).isEmpty) // Retained quiet + speech = 4 s.
@@ -97,22 +97,22 @@ struct PauseChunkerTests {
         #expect(later.first?.samples.count == 96_000)
     }
 
-    @Test func firstForcedCutAtThreeSecondsUsesQuietest100MillisecondsInLastSecond() {
+    @Test func firstForcedCutAtFourSecondsUsesQuietest100MillisecondsInLastSecond() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(2.3))
+        _ = chunker.append(pcm(3.3))
         #expect(chunker.append(pcm(0.1, 400)).isEmpty) // Below the 150 ms pause threshold.
         #expect(chunker.append(pcm(0.45)).isEmpty)
         let chunks = chunker.append(pcm(0.05))
         #expect(chunks.count == 1)
-        #expect(chunks.first?.samples.count == 57_600) // 2.4 s; opening silence excluded.
+        #expect(chunks.first?.samples.count == 81_600) // 3.4 s; opening silence excluded.
         #expect(chunker.finish().first?.samples.count == 14_400)
     }
 
     @Test func laterForcedCutAtSixSecondsUsesQuietest100Milliseconds() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(1.9))
+        _ = chunker.append(pcm(2.9))
         _ = chunker.append(pcm(0.15, 0))
         _ = chunker.append(pcm(5.05)) // Including retained quiet: 5.2 s.
         #expect(chunker.append(pcm(0.1, 400)).isEmpty)
@@ -127,20 +127,20 @@ struct PauseChunkerTests {
     @Test func forcedCutMeasuresWhole100MillisecondWindow() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(2.1))
+        _ = chunker.append(pcm(3.1))
         _ = chunker.append(pcm(0.05, 100)) // One quiet 50 ms slice beside loud speech.
         _ = chunker.append(pcm(0.05))
         _ = chunker.append(pcm(0.1, 800)) // Quieter across the whole 100 ms.
         let chunks = chunker.append(pcm(0.6))
-        #expect(chunks.first?.samples.count == 55_200) // 2.3 s.
+        #expect(chunks.first?.samples.count == 79_200) // 3.3 s.
     }
 
-    @Test func largeInputCutsFirstAtThreeThenLaterAtSixSeconds() {
+    @Test func largeInputCutsFirstAtFourThenLaterAtSixSeconds() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        let chunks = chunker.append(pcm(14.9))
+        let chunks = chunker.append(pcm(15.9))
         #expect(chunks.count == 3)
-        #expect(chunks.map(\.samples.count) == [69_600, 141_600, 141_600])
+        #expect(chunks.map(\.samples.count) == [93_600, 141_600, 141_600])
         #expect(chunks.map(\.index) == [0, 1, 2])
     }
 
@@ -151,7 +151,7 @@ struct PauseChunkerTests {
         for offset in stride(from: 0, to: input.count, by: 3_713) {
             chunks += chunker.append(Array(input[offset..<min(input.count, offset + 3_713)]))
         }
-        #expect(chunks.first.map { (48_000...72_000).contains($0.samples.count) } == true)
+        #expect(chunks.first.map { (72_000...96_000).contains($0.samples.count) } == true)
         #expect(chunks.dropFirst().allSatisfy { (96_000...144_000).contains($0.samples.count) })
         chunks += chunker.finish()
         #expect(chunks.flatMap(\.samples) == input)
@@ -168,12 +168,53 @@ struct PauseChunkerTests {
         #expect(empty.finish().isEmpty)
     }
 
+    @Test func firstChunkWaitsThreeSeconds() {
+        var chunker = PauseChunker()
+        #expect(chunker.append(pcm(0.1, 0)).isEmpty)
+        #expect(chunker.append(pcm(2.1)).isEmpty)
+        #expect(chunker.append(pcm(0.15, 0)).isEmpty) // Pause at 2.2 s must not cut.
+        #expect(chunker.append(pcm(0.75)).isEmpty)
+        let chunks = chunker.append(pcm(0.15, 0)) // Pause at 3.1 s does cut.
+        #expect(chunks.count == 1)
+        #expect(chunks.first?.index == 0)
+        #expect(chunks.first.map { $0.samples.count >= 72_000 } == true)
+    }
+
+    @Test func firstChunkHardCutAtFour() {
+        var chunker = PauseChunker()
+        #expect(chunker.append(pcm(0.1, 0)).isEmpty) // Establish the noise floor before speech.
+        #expect(chunker.append(pcm(3.85)).isEmpty)
+        let chunks = chunker.append(pcm(0.05))
+        #expect(chunks.count == 1)
+        #expect(chunks.first?.index == 0)
+        #expect(chunks.first.map { (72_000...96_000).contains($0.samples.count) } == true)
+    }
+
+    @Test func oldVariantStillTwoThree() {
+        var paused = PauseChunker(firstMinimumSeconds: 2, firstMaximumSeconds: 3)
+        #expect(paused.append(pcm(0.1, 0)).isEmpty)
+        #expect(paused.append(pcm(1.9)).isEmpty)
+        #expect(paused.append(pcm(0.1, 0)).isEmpty)
+        let pauseCut = paused.append(pcm(0.05, 0))
+        #expect(pauseCut.count == 1)
+        #expect(pauseCut.first?.samples.count == 48_000)
+
+        var continuous = PauseChunker(firstMinimumSeconds: 2, firstMaximumSeconds: 3)
+        #expect(continuous.append(pcm(0.1, 0)).isEmpty)
+        #expect(continuous.append(pcm(2.85)).isEmpty)
+        let hardCut = continuous.append(pcm(0.05))
+        #expect(hardCut.count == 1)
+        #expect(hardCut.first?.samples.count == 69_600)
+    }
+
 }
 
 @Suite("GroqChunkedTranscriber")
 struct GroqChunkedTests {
-    private func engine(_ transport: ChunkTransport, prompt: String = "Kubernetes, PostgreSQL") -> GroqChunkedTranscriber {
-        GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: prompt)
+    private func engine(_ transport: ChunkTransport, prompt: String = "Kubernetes, PostgreSQL",
+                        fillerLeadIn: Bool = true) -> GroqChunkedTranscriber {
+        GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: prompt,
+                               fillerLeadIn: fillerLeadIn)
     }
     private func chunk(_ index: Int, tag: Int16) -> PauseChunker.Chunk {
         .init(index: index, samples: [Int16](repeating: tag, count: 2_400))
@@ -187,7 +228,7 @@ struct GroqChunkedTests {
         let second = engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000) // Both in flight; no previous response.
         let request = await transport.request(tag: 2000)
-        #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("name=\"prompt\"\r\n\r\nKubernetes, PostgreSQL\r\n"))
+        #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Kubernetes, PostgreSQL\r\n"))
         try await transport.respond(tag: 2000, text: " second \n", headers: ["x-ratelimit-remaining-requests": "98"])
         await second?.value
         try await transport.respond(tag: 1000, text: " first ", headers: ["x-ratelimit-remaining-requests": "97"])
@@ -211,7 +252,7 @@ struct GroqChunkedTests {
         engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000)
         let body = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
-        #expect(body.contains("name=\"prompt\"\r\n\r\nKubernetes, PostgreSQL " + String(repeating: "é", count: 200) + "\r\n"))
+        #expect(body.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Kubernetes, PostgreSQL " + String(repeating: "é", count: 200) + "\r\n"))
         #expect(!body.contains("discarded prefix"))
         try await transport.respond(tag: 2000, text: "next")
         #expect(await engine.finish().text == previous + " next")
@@ -291,7 +332,7 @@ struct GroqChunkedTests {
         let body = try #require(request.httpBody)
         let text = String(decoding: body, as: UTF8.self)
         for part in ["name=\"model\"\r\n\r\nwhisper-large-v3-turbo", "name=\"response_format\"\r\n\r\njson",
-                     "name=\"language\"\r\n\r\nen", "name=\"prompt\"\r\n\r\n\r\n",
+                     "name=\"language\"\r\n\r\nen", "name=\"prompt\"\r\n\r\nUm, so, uh, like, \r\n",
                      "name=\"file\"; filename=\"audio.wav\"", "Content-Type: audio/wav"] {
             #expect(text.contains(part))
         }
@@ -303,6 +344,69 @@ struct GroqChunkedTests {
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer hermetic-key")
         try await transport.respond(tag: 1000)
         #expect(await engine.finish().failedCount == 0)
+    }
+
+    @Test func promptHasFillerLeadIn() async throws {
+        let transport = ChunkTransport()
+        let engine = engine(transport)
+        engine.submit(chunk(0, tag: 1000))
+        await transport.wait(tag: 1000)
+        let body = String(decoding: await transport.request(tag: 1000).httpBody!, as: UTF8.self)
+        #expect(body.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Kubernetes, PostgreSQL\r\n"))
+        try await transport.respond(tag: 1000)
+        #expect(await engine.finish().failedCount == 0)
+
+        let old = self.engine(transport, fillerLeadIn: false)
+        old.submit(chunk(0, tag: 2000))
+        await transport.wait(tag: 2000)
+        let oldBody = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
+        #expect(oldBody.contains("name=\"prompt\"\r\n\r\nKubernetes, PostgreSQL\r\n"))
+        #expect(!oldBody.contains("Um, so, uh, like,"))
+        #expect(GroqChunkedTranscriber.fillerLeadIn == "Um, so, uh, like,")
+        try await transport.respond(tag: 2000)
+        #expect(await old.finish().failedCount == 0)
+    }
+
+    @Test func vocabularyCapPreservesLeadInAndPreviousTail() async throws {
+        let transport = ChunkTransport()
+        let vocab = String(repeating: "é", count: 800)
+        let engine = engine(transport, prompt: vocab + "discarded vocabulary")
+        let first = engine.submit(chunk(0, tag: 1000))
+        await transport.wait(tag: 1000)
+        let firstBody = String(decoding: await transport.request(tag: 1000).httpBody!, as: UTF8.self)
+        #expect(firstBody.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, " + vocab + "\r\n"))
+        #expect(!firstBody.contains("discarded vocabulary"))
+        let tail = String(repeating: "t", count: 200)
+        try await transport.respond(tag: 1000, text: "discarded tail " + tail)
+        await first?.value
+        engine.submit(chunk(1, tag: 2000))
+        await transport.wait(tag: 2000)
+        let nextBody = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
+        #expect(nextBody.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, " + vocab + " " + tail + "\r\n"))
+        #expect(!nextBody.contains("discarded tail"))
+        try await transport.respond(tag: 2000)
+        #expect(await engine.finish().failedCount == 0)
+    }
+
+    @Test func internalChunkerPassesThroughFirstLimits() async throws {
+        for (minimum, maximum) in [(3.0, 4.0), (2.0, 3.0)] {
+            let transport = ChunkTransport()
+            let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "",
+                                               firstMinimumSeconds: minimum, firstMaximumSeconds: maximum)
+            engine.append([Int16](repeating: 0, count: 2_400))
+            engine.append([Int16](repeating: 1000, count: Int(minimum * 24_000) - 2_400))
+            engine.append([Int16](repeating: 0, count: 3_600))
+            await transport.wait(tag: 0) // The first sample is retained opening silence.
+            let body = await transport.request(tag: 0).httpBody!
+            let riff = try #require(body.range(of: Data("RIFF".utf8)))
+            let bytes = Int(minimum * 16_000) * 2
+            let wavHeader = Array(body[riff.lowerBound..<(riff.lowerBound + 44)])
+            let dataSize = Int(wavHeader[40]) | Int(wavHeader[41]) << 8 |
+                           Int(wavHeader[42]) << 16 | Int(wavHeader[43]) << 24
+            #expect(dataSize == bytes)
+            try await transport.respond(tag: 0)
+            #expect(await engine.finish().chunks == 1) // The retained 150 ms tail is dropped.
+        }
     }
 
     @Test func parsesAllRateLimitHeadersAndAbsence() {
