@@ -413,9 +413,11 @@ case "stt-groq-chunked":
                 var cleaned = joined.text
                 var mode = incremental?.needsFallback == true ? "incremental_fallback" : "single"
                 var calls = incremental?.callCount ?? 0
+                var reason = "-"
                 if TranscriptCleaner.shouldClean(joined.text) {
                     let output = await incremental?.finish(totalChunks: joined.chunks)
                     mode = output?.mode ?? "single"
+                    reason = output?.fallbackReason ?? "-"
                     calls = output?.calls ?? 0
                     if let text = output?.text { cleaned = text }
                     else {
@@ -428,7 +430,7 @@ case "stt-groq-chunked":
                 let pasteMs = ms(since: finish)
                 results.append(pasteMs)
                 lastText = cleaned
-                print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls)")
+                print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason)")
             } else {
                 results.append(elapsed)
                 lastText = joined.text
