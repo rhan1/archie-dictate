@@ -38,7 +38,7 @@ fi
 # Only cloud modes need a key; local/Apple benchmarks remain usable offline.
 case "$1" in
     stt-groq|stt-groq-chunked|cleanup|score-text) NEED_GROQ_KEY=1 ;;
-    eval) [[ "${2:-}" == "groq" ]] && NEED_GROQ_KEY=1 || NEED_GROQ_KEY=0 ;;
+    eval|eval-incremental) [[ "${2:-}" == "groq" ]] && NEED_GROQ_KEY=1 || NEED_GROQ_KEY=0 ;;
     *) NEED_GROQ_KEY=0 ;;
 esac
 if [[ "$NEED_GROQ_KEY" == 1 ]]; then
