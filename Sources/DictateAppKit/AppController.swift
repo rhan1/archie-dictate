@@ -13,20 +13,15 @@ public final class AppController {
     private let pill = PillPanel()
     private let statusItem = StatusItemController()
     private let inserter = TextInserter()
-    /// OpenAI batch STT is the final fallback after Apple and Groq.
-    private let client = TranscriptionClient(transport: URLSessionTransport(timeout: 60)) {
-        try KeychainAPIKey.read()   // D2: read at use time, never cached
-    }
+    private let keyStore = KeyStore()
     private let prompt: String
     /// Local cleanup is the fallback when Groq fails.
     private let localCleaner: TranscriptCleaner
     /// Cleanup default (G7 round 2): Groq qwen3.8-27b, 10/10 quality, p50 367 ms.
     private let groqCleaner: TranscriptCleaner
-    /// Batch STT fallback when the streaming engine fails: Groq whisper first.
+    /// Batch Groq STT fallback when Apple on-device recognition fails.
     private let groqSTT: TranscriptionClient
     private var apple: AppleTranscriber?
-    private let chunkedEnabled = ProcessInfo.processInfo.environment["DICTATE_STT"] == "groq-chunked"
-    private var chunked: GroqChunkedTranscriber?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private var warmup = CaptureWarmup()
@@ -52,6 +47,10 @@ public final class AppController {
     private var capTimer: Timer?
     private var generation = 0
     private var micAvailable = false
+    private var pillOutcome: PillOutcome?
+    private var outcomeText: String?
+    private var outcomeTimer: Timer?
+    private var recoveryTap: DispatchWorkItem?
 
     public init() {
         if !FileManager.default.fileExists(atPath: AppController.vocabularyURL.path) {
@@ -60,21 +59,28 @@ public final class AppController {
         prompt = Vocabulary.buildPrompt(fileURL: AppController.vocabularyURL)
         // The vocabulary feeds ONLY the cleanup prompt: given to the STT model
         // it was echoed back verbatim instead of the speech (live, 00:27).
-        localCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 30), endpoint: TranscriptCleaner.ollamaEndpoint,
+        let keys = keyStore
+        let groqKey: @Sendable () throws -> String = {
+            guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
+            return key
+        }
+        localCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 2), endpoint: TranscriptCleaner.ollamaEndpoint,
                                          model: TranscriptCleaner.localModel, vocabulary: prompt, apiKey: { "ollama" })
         var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5), endpoint: TranscriptCleaner.groqEndpoint,
-                                     model: "qwen/qwen3.8-27b", vocabulary: prompt) { try KeychainAPIKey.read(service: "groq-api") }
+                                     model: TranscriptCleaner.defaultModel, vocabulary: prompt, apiKey: groqKey)
         groq.reasoningEffort = "none"
         groqCleaner = groq
-        var whisper = TranscriptionClient(transport: URLSessionTransport(timeout: 30)) { try KeychainAPIKey.read(service: "groq-api") }
+        var whisper = TranscriptionClient(transport: URLSessionTransport(timeout: 30), apiKey: groqKey)
         whisper.endpointURL = TranscriptionClient.groqEndpoint
         whisper.modelName = "whisper-large-v3-turbo"
         groqSTT = whisper
     }
 
     public func start() {
+        keyStore.prefetch(services: ["groq-api"])
+        logKeyStates()
         hotkeys.onSignal = { [weak self] signal in self?.hotkey(signal) }
-        hotkeys.onEscape = { [weak self] in self?.cancel() }
+        hotkeys.onEscape = { [weak self] in self?.escape() }
         pill.onCancel = { [weak self] in self?.cancel() }
         pill.onFinish = { [weak self] in self?.finishButton() }
         statusItem.onToggle = { [weak self] in self?.doubleTap() }
@@ -97,7 +103,7 @@ public final class AppController {
         }
         if !trusted { watchAccessibilityGrant() }
         if fakeTranscript == nil {
-            Task { [localCleaner] in await localCleaner.warmUp() }
+            warmLocalModel()
             Task { await AppleTranscriber.ensureAssets() }
         }
         // A run that crashed while muted is undone at launch.
@@ -133,16 +139,86 @@ public final class AppController {
 
     // MARK: - Inputs
 
-    private func doubleTap() { perform(machine.doubleTap()) }
+    private func doubleTap() {
+        clearOutcome()
+        perform(machine.doubleTap())
+    }
 
     /// ⌥⌥ starts, one clean ⌥ tap finishes (A2). A clean tap while idle may be
     /// the first half of a double-tap: prewarm capture and cleanup.
     private func hotkey(_ signal: TapSignal) {
+        if pillOutcome?.isRecoverable == true, machine.state == .idle {
+            switch signal {
+            case .tap:
+                recoveryTap?.cancel()
+                let work = DispatchWorkItem { [weak self] in self?.outcomeEvent(.singleOptionTap) }
+                recoveryTap = work
+                // A second press can start at the edge of the window and last maxHold.
+                DispatchQueue.main.asyncAfter(deadline: .now() + DoubleTapDetector.defaultWindow + DoubleTapDetector.defaultMaxHold,
+                                              execute: work)
+            case .doubleTap: doubleTap()
+            case .none: break
+            }
+            return
+        }
+        if signal == .doubleTap { clearOutcome() }
         if signal == .tap, machine.state == .idle {
-            if fakeTranscript == nil { Task { [groqCleaner] in await groqCleaner.warmUp() } }
+            clearOutcome()
+            if fakeTranscript == nil {
+                Task { [groqCleaner] in await groqCleaner.warmUp() }
+                warmLocalModel()
+            }
             prewarmEngine()
         }
         perform(machine.handle(signal))
+    }
+
+    private func warmLocalModel() {
+        Task { [localCleaner] in await localCleaner.warmUp() }
+    }
+
+    private func logKeyStates() {
+        let state = keyStore.missing(for: "groq-api")?.rawValue ?? "ok"
+        Self.note("keys=groq:\(state)")
+    }
+
+    private func showOutcome(_ kind: PillOutcome.Kind, text: String? = nil) {
+        clearOutcome()
+        outcomeText = text
+        pillOutcome = PillOutcome(kind, hasText: text?.isEmpty == false)
+        renderOutcome()
+        guard pillOutcome?.isVisible == true else { return }
+        let start = ProcessInfo.processInfo.systemUptime
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.outcomeEvent(.tick(elapsed: ProcessInfo.processInfo.systemUptime - start))
+        }
+        outcomeTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func outcomeEvent(_ event: PillOutcome.Event) {
+        guard var outcome = pillOutcome else { return }
+        let output = outcome.handle(event)
+        pillOutcome = outcome
+        let text = outcomeText
+        if output.label == nil { clearOutcome() }
+        else { renderOutcome() }
+        if output.pasteHeldText, let text { inserter.insert(text) }
+    }
+
+    private func renderOutcome() {
+        guard let outcome = pillOutcome, let label = outcome.label else { pill.hide(); return }
+        pill.show(.error, held: outcome.isRecoverable, status: label)
+    }
+
+    private func clearOutcome() {
+        recoveryTap?.cancel()
+        recoveryTap = nil
+        outcomeTimer?.invalidate()
+        outcomeTimer = nil
+        pillOutcome = nil
+        outcomeText = nil
+        pill.hide()
     }
 
     /// First ⌥ tap: start the engine now so a Bluetooth headset's profile
@@ -232,8 +308,18 @@ public final class AppController {
         signalSource = source
     }
 
-    private func finishButton() { perform(machine.finishButton()) }
-    private func cancel() { perform(machine.cancel()) }
+    private func finishButton() {
+        if pillOutcome?.isRecoverable == true { outcomeEvent(.recoverTap) }
+        else { perform(machine.finishButton()) }
+    }
+    private func cancel() {
+        if pillOutcome != nil { outcomeEvent(.dismissTap) }
+        else { perform(machine.cancel()) }
+    }
+    private func escape() {
+        if pillOutcome != nil { outcomeEvent(.escape) }
+        else { perform(machine.cancel()) }
+    }
 
     private func perform(_ action: DictationAction) {
         switch action {
@@ -247,19 +333,15 @@ public final class AppController {
     // MARK: - Flow
 
     private func beginRecording() {
+        clearOutcome()
+        logKeyStates()
         recordingTarget = Self.frontmostTarget()
         generation += 1
         recordingStarted = Date()
         if fakeTranscript == nil {
             let engine = AppleTranscriber()
             apple = engine
-            let streaming = chunkedEnabled ? GroqChunkedTranscriber(transport: groqSTT.transport,
-                                                                   apiKey: groqSTT.apiKey, prompt: prompt) : nil
-            chunked = streaming
-            recorder.onPCMChunk = { pcm in
-                engine.append(pcm)
-                streaming?.append(pcm)
-            }
+            recorder.onPCMChunk = { pcm in engine.append(pcm) }
             Task { try? await engine.start() }
             Task { [groqCleaner] in await groqCleaner.warmUp() }
         } else {
@@ -286,16 +368,13 @@ public final class AppController {
 
     private func dropTranscriber() {
         recorder.onPCMChunk = nil
-        chunked?.cancel()
-        chunked = nil
     }
 
     private func endRecording() {
         capTimer?.invalidate()
         statusItem.setRecording(false)
         let finishedAt = Date()
-        let finishClock = DispatchTime.now()
-        let samples = recorder.stop()      // also flushes the last chunk to the Apple engine
+        let samples = recorder.stop()      // also flushes the final audio to the Apple engine
         recorder.onPCMChunk = nil
         let warmMs = warmup.warmMs
         warmup.stopped()
@@ -304,21 +383,17 @@ public final class AppController {
         let bytes = 44 + samples.count * 2
         let appleSession = apple
         apple = nil
-        let chunkedSession = chunked
-        chunked = nil
         let myGeneration = generation
         pill.show(.transcribing)
 
         if fakeTranscript == nil, AudioLevel.isSilent(samples) {
             appleSession?.cancel()
-            chunkedSession?.cancel()
             machine.transcriptionFinished()
             fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0)
             return
         }
 
         let fake = fakeTranscript
-        let client = self.client
         let localCleaner = self.localCleaner
         let groqCleaner = self.groqCleaner
         let groqSTT = self.groqSTT
@@ -335,37 +410,8 @@ public final class AppController {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                if let chunkedSession {
-                    // Finalise Apple immediately, while outstanding uploads finish.
-                    let appleFinal = Task { try? await appleSession?.finish() }
-                    let joined = await chunkedSession.finish(at: finishClock)
-                    pipeline.chunks = joined.chunks
-                    pipeline.lastChunkMs = joined.lastChunkMs
-                    timeline.chunked = joined
-                    if joined.failedCount > 0 || joined.text.isEmpty {
-                        pipeline.path = "apple"
-                        pipeline.chunkFallback = joined.failedCount
-                        if let raw = await appleFinal.value, !raw.isEmpty { result = .success(raw) }
-                        else { result = .failure(TranscriptionError.decode) }
-                    } else {
-                        pipeline.path = "groq-chunked"
-                        result = .success(joined.text)
-                        if shadowEnabled {
-                            shadow = Task.detached {
-                                let raw = await appleFinal.value ?? ""
-                                guard ShadowScore.overlap(raw) >= 0.60 else { return nil }
-                                let start = DispatchTime.now()
-                                let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: 24_000)
-                                let groqRaw = (try? await groqSTT.transcribe(wav: wav, prompt: vocabularyPrompt)) ?? ""
-                                let elapsed = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
-                                return (ShadowScore.nameCount(raw), ShadowScore.nameCount(groqRaw), elapsed)
-                            }
-                        }
-                    }
-                } else {
-                    result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, openAI: client, report: &pipeline)
-                }
-                pipeline.sttMs = Int(Date().timeIntervalSince(chunkedSession == nil ? sttStart : finishedAt) * 1000)
+                result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, report: &pipeline)
+                pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
                 if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
                    ShadowScore.overlap(raw) >= 0.60 {
                     let appleNames = ShadowScore.nameCount(raw)
@@ -428,30 +474,40 @@ public final class AppController {
                         let app = now?.bundleID ?? ""
                         switch InsertionTarget.decide(start: start, now: now) {
                         case .paste:
-                            self.pill.hide()
-                            self.traceFocus("pill hidden, pasting")
+                            if let cleanup = report.cleanup, cleanup != "skipped:short", cleanup.hasPrefix("skipped:") || cleanup.hasPrefix("rejected:") {
+                                self.showOutcome(.rawPasted(cleanup))
+                            } else {
+                                self.showOutcome(.ok)
+                            }
+                            self.traceFocus("pasting")
                             DictationLog.append(entry(text.count, app, .ok))
                             return true
                         case .hold:
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(text, forType: .string)
                             self.rememberHeldDictation(text)
-                            self.pill.show(.error, held: true)
+                            self.showOutcome(.held("focus_changed"), text: text)
                             DictationLog.append(entry(text.count, app, .held("focus_changed")))
                             return false
                         }
                     })
                 case .success:
-                    self.pill.show(.error)
-                    DictationLog.append(entry(0, AppController.frontmostBundleID(), .error("empty_transcript")))
+                    self.showOutcome(.held("no_stt"))
+                    DictationLog.append(entry(0, AppController.frontmostBundleID(), .held("no_stt")))
                 case .failure(let error):
                     let reason = (error as? TranscriptionError)?.logReason ?? "unknown"
-                    self.pill.show(.error)
-                    DictationLog.append(entry(0, AppController.frontmostBundleID(), .error(reason)))
+                    if reason == "rejected_no_stt" {
+                        self.showOutcome(.held("no_stt"))
+                        DictationLog.append(entry(0, AppController.frontmostBundleID(), .held("no_stt")))
+                    } else {
+                        self.showOutcome(.error(reason))
+                        DictationLog.append(entry(0, AppController.frontmostBundleID(), .error(reason)))
+                    }
                 }
                 if fake == nil {
                     AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path,
-                                                          chunkFallback: report.chunkFallback))
+                                                          chunkFallback: report.chunkFallback,
+                                                          keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok"))
                 }
             }
         }
@@ -479,18 +535,16 @@ public final class AppController {
         }
     }
 
-    /// G9: Apple on-device first; batch Groq whisper, then OpenAI batch, if it fails.
+    /// Apple on-device, then Groq batch. If neither yields text, hold an empty outcome.
     private static func transcribeApple(_ engine: AppleTranscriber?, samples: [Float], groq: TranscriptionClient,
-                                        openAI: TranscriptionClient, report: inout PipelineReport) async -> Result<String, Error> {
+                                        report: inout PipelineReport) async -> Result<String, Error> {
         report.path = "apple"
         if let engine, let text = try? await engine.finish(), !text.isEmpty { return .success(text) }
         note("apple STT failed or empty; falling back to batch")
         let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: Int(AudioRecorder.sampleRate))
         report.path = "batch_groq"
-        if let text = try? await groq.transcribe(wav: wav, prompt: "") { return .success(text) }
-        report.path = "batch_openai"
-        do { return .success(try await openAI.transcribe(wav: wav, prompt: "")) }
-        catch { return .failure(error) }
+        if let text = try? await groq.transcribe(wav: wav, prompt: ""), !text.isEmpty { return .success(text) }
+        return .failure(TranscriptionError.rejected("no_stt"))
     }
 
     /// One stderr line per dictation: where the time went. Counts and ms only.
@@ -503,9 +557,9 @@ public final class AppController {
         var cleanup: TranscriptCleaner.Stats?
         var chunked: GroqChunkedTranscriber.Result?
 
-        func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?) -> String {
+        func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
-                "timeline:",
+                "timeline:", "keys=groq:\(keyState)",
                 "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)",
                 "conflict=\(AppController.conflictingDictationApps())", "fmt=\(capture.startFormat)",
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
@@ -513,8 +567,6 @@ public final class AppController {
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
                 "path=\(path)", "stt_ms=\(sttMs.map(String.init) ?? "-")",
                 "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
-                "pred_accepted=\(cleanup?.acceptedPredictionTokens.map(String.init) ?? "-")",
-                "pred_rejected=\(cleanup?.rejectedPredictionTokens.map(String.init) ?? "-")",
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
             ]
             if let chunked {
@@ -567,7 +619,7 @@ public final class AppController {
 
     private func fail(reason: String, duration: TimeInterval, bytes: Int, latencyMs: Int) {
         statusItem.setRecording(false)
-        pill.show(.error)
+        showOutcome(.error(reason))
         log(duration: duration, bytes: bytes, latencyMs: latencyMs, chars: 0, app: AppController.frontmostBundleID(), outcome: .error(reason))
     }
 

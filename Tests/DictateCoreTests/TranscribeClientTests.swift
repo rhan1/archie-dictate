@@ -48,14 +48,14 @@ struct TranscribeClientTests {
         let request = client().makeRequest(wav: wav, prompt: "Raza, Limpar", apiKey: "test-key", boundary: "test-boundary")
         let body = try #require(request.httpBody)
         let string = String(decoding: body, as: UTF8.self)
-        #expect(string.contains("name=\"model\"\r\n\r\ngpt-4o-transcribe"))
+        #expect(string.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo"))
         #expect(string.contains("name=\"prompt\"\r\n\r\nRaza, Limpar"))
         #expect(string.contains("name=\"file\"; filename=\"audio.wav\""))
         #expect(string.contains("name=\"language\"\r\n\r\nen"))
         #expect(string.contains("name=\"response_format\"\r\n\r\njson"))
         #expect(body.range(of: wav) != nil)
         var expected = Data((
-            "--test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-transcribe\r\n" +
+            "--test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n" +
             "--test-boundary\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n" +
             "--test-boundary\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nen\r\n" +
             "--test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nRaza, Limpar\r\n" +
@@ -65,7 +65,7 @@ struct TranscribeClientTests {
         expected.append(contentsOf: "\r\n--test-boundary--\r\n".utf8)
         #expect(body == expected)
         #expect(request.httpMethod == "POST")
-        #expect(request.url == URL(string: "https://api.openai.com/v1/audio/transcriptions"))
+        #expect(request.url == URL(string: "https://api.groq.com/openai/v1/audio/transcriptions"))
         #expect(request.value(forHTTPHeaderField: "Content-Type") == "multipart/form-data; boundary=test-boundary")
     }
     @Test func authorizationHeader() {
