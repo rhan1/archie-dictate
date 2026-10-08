@@ -5,7 +5,13 @@ import AppKit
 public final class PillPanel {
     public enum Mode: Equatable { case hidden, recording, transcribing, error }
 
-    public static let size = NSSize(width: 250, height: 52)
+    /// Measured from Wispr Flow's own pill (2x capture ÷ 2): 100 × 28 pt.
+    public static let capsuleSize = NSSize(width: 100, height: 28)
+    /// Transparent margin around the capsule so its soft shadow is not clipped.
+    public static let shadowMargin: CGFloat = 6
+    public static var size: NSSize {
+        NSSize(width: capsuleSize.width + 2 * shadowMargin, height: capsuleSize.height + 2 * shadowMargin)
+    }
     public static let dockGap: CGFloat = 24
 
     public var onCancel: (() -> Void)? {
@@ -80,13 +86,13 @@ public final class PillPanel {
     public var isOnScreen: Bool { panel.isVisible }
     public var frame: NSRect { panel.frame }
 
-    /// Bottom-centre of the screen holding the mouse, 24 pt above the Dock edge
-    /// (visibleFrame already excludes the Dock and the menu bar).
+    /// Bottom-centre of the screen holding the mouse, the CAPSULE 24 pt above the
+    /// Dock edge (visibleFrame already excludes the Dock and the menu bar).
     public static func origin(for size: NSSize) -> NSPoint {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        return NSPoint(x: (visible.midX - size.width / 2).rounded(), y: visible.minY + dockGap)
+        return NSPoint(x: (visible.midX - size.width / 2).rounded(), y: visible.minY + dockGap - shadowMargin)
     }
 
     private func startAnimating() {
@@ -109,10 +115,15 @@ final class PillView: NSView {
     var onFinish: (() -> Void)?
     var mode: PillPanel.Mode = .hidden { didSet { needsDisplay = true } }
 
-    private static let capsuleColor = NSColor(srgbRed: 0x14 / 255.0, green: 0x14 / 255.0, blue: 0x14 / 255.0, alpha: 1)
-    private static let cancelFill = NSColor(srgbRed: 0x3A / 255.0, green: 0x3A / 255.0, blue: 0x3C / 255.0, alpha: 1)
-    private static let barCount = 10
-    private static let buttonDiameter: CGFloat = 36
+    private static let capsuleColor = NSColor.black
+    private static let cancelFill = NSColor(srgbRed: 0x3E / 255.0, green: 0x3B / 255.0, blue: 0x32 / 255.0, alpha: 1)
+    static let barCount = 8
+    static let buttonDiameter: CGFloat = 18
+    static let buttonInset: CGFloat = 5
+    static let barWidth: CGFloat = 2
+    static let barGap: CGFloat = 2
+    static let barIdleHeight: CGFloat = 2.5
+    static let barPeakHeight: CGFloat = 14
 
     private var levels = [CGFloat](repeating: 0, count: PillView.barCount)
     private var displayed = [CGFloat](repeating: 0, count: PillView.barCount)
@@ -121,13 +132,16 @@ final class PillView: NSView {
     override var isFlipped: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    var capsuleRect: NSRect {
+        bounds.insetBy(dx: PillPanel.shadowMargin, dy: PillPanel.shadowMargin)
+    }
     var cancelRect: NSRect {
-        let d = PillView.buttonDiameter
-        return NSRect(x: (bounds.height - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
+        let d = PillView.buttonDiameter, c = capsuleRect
+        return NSRect(x: c.minX + PillView.buttonInset, y: c.midY - d / 2, width: d, height: d)
     }
     var finishRect: NSRect {
-        let d = PillView.buttonDiameter
-        return NSRect(x: bounds.width - (bounds.height - d) / 2 - d, y: (bounds.height - d) / 2, width: d, height: d)
+        let d = PillView.buttonDiameter, c = capsuleRect
+        return NSRect(x: c.maxX - PillView.buttonInset - d, y: c.midY - d / 2, width: d, height: d)
     }
 
     func resetLevels() {
@@ -150,9 +164,9 @@ final class PillView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        if cancelRect.insetBy(dx: -4, dy: -4).contains(p) {
+        if cancelRect.insetBy(dx: -3, dy: -3).contains(p) {
             onCancel?()
-        } else if finishRect.insetBy(dx: -4, dy: -4).contains(p), mode == .recording {
+        } else if finishRect.insetBy(dx: -3, dy: -3).contains(p), mode == .recording {
             onFinish?()
         }
     }
@@ -160,9 +174,17 @@ final class PillView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.setFill()
         bounds.fill()
-        let capsule = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        let c = capsuleRect
+        let capsule = NSBezierPath(roundedRect: c, xRadius: c.height / 2, yRadius: c.height / 2)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+        shadow.shadowBlurRadius = 4
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.set()
         PillView.capsuleColor.setFill()
         capsule.fill()
+        NSGraphicsContext.restoreGraphicsState()
 
         drawCancelButton()
         drawFinishButton()
@@ -180,9 +202,9 @@ final class PillView: NSView {
         NSBezierPath(ovalIn: cancelRect).fill()
         NSColor.white.setStroke()
         let c = NSPoint(x: cancelRect.midX, y: cancelRect.midY)
-        let r: CGFloat = 5.5
+        let r: CGFloat = 3.25
         let x = NSBezierPath()
-        x.lineWidth = 2
+        x.lineWidth = 1.5
         x.lineCapStyle = .round
         x.move(to: NSPoint(x: c.x - r, y: c.y - r)); x.line(to: NSPoint(x: c.x + r, y: c.y + r))
         x.move(to: NSPoint(x: c.x - r, y: c.y + r)); x.line(to: NSPoint(x: c.x + r, y: c.y - r))
@@ -195,33 +217,33 @@ final class PillView: NSView {
         NSColor.black.setStroke()
         let c = NSPoint(x: finishRect.midX, y: finishRect.midY)
         let check = NSBezierPath()
-        check.lineWidth = 2.4
+        check.lineWidth = 1.5
         check.lineCapStyle = .round
         check.lineJoinStyle = .round
-        check.move(to: NSPoint(x: c.x - 6.5, y: c.y + 0.5))
-        check.line(to: NSPoint(x: c.x - 2, y: c.y - 4.5))
-        check.line(to: NSPoint(x: c.x + 7, y: c.y + 5))
+        check.move(to: NSPoint(x: c.x - 3.75, y: c.y + 0.25))
+        check.line(to: NSPoint(x: c.x - 1.25, y: c.y - 2.5))
+        check.line(to: NSPoint(x: c.x + 4, y: c.y + 2.75))
         check.stroke()
     }
 
     private func drawBars() {
-        let barWidth: CGFloat = 3, gap: CGFloat = 4
+        let barWidth = PillView.barWidth, gap = PillView.barGap
         let total = CGFloat(PillView.barCount) * barWidth + CGFloat(PillView.barCount - 1) * gap
-        var x = bounds.midX - total / 2
+        // Centred between the two buttons.
+        var x = ((cancelRect.maxX + finishRect.minX) / 2 - total / 2).rounded()
         NSColor.white.setFill()
         for i in 0..<PillView.barCount {
-            // Idle bars still breathe a little so the pill reads as "listening".
-            let idle = 0.08 + 0.04 * sin(phase * 4 + CGFloat(i) * 0.9)
-            let h = 3 + 22 * max(displayed[i], idle)
-            let rect = NSRect(x: x, y: bounds.midY - h / 2, width: barWidth, height: h)
+            // Quiet = flat 2.5 pt dashes, like Wispr; voice lifts them toward 14 pt.
+            let h = PillView.barIdleHeight + (PillView.barPeakHeight - PillView.barIdleHeight) * displayed[i]
+            let rect = NSRect(x: x, y: capsuleRect.midY - h / 2, width: barWidth, height: h)
             NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
             x += barWidth + gap
         }
     }
 
     private func drawDots() {
-        let d: CGFloat = 6, gap: CGFloat = 7
-        var x = bounds.midX - (3 * d + 2 * gap) / 2
+        let d: CGFloat = 3, gap: CGFloat = 4
+        var x = capsuleRect.midX - (3 * d + 2 * gap) / 2
         for i in 0..<3 {
             let alpha = 0.3 + 0.7 * (0.5 + 0.5 * sin(phase * 6 - CGFloat(i) * 0.9))
             NSColor.white.withAlphaComponent(alpha).setFill()
@@ -232,10 +254,10 @@ final class PillView: NSView {
 
     private func drawErrorMark() {
         let c = NSPoint(x: bounds.midX, y: bounds.midY)
-        let r: CGFloat = 8
+        let r: CGFloat = 4
         NSColor.systemRed.setStroke()
         let x = NSBezierPath()
-        x.lineWidth = 3
+        x.lineWidth = 2
         x.lineCapStyle = .round
         x.move(to: NSPoint(x: c.x - r, y: c.y - r)); x.line(to: NSPoint(x: c.x + r, y: c.y + r))
         x.move(to: NSPoint(x: c.x - r, y: c.y + r)); x.line(to: NSPoint(x: c.x + r, y: c.y - r))
