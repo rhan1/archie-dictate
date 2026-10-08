@@ -1,13 +1,19 @@
 import AVFoundation
 import DictateCore
 
-/// D2: AVAudioEngine capture, converted live to 16 kHz mono Float32 and kept
-/// in memory only. Nothing is ever written to disk.
+/// AVAudioEngine capture, converted live to 24 kHz mono (the Realtime API's
+/// pcm16 rate) and kept in memory only. Nothing is ever written to disk.
 public final class AudioRecorder {
-    public static let sampleRate: Double = 16_000
+    public static let sampleRate: Double = 24_000
+    /// 100 ms of pcm16 per streamed chunk (v1.1 A1).
+    public static let chunkSamples = 2_400
 
     /// Called on the main queue with a 0...1 level, ~30 times a second.
     public var onLevel: ((Float) -> Void)?
+    /// Called on the AUDIO thread with each 100 ms pcm16 chunk, and once more
+    /// from `stop()` with the remainder. Must be thread-safe.
+    public var onPCMChunk: (([Int16]) -> Void)?
+    private var pendingPCM: [Int16] = []
 
     private let engine = AVAudioEngine()
     private let lock = NSLock()
@@ -32,7 +38,7 @@ public final class AudioRecorder {
     }
 
     public func start() throws {
-        lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+        lock.lock(); samples.removeAll(keepingCapacity: true); pendingPCM.removeAll(); lock.unlock()
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
@@ -51,9 +57,13 @@ public final class AudioRecorder {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         converter = nil
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         let captured = samples
+        let remainder = pendingPCM
         samples.removeAll()
+        pendingPCM.removeAll()
+        lock.unlock()
+        if !remainder.isEmpty { onPCMChunk?(remainder) }
         return captured
     }
 
@@ -75,7 +85,18 @@ public final class AudioRecorder {
         }
         guard error == nil, let channel = out.floatChannelData?[0] else { return }
         let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
-        lock.lock(); samples.append(contentsOf: chunk); lock.unlock()
+        var ready: [[Int16]] = []
+        lock.lock()
+        samples.append(contentsOf: chunk)
+        if onPCMChunk != nil {
+            pendingPCM.append(contentsOf: WAVEncoder.pcm16(from: chunk))
+            while pendingPCM.count >= AudioRecorder.chunkSamples {
+                ready.append(Array(pendingPCM.prefix(AudioRecorder.chunkSamples)))
+                pendingPCM.removeFirst(AudioRecorder.chunkSamples)
+            }
+        }
+        lock.unlock()
+        for pcm in ready { onPCMChunk?(pcm) }
 
         let now = ProcessInfo.processInfo.systemUptime
         if now - lastLevelPost >= 1.0 / 30.0 {

@@ -21,6 +21,8 @@ public enum KeyEvent: Equatable, Sendable {
     case keyDown(keyCode: UInt16, time: TimeInterval)
 }
 
+public enum TapSignal: Equatable, Sendable { case none, tap, doubleTap }
+
 public struct DoubleTapDetector: Sendable {
     public static let defaultWindow: TimeInterval = 0.35
     public static let defaultMaxHold: TimeInterval = 0.35
@@ -36,11 +38,19 @@ public struct DoubleTapDetector: Sendable {
         self.maxHold = maxHold
     }
 
+    /// v1.0 API: true exactly when this event completes a double-tap.
     public mutating func handle(_ event: KeyEvent) -> Bool {
+        process(event) == .doubleTap
+    }
+
+    /// v1.1: every clean Left-Option tap is reported (`.tap`), and the second
+    /// one inside the window as `.doubleTap` instead. Chords, holds, Right
+    /// Option and other modifiers report `.none`.
+    public mutating func process(_ event: KeyEvent) -> TapSignal {
         guard case let .flagsChanged(keyCode, flags, time) = event,
               keyCode == KeyCodes.leftOption, time.isFinite else {
             reset()
-            return false
+            return .none
         }
         let pressed = flags & ModifierMask.leftOptionDevice != 0
         let forbidden = ModifierMask.shift | ModifierMask.control |
@@ -48,29 +58,29 @@ public struct DoubleTapDetector: Sendable {
         guard flags & forbidden == 0 else {
             reset()
             invalidUntilRelease = pressed
-            return false
+            return .none
         }
         if pressed {
             guard pressTime == nil, !invalidUntilRelease else {
                 reset()
                 invalidUntilRelease = true
-                return false
+                return .none
             }
             pressTime = time
-            return false
+            return .none
         }
         guard !invalidUntilRelease, let start = pressTime,
               time >= start, time - start <= maxHold else {
             reset()
-            return false
+            return .none
         }
         pressTime = nil
         if let firstRelease, start >= firstRelease, start - firstRelease <= window {
             reset()
-            return true
+            return .doubleTap
         }
         firstRelease = time
-        return false
+        return .tap
     }
 
     public mutating func reset() {

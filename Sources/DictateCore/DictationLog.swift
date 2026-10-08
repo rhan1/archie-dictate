@@ -20,6 +20,14 @@ public struct DictationLogEntry: Equatable, Sendable {
     public var chars: Int
     public var frontmostBundleID: String
     public var outcome: DictationOutcome
+    // v1.1 (A1/A3): which STT path ran, how long STT and cleanup took after
+    // the finish tap, and the cleanup model / result. Omitted from the line
+    // when nil so v1 lines keep their exact shape.
+    public var path: String?
+    public var sttMs: Int?
+    public var cleanupMs: Int?
+    public var cleanupModel: String?
+    public var cleanup: String?
 
     public init(time: Date, durationSeconds: Double, audioBytes: Int, latencyMs: Int,
                 chars: Int, frontmostBundleID: String, outcome: DictationOutcome) {
@@ -38,7 +46,13 @@ public struct DictationLogEntry: Equatable, Sendable {
         formatter.timeZone = timeZone
         let duration = String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"), durationSeconds)
         let app = frontmostBundleID.isEmpty ? "unknown" : frontmostBundleID
-        return "\(formatter.string(from: time)) duration=\(duration)s bytes=\(audioBytes) latency_ms=\(latencyMs) chars=\(chars) app=\(app) outcome=\(outcome.label)"
+        var line = "\(formatter.string(from: time)) duration=\(duration)s bytes=\(audioBytes) latency_ms=\(latencyMs) chars=\(chars) app=\(app) outcome=\(outcome.label)"
+        if let path { line += " path=\(path)" }
+        if let sttMs { line += " stt_ms=\(sttMs)" }
+        if let cleanupMs { line += " cleanup_ms=\(cleanupMs)" }
+        if let cleanupModel { line += " model=\(cleanupModel)" }
+        if let cleanup { line += " cleanup=\(cleanup)" }
+        return line
     }
 }
 

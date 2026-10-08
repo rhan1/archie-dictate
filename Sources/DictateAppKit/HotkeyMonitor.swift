@@ -2,10 +2,11 @@ import AppKit
 import CoreGraphics
 import DictateCore
 
-/// D1: a listen-only CGEventTap on flagsChanged + keyDown. It never swallows an
+/// D1 + v1.1 A2: a listen-only CGEventTap on flagsChanged + keyDown. It never swallows an
 /// event; it only feeds the pure DoubleTapDetector and reports Esc.
 public final class HotkeyMonitor {
-    public var onDoubleTap: (() -> Void)?
+    /// v1.1: every clean Left-Option tap (`.tap`) and double-tap (`.doubleTap`).
+    public var onSignal: ((TapSignal) -> Void)?
     public var onEscape: (() -> Void)?
 
     private var detector = DoubleTapDetector()
@@ -59,9 +60,8 @@ public final class HotkeyMonitor {
             if type == .keyDown, keyCode == KeyCodes.escape {
                 onEscape?()
             }
-            if detector.handle(keyEvent) {
-                onDoubleTap?()
-            }
+            let signal = detector.process(keyEvent)
+            if signal != .none { onSignal?(signal) }
         default:
             break
         }
