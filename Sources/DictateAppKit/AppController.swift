@@ -19,9 +19,14 @@ public final class AppController {
     private let localCleaner: TranscriptCleaner
     /// Cleanup default (G7 round 2): Groq qwen3.8-27b, 10/10 quality, p50 367 ms.
     private let groqCleaner: TranscriptCleaner
-    /// Batch Groq STT fallback when Apple on-device recognition fails.
+    /// Batch Groq STT is used only for explicitly enabled shadow QA.
     private let groqSTT: TranscriptionClient
     private var apple: AppleTranscriber?
+    public static let defaultSTTEngine = "groq-chunked"
+    private let sttEngine = ProcessInfo.processInfo.environment["DICTATE_STT"] == "apple"
+        ? "apple" : AppController.defaultSTTEngine
+    private var chunkedEnabled: Bool { sttEngine == "groq-chunked" }
+    private var chunked: GroqChunkedTranscriber?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private var warmup = CaptureWarmup()
@@ -341,7 +346,20 @@ public final class AppController {
         if fakeTranscript == nil {
             let engine = AppleTranscriber()
             apple = engine
-            recorder.onPCMChunk = { pcm in engine.append(pcm) }
+            if chunkedEnabled {
+                let keys = keyStore
+                let streaming = GroqChunkedTranscriber(transport: URLSessionTransport(timeout: 30), apiKey: {
+                    guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
+                    return key
+                }, prompt: prompt)
+                chunked = streaming
+                recorder.onPCMChunk = { pcm in
+                    engine.append(pcm)
+                    streaming.append(pcm)
+                }
+            } else {
+                recorder.onPCMChunk = { pcm in engine.append(pcm) }
+            }
             Task { try? await engine.start() }
             Task { [groqCleaner] in await groqCleaner.warmUp() }
         } else {
@@ -354,6 +372,8 @@ public final class AppController {
             machine = DictationStateMachine()
             warmup.stopped()
             dropTranscriber()
+            apple?.cancel()
+            apple = nil
             fail(reason: "mic_\(micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
             return
         }
@@ -368,13 +388,16 @@ public final class AppController {
 
     private func dropTranscriber() {
         recorder.onPCMChunk = nil
+        chunked?.cancel()
+        chunked = nil
     }
 
     private func endRecording() {
         capTimer?.invalidate()
         statusItem.setRecording(false)
         let finishedAt = Date()
-        let samples = recorder.stop()      // also flushes the final audio to the Apple engine
+        let finishClock = DispatchTime.now()
+        let samples = recorder.stop()      // also flushes final audio to both engines
         recorder.onPCMChunk = nil
         let warmMs = warmup.warmMs
         warmup.stopped()
@@ -383,11 +406,14 @@ public final class AppController {
         let bytes = 44 + samples.count * 2
         let appleSession = apple
         apple = nil
+        let chunkedSession = chunked
+        chunked = nil
         let myGeneration = generation
         pill.show(.transcribing)
 
         if fakeTranscript == nil, AudioLevel.isSilent(samples) {
             appleSession?.cancel()
+            chunkedSession?.cancel()
             machine.transcriptionFinished()
             fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0)
             return
@@ -410,8 +436,34 @@ public final class AppController {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, report: &pipeline)
-                pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
+                if let chunkedSession {
+                    // Apple finalises concurrently so failed chunks can use its
+                    // own complete transcript without another upload.
+                    let appleFinal = Task { try? await appleSession?.finish() }
+                    let joined = await chunkedSession.finish(at: finishClock)
+                    pipeline.chunks = joined.chunks
+                    pipeline.lastChunkMs = joined.lastChunkMs
+                    timeline.chunked = joined
+                    if joined.failedCount > 0 || joined.text.isEmpty {
+                        pipeline.path = "apple"
+                        pipeline.chunkFallback = joined.failedCount
+                        if let raw = await appleFinal.value, !raw.isEmpty { result = .success(raw) }
+                        else { result = .failure(TranscriptionError.rejected("no_stt")) }
+                    } else {
+                        pipeline.path = "groq-chunked"
+                        result = .success(joined.text)
+                        if shadowEnabled {
+                            shadow = Task.detached {
+                                let raw = await appleFinal.value ?? ""
+                                guard ShadowScore.overlap(raw) >= 0.60 else { return nil }
+                                return (ShadowScore.nameCount(raw), ShadowScore.nameCount(joined.text), 0)
+                            }
+                        }
+                    }
+                } else {
+                    result = await Self.transcribeApple(appleSession, report: &pipeline)
+                }
+                pipeline.sttMs = Int(Date().timeIntervalSince(chunkedSession == nil ? sttStart : finishedAt) * 1000)
                 if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
                    ShadowScore.overlap(raw) >= 0.60 {
                     let appleNames = ShadowScore.nameCount(raw)
@@ -468,6 +520,10 @@ public final class AppController {
                 switch finalResult {
                 case .success(let raw) where !raw.isEmpty:
                     let text = report.text ?? raw
+                    if fake == nil, ShadowScore.overlap(raw) >= 0.60 {
+                        Self.note(ShadowScore.namesLine(rawNames: ShadowScore.nameCount(raw),
+                                                       pastedNames: ShadowScore.nameCount(text), path: report.path))
+                    }
                     let start = self.recordingTarget
                     self.inserter.insert(text, shouldInsert: {
                         let now = Self.frontmostTarget()
@@ -535,15 +591,11 @@ public final class AppController {
         }
     }
 
-    /// Apple on-device, then Groq batch. If neither yields text, hold an empty outcome.
-    private static func transcribeApple(_ engine: AppleTranscriber?, samples: [Float], groq: TranscriptionClient,
+    /// Apple-only recognition. Never invokes a cloud recognizer on failure.
+    private static func transcribeApple(_ engine: AppleTranscriber?,
                                         report: inout PipelineReport) async -> Result<String, Error> {
         report.path = "apple"
         if let engine, let text = try? await engine.finish(), !text.isEmpty { return .success(text) }
-        note("apple STT failed or empty; falling back to batch")
-        let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: Int(AudioRecorder.sampleRate))
-        report.path = "batch_groq"
-        if let text = try? await groq.transcribe(wav: wav, prompt: ""), !text.isEmpty { return .success(text) }
         return .failure(TranscriptionError.rejected("no_stt"))
     }
 

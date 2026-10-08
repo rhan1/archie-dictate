@@ -9,6 +9,11 @@ public enum ShadowScore {
         "shadow=groq names_apple=\(appleNames)/4 names_pasted=\(pastedNames)/4 names_groq=\(groqNames)/4 shadow_ms=\(milliseconds)"
     }
 
+    /// The selected engine's raw text and the final paste; no shadow request.
+    public static func namesLine(rawNames: Int, pastedNames: Int, path: String) -> String {
+        "names_raw=\(rawNames)/4 names_pasted=\(pastedNames)/4 path=\(path)"
+    }
+
     private static func tokens(_ text: String) -> [String] {
         text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
     }

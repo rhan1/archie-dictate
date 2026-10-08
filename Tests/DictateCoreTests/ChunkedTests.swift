@@ -60,50 +60,88 @@ private actor ChunkTransport: HTTPTransport {
 @Suite("PauseChunker")
 struct PauseChunkerTests {
     private func pcm(_ seconds: Double, _ value: Int16 = 12_000) -> [Int16] {
-        [Int16](repeating: value, count: Int(seconds * 24_000))
+        [Int16](repeating: value, count: Int((seconds * 24_000).rounded()))
     }
 
-    @Test func cutsAtStartOfPauseAfterFiveSeconds() {
+    @Test func firstChunkCutsAfterTwoSecondsAnd150MillisecondsOfQuiet() {
         var chunker = PauseChunker()
         #expect(chunker.append(pcm(0.1, 0)).isEmpty)
-        #expect(chunker.append(pcm(4.9)).isEmpty)
-        #expect(chunker.append(pcm(0.2, 0)).isEmpty) // RED: 200 ms is too short.
-        let emitted = chunker.append(pcm(0.1, 0)) // GREEN: 300 ms qualifies.
-        #expect(emitted.count == 1)
-        #expect(emitted.first?.samples.count == 120_000)
-        #expect(emitted.first?.index == 0)
-        #expect(chunker.finish().first?.samples == pcm(0.3, 0))
+        #expect(chunker.append(pcm(1.9)).isEmpty)
+        #expect(chunker.append(pcm(0.1, 0)).isEmpty)
+        let chunks = chunker.append(pcm(0.05, 0))
+        #expect(chunks.count == 1)
+        #expect(chunks.first?.samples.count == 48_000)
+        #expect(chunks.first?.index == 0)
     }
 
-    @Test func waitsUntilFiveSecondsButCanCutAtThree() {
+    @Test func quietBeforeMinimumWaitsForTwoSecondsPlus150Milliseconds() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(2.9))
-        #expect(chunker.append(pcm(1.9, 0)).isEmpty)
-        let chunks = chunker.append(pcm(0.1, 0))
-        #expect(chunks.first?.samples.count == 72_000)
+        _ = chunker.append(pcm(1.8))
+        #expect(chunker.append(pcm(0.2, 0)).isEmpty)
+        let chunks = chunker.append(pcm(0.05, 0))
+        #expect(chunks.first?.samples.count == 48_000)
     }
 
-    @Test func neverCutsANonfinalChunkShorterThanThreeSeconds() {
-        var chunker = PauseChunker()
-        var chunks = chunker.append(pcm(0.1, 0))
-        chunks += chunker.append(pcm(2.8))
-        chunks += chunker.append(pcm(2.1, 0)) // RED: quiet run starts at 2.9 s.
-        #expect(chunks.isEmpty)
-        chunks += chunker.append(pcm(15))
-        #expect(!chunks.isEmpty)
-        #expect(chunks.allSatisfy { $0.samples.count >= 72_000 && $0.samples.count <= 240_000 })
-    }
-
-    @Test func forcedCutUsesQuietestWindowInLastTwoSeconds() {
+    @Test func laterChunksRequireFourSecondsAnd250MillisecondsOfQuiet() {
         var chunker = PauseChunker()
         _ = chunker.append(pcm(0.1, 0))
-        _ = chunker.append(pcm(8.3))
-        _ = chunker.append(pcm(0.1, 400)) // Quiet, but not a 250 ms pause.
-        #expect(chunker.append(pcm(1.4)).isEmpty)
-        let chunks = chunker.append(pcm(0.1))
-        #expect(chunks.first?.samples.count == 201_600) // 8.4 s.
-        #expect(chunker.finish().first?.samples.count == 38_400)
+        _ = chunker.append(pcm(1.9))
+        let first = chunker.append(pcm(0.15, 0))
+        #expect(first.first?.index == 0)
+        #expect(chunker.append(pcm(3.85)).isEmpty) // Retained quiet + speech = 4 s.
+        #expect(chunker.append(pcm(0.2, 0)).isEmpty)
+        let later = chunker.append(pcm(0.05, 0))
+        #expect(later.count == 1)
+        #expect(later.first?.index == 1)
+        #expect(later.first?.samples.count == 96_000)
+    }
+
+    @Test func firstForcedCutAtThreeSecondsUsesQuietest100MillisecondsInLastSecond() {
+        var chunker = PauseChunker()
+        _ = chunker.append(pcm(0.1, 0))
+        _ = chunker.append(pcm(2.3))
+        #expect(chunker.append(pcm(0.1, 400)).isEmpty) // Below the 150 ms pause threshold.
+        #expect(chunker.append(pcm(0.45)).isEmpty)
+        let chunks = chunker.append(pcm(0.05))
+        #expect(chunks.count == 1)
+        #expect(chunks.first?.samples.count == 57_600) // 2.4 s; opening silence excluded.
+        #expect(chunker.finish().first?.samples.count == 14_400)
+    }
+
+    @Test func laterForcedCutAtSixSecondsUsesQuietest100Milliseconds() {
+        var chunker = PauseChunker()
+        _ = chunker.append(pcm(0.1, 0))
+        _ = chunker.append(pcm(1.9))
+        _ = chunker.append(pcm(0.15, 0))
+        _ = chunker.append(pcm(5.05)) // Including retained quiet: 5.2 s.
+        #expect(chunker.append(pcm(0.1, 400)).isEmpty)
+        #expect(chunker.append(pcm(0.65)).isEmpty)
+        let chunks = chunker.append(pcm(0.05))
+        #expect(chunks.count == 1)
+        #expect(chunks.first?.index == 1)
+        #expect(chunks.first?.samples.count == 124_800) // 5.2 s.
+        #expect(chunker.finish().first?.samples.count == 19_200)
+    }
+
+    @Test func forcedCutMeasuresWhole100MillisecondWindow() {
+        var chunker = PauseChunker()
+        _ = chunker.append(pcm(0.1, 0))
+        _ = chunker.append(pcm(2.1))
+        _ = chunker.append(pcm(0.05, 100)) // One quiet 50 ms slice beside loud speech.
+        _ = chunker.append(pcm(0.05))
+        _ = chunker.append(pcm(0.1, 800)) // Quieter across the whole 100 ms.
+        let chunks = chunker.append(pcm(0.6))
+        #expect(chunks.first?.samples.count == 55_200) // 2.3 s.
+    }
+
+    @Test func largeInputCutsFirstAtThreeThenLaterAtSixSeconds() {
+        var chunker = PauseChunker()
+        _ = chunker.append(pcm(0.1, 0))
+        let chunks = chunker.append(pcm(14.9))
+        #expect(chunks.count == 3)
+        #expect(chunks.map(\.samples.count) == [69_600, 141_600, 141_600])
+        #expect(chunks.map(\.index) == [0, 1, 2])
     }
 
     @Test func arbitraryBufferSizesPreserveEverySampleAndIndices() {
@@ -113,7 +151,8 @@ struct PauseChunkerTests {
         for offset in stride(from: 0, to: input.count, by: 3_713) {
             chunks += chunker.append(Array(input[offset..<min(input.count, offset + 3_713)]))
         }
-        #expect(chunks.allSatisfy { (72_000...240_000).contains($0.samples.count) })
+        #expect(chunks.first.map { (48_000...72_000).contains($0.samples.count) } == true)
+        #expect(chunks.dropFirst().allSatisfy { (96_000...144_000).contains($0.samples.count) })
         chunks += chunker.finish()
         #expect(chunks.flatMap(\.samples) == input)
         #expect(chunks.map(\.index) == Array(chunks.indices))
@@ -121,13 +160,14 @@ struct PauseChunkerTests {
         #expect(chunker.append([1, 2, 3]).isEmpty)
     }
 
-    @Test func finalPartialCanBeShorterThanThreeSeconds() {
+    @Test func finalPartialCanBeShorterThanMinimumCut() {
         var chunker = PauseChunker()
-        #expect(chunker.append([11, 12, 13]).isEmpty)
-        #expect(chunker.finish() == [.init(index: 0, samples: [11, 12, 13])])
+        #expect(chunker.append(pcm(0.3)).isEmpty)
+        #expect(chunker.finish() == [.init(index: 0, samples: pcm(0.3))])
         var empty = PauseChunker()
         #expect(empty.finish().isEmpty)
     }
+
 }
 
 @Suite("GroqChunkedTranscriber")

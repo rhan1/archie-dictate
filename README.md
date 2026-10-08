@@ -2,7 +2,7 @@
 
 Dictate is a standalone menu-bar dictation app for macOS. Speak into any app, then finish with a tap: Dictate transcribes your speech, removes filler words and spoken corrections, and pastes the result at your cursor.
 
-Speech recognition uses Apple on-device first, then Groq `whisper-large-v3-turbo` if Apple fails. Cleanup uses Groq `qwen/qwen3.8-27b`, then local Ollama; if both cleaners fail, Dictate pastes the raw transcript. If neither speech recognizer returns text, the pill shows “no speech”.
+Speech recognition defaults to `groq-chunked` (Groq `whisper-large-v3-turbo`), with Apple on-device as the fallback for failed chunks; set `DICTATE_STT=apple` for Apple-only speech recognition. Cleanup uses Groq `qwen/qwen3.8-27b`, then local Ollama; if both cleaners fail, Dictate pastes the raw transcript. If neither speech recognizer returns text, the pill shows “no speech”.
 
 ## Requirements and setup
 
@@ -91,7 +91,7 @@ tools/bench.sh eval groq qwen/qwen3.8-27b
 tools/bench.sh eval local llama3.2:3b-instruct-q4_K_M
 ```
 
-Additional harness modes include `stt-groq-chunked`, `levels`, `pill-match`, and `score-text`. The app uses Apple followed by Groq batch transcription.
+Additional harness modes include `stt-groq-chunked`, `levels`, `pill-match`, and `score-text`. The app defaults to `groq-chunked` with Apple on-device fallback; `DICTATE_STT=apple` selects Apple-only speech recognition.
 
 ## Known limits
 
