@@ -4,6 +4,7 @@
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
 //   DictateBench eval         groq|local <model>    G7 quality: 11 cases, prints PASS/FAIL + misses
+//   DictateBench eval-incremental groq <model>     Incremental quality: 12 cases
 import DictateAppKit
 import DictateCore
 import Foundation
@@ -58,6 +59,31 @@ let evalCases: [EvalCase] = [
     EvalCase(input: "we need the latest numbers from that he beat 99 query before noon",
              mustContain: ["DB99 query"], mustNotContain: ["he beat 99"]),
 ]
+
+let incrementalLongInput = "Um, so for the Politrace launch we need to sort out a few things before the end of the week. First, the Limpar match counts have to be rerun because, uh, the last batch was missing about two hundred organisations. Second, can you check the DB99 query, the one that pulls the grant amounts, because it was timing out yesterday afternoon. Third, the screenshots for the deck, like, the ones from TurnoutWatch, need to be updated with the new numbers. And let's do the review meeting on Thursday at three."
+let incrementalCorrection = "No, sorry, make that Friday at four."
+let incrementalLongCase = EvalCase(input: incrementalLongInput + " " + incrementalCorrection,
+    mustContain: ["Politrace", "Limpar", "DB99", "TurnoutWatch", "Friday at four"],
+    mustNotContain: ["Thursday", "um", "uh"])
+
+func pseudoChunks(_ text: String) -> [String] {
+    let words = text.split(whereSeparator: { $0.isWhitespace })
+    return (0..<3).map { part in
+        words[(part * words.count / 3)..<((part + 1) * words.count / 3)].joined(separator: " ")
+    }
+}
+
+/// App-equivalent full-text fallback, including the length-scaled local deadline.
+func benchCleanUp(_ raw: String, groq: TranscriptCleaner) async -> (text: String, calls: Int) {
+    if let text = try? await groq.clean(raw) { return (text, 1) }
+    let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
+    var local = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline),
+        endpoint: TranscriptCleaner.ollamaEndpoint, model: TranscriptCleaner.localModel,
+        vocabulary: groq.vocabulary, apiKey: { "ollama" })
+    local.reloadVocabularyFromHints = groq.reloadVocabularyFromHints
+    local.timeoutInterval = deadline
+    return ((try? await local.clean(raw)) ?? raw, 2)
+}
 
 /// The expected paste for Fable's standard live-test script.
 let expectedScript = "So for the Politrace launch, send the draft to the team on Wednesday. We need three things: the Limpar match counts, the DB99 query, and the screenshots. Can you also check if TurnoutWatch is still running?"
@@ -304,6 +330,9 @@ if args.count >= 2 {
     case "stt-groq" where args.count >= 4, "stt-groq-chunked" where args.count >= 4: requireKey("GROQ_API_KEY")
     case "cleanup" where args.count >= 4:
         requireKey("GROQ_API_KEY")
+    case "eval-incremental" where args.count >= 4:
+        guard args[2] == "groq" else { print("eval-incremental backend must be groq"); exit(2) }
+        requireKey("GROQ_API_KEY")
     case "eval" where args.count >= 4:
         guard ["groq", "local"].contains(args[2]) else {
             print("eval backend must be groq or local")
@@ -351,11 +380,14 @@ case "stt-groq-chunked":
     let cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5),
                                     endpoint: TranscriptCleaner.groqEndpoint, model: TranscriptCleaner.defaultModel,
                                     vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
+    let useIncremental = endToEnd && ProcessInfo.processInfo.environment["BENCH_INCREMENTAL"] != "0"
     for run in 1...runs {
         var chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
+        let incremental = useIncremental ? IncrementalCleaner(cleaner: cleaner) : nil
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt,
                                            fillerLeadIn: useV3, firstMinimumSeconds: firstMinimumSeconds,
-                                           firstMaximumSeconds: firstMaximumSeconds)
+                                           firstMaximumSeconds: firstMaximumSeconds,
+                                           onChunkText: { index, text in incremental?.append(index: index, text: text) })
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
@@ -376,25 +408,36 @@ case "stt-groq-chunked":
         for chunk in chunker.finish() where chunk.samples.count >= 7_200 { engine.submit(chunk) }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)
-        let opening = String(joined.text.prefix(40)) // Generated fixture text only; never app logging.
         if joined.failedCount == 0, !joined.text.isEmpty {
             if endToEnd {
-                do {
-                    let cleaned = try await cleaner.clean(joined.text)
-                    let pasteMs = ms(since: finish)
-                    results.append(pasteMs)
-                    lastText = cleaned
-                    print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) opening=\"\(opening)\"")
-                } catch {
-                    print("run \(run) cleanup_error=\((error as? TranscriptionError)?.logReason ?? "error") opening=\"\(opening)\"")
+                var cleaned = joined.text
+                var mode = incremental?.needsFallback == true ? "incremental_fallback" : "single"
+                var calls = incremental?.callCount ?? 0
+                if TranscriptCleaner.shouldClean(joined.text) {
+                    let output = await incremental?.finish(totalChunks: joined.chunks)
+                    mode = output?.mode ?? "single"
+                    calls = output?.calls ?? 0
+                    if let text = output?.text { cleaned = text }
+                    else {
+                        let fallback = await benchCleanUp(joined.text, groq: cleaner)
+                        cleaned = fallback.text
+                        calls += fallback.calls
+                    }
                 }
+                incremental?.cancel()
+                let pasteMs = ms(since: finish)
+                results.append(pasteMs)
+                lastText = cleaned
+                print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls)")
             } else {
                 results.append(elapsed)
                 lastText = joined.text
-                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-") opening=\"\(opening)\"")
+                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
             }
         } else {
-            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks) opening=\"\(opening)\"")
+            incremental?.cancel()
+            let mode = incremental == nil ? "single" : "incremental_fallback"
+            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)" + (endToEnd ? " cleanup_mode=\(mode) cleanup_calls=\(incremental?.callCount ?? 0)" : ""))
         }
     }
 case "stt-apple":
@@ -475,7 +518,8 @@ case "cleanup-local":
             print("run \(run) model=\(args[2]) error=\(error)")
         }
     }
-case "eval":
+case "eval", "eval-incremental":
+    let isIncremental = args[1] == "eval-incremental"
     let model = args[3]
     var groqCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: model, vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
     groqCleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"] ?? "none"
@@ -484,9 +528,23 @@ case "eval":
         : groqCleaner
     await cleaner.warmUp()
     var passed = 0
-    for (i, c) in evalCases.enumerated() {
+    let cases = isIncremental ? evalCases + [incrementalLongCase] : evalCases
+    for (i, c) in cases.enumerated() {
+        if i > 0 { try await Task.sleep(nanoseconds: 8_000_000_000) }
         do {
-            let (out, _) = try await cleaner.cleanWithStats(c.input)
+            let out: String
+            if isIncremental {
+                let incremental = IncrementalCleaner(cleaner: cleaner)
+                let chunks = i == evalCases.count
+                    ? pseudoChunks(incrementalLongInput) + [incrementalCorrection] : pseudoChunks(c.input)
+                for (index, text) in chunks.enumerated() {
+                    incremental.append(index: index, text: text)
+                    await incremental.waitForPending()
+                }
+                let output = await incremental.finish(totalChunks: chunks.count)
+                if let text = output.text { out = text }
+                else { out = try await cleaner.clean(c.input) }
+            } else { out = try await cleaner.cleanWithStats(c.input).text }
             let misses = score(c, out)
             if misses.isEmpty { passed += 1 }
             print("case \(i + 1) \(misses.isEmpty ? "PASS" : "FAIL") \(misses.joined(separator: "; "))")
@@ -497,7 +555,7 @@ case "eval":
             if c.mustPass { print("MUSTPASS FAIL case \(i + 1)") }
         }
     }
-    print("EVAL \(args[2]) \(model) \(passed)/\(evalCases.count)")
+    print("\(isIncremental ? "EVAL-INCREMENTAL" : "EVAL") \(args[2]) \(model) \(passed)/\(cases.count)")
     exit(0)
 default:
     print("unknown command \(args[1])")

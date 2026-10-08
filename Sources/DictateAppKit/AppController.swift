@@ -24,6 +24,7 @@ public final class AppController {
         ? "apple" : AppController.defaultSTTEngine
     private var chunkedEnabled: Bool { sttEngine == "groq-chunked" }
     private var chunked: GroqChunkedTranscriber?
+    private var incrementalCleaner: IncrementalCleaner?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private lazy var capture = CaptureLifecycle(engine: recorder)
@@ -392,10 +393,12 @@ public final class AppController {
             apple = engine
             if chunkedEnabled {
                 let keys = keyStore
+                let incremental = IncrementalCleaner(cleaner: groqCleaner)
+                incrementalCleaner = incremental
                 let streaming = GroqChunkedTranscriber(transport: URLSessionTransport(timeout: 30), apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
                     return key
-                }, prompt: prompt)
+                }, prompt: prompt, onChunkText: { index, text in incremental.append(index: index, text: text) })
                 chunked = streaming
                 recorder.onPCMChunk = { pcm in
                     engine.append(pcm)
@@ -412,6 +415,8 @@ public final class AppController {
     }
 
     private func dropTranscriber() {
+        incrementalCleaner?.cancel()
+        incrementalCleaner = nil
         recorder.onPCMChunk = nil
         chunked?.cancel()
         chunked = nil
@@ -437,6 +442,7 @@ public final class AppController {
         apple = nil
         let chunkedSession = chunked
         chunked = nil
+        let incrementalSession = incrementalCleaner
         let myGeneration = generation
         pill.show(.transcribing)
 
@@ -504,17 +510,38 @@ public final class AppController {
                         return (appleNames, ShadowScore.nameCount(groqRaw), elapsed)
                     }
                 }
+                guard myGeneration == self.generation, self.machine.state == .transcribing else {
+                    incrementalSession?.cancel()
+                    return
+                }
+                timeline.cleanupCalls = incrementalSession?.callCount ?? 0
+                if incrementalSession?.needsFallback == true { pipeline.cleanupMode = "incremental_fallback" }
                 if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
+                    incrementalSession?.cancel()
                     pipeline.cleanup = "skipped:short"
                 } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
-                    let outcome = await Self.cleanUp(raw, groq: groqCleaner, local: localCleaner)
-                    pipeline.text = outcome.text
-                    pipeline.cleanup = outcome.label
-                    pipeline.cleanupModel = outcome.model
-                    timeline.cleanup = outcome.stats
+                    if pipeline.path != "groq-chunked" { incrementalSession?.cancel() }
+                    let incremental = await incrementalSession?.finish(totalChunks: pipeline.chunks ?? 0)
+                    guard myGeneration == self.generation, self.machine.state == .transcribing else { return }
+                    pipeline.cleanupMode = incremental?.mode ?? "single"
+                    timeline.cleanupCalls = incremental?.calls ?? 0
+                    if let text = incremental?.text, pipeline.path == "groq-chunked" {
+                        pipeline.text = text
+                        pipeline.cleanup = "ok"
+                        pipeline.cleanupModel = groqCleaner.model
+                        timeline.cleanup = incremental?.stats
+                    } else {
+                        let outcome = await Self.cleanUp(raw, groq: groqCleaner, local: localCleaner)
+                        pipeline.text = outcome.text
+                        pipeline.cleanup = outcome.label
+                        pipeline.cleanupModel = outcome.model
+                        timeline.cleanup = outcome.stats
+                        timeline.cleanupCalls += outcome.calls
+                    }
                     pipeline.cleanupMs = Int(Date().timeIntervalSince(cleanStart) * 1000)
                 }
+                timeline.cleanupMode = pipeline.cleanupMode
             }
             if let shadow, case .success(let raw) = result {
                 let pastedNames = ShadowScore.nameCount(pipeline.text ?? raw)
@@ -529,6 +556,8 @@ public final class AppController {
             let finalResult = result
             await MainActor.run {
                 guard myGeneration == self.generation, self.machine.state == .transcribing else { return }
+                self.incrementalCleaner?.cancel()
+                self.incrementalCleaner = nil
                 self.machine.transcriptionFinished()
                 let latency = Int(Date().timeIntervalSince(finishedAt) * 1000)
                 let entry = { (chars: Int, app: String, outcome: DictationOutcome) -> DictationLogEntry in
@@ -540,6 +569,7 @@ public final class AppController {
                         e.cleanupMs = report.cleanupMs
                         e.cleanupModel = report.cleanupModel
                         e.cleanup = report.cleanup
+                        e.cleanupMode = report.cleanupMode
                         e.chunks = report.chunks
                         e.lastChunkMs = report.lastChunkMs
                         e.chunkFallback = report.chunkFallback
@@ -602,9 +632,9 @@ public final class AppController {
     /// its 1.5 s deadline, the local model runs; raw text is used if both fail.
     /// The log says which one produced the text.
     private static func cleanUp(_ raw: String, groq: TranscriptCleaner, local: TranscriptCleaner) async
-        -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?) {
+        -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?, calls: Int) {
         if let (text, stats) = try? await groq.cleanWithStats(raw) {
-            return (text, "ok", groq.model, stats)
+            return (text, "ok", groq.model, stats, 1)
         }
         let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
         var timedLocal = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline), endpoint: local.endpoint,
@@ -613,11 +643,11 @@ public final class AppController {
         timedLocal.timeoutInterval = deadline
         do {
             let (text, stats) = try await timedLocal.cleanWithStats(raw)
-            return (text, "fallback_local", local.model, stats)
+            return (text, "fallback_local", local.model, stats, 2)
         } catch TranscriptionError.rejected(let reason) {
-            return (raw, "rejected:\(reason)", local.model, nil)
+            return (raw, "rejected:\(reason)", local.model, nil, 2)
         } catch {
-            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil)
+            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil, 2)
         }
     }
 
@@ -639,6 +669,8 @@ public final class AppController {
         var peakDBFS: Double
         var cleanup: TranscriptCleaner.Stats?
         var chunked: GroqChunkedTranscriber.Result?
+        var cleanupMode = "single"
+        var cleanupCalls = 0
 
         func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
@@ -651,6 +683,7 @@ public final class AppController {
                 "path=\(path)", "stt_ms=\(sttMs.map(String.init) ?? "-")",
                 "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
+                "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)",
             ]
             if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
@@ -678,6 +711,7 @@ public final class AppController {
         var sttMs: Int?
         var cleanupMs: Int?
         var cleanup: String?
+        var cleanupMode = "single"
         var text: String?
         var chunks: Int?
         var lastChunkMs: Int?
