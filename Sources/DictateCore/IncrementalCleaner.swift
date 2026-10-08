@@ -53,7 +53,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
                 let output = try await cleaner.cleanIncrementalWithStats(text, context: context, final: false)
                 lock.withLock {
                     if !cancelled {
-                        prefix = Self.join(prefix: prefix, revision: nil, tail: output.text)
+                        prefix = (prefix + " " + output.text).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
                         covered = end
                     }
                     pending = nil
@@ -94,13 +94,15 @@ public final class IncrementalCleaner: @unchecked Sendable {
                         return nil
                     }
                     calls += 1
-                    return (raw(from: covered, to: totalChunks), prefix)
+                    let sentence = Self.lastSentence(prefix)
+                    let context = String(prefix.dropLast(sentence.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    return (sentence + " " + raw(from: covered, to: totalChunks), context)
                 }
                 guard let (text, context) = tail else { return snapshot(text: nil, stats: nil) }
                 do {
                     let output = try await cleaner.cleanIncrementalWithStats(text, context: context, final: true)
                     return lock.withLock {
-                        result(text: cancelled ? nil : Self.join(prefix: prefix, revision: output.revision, tail: output.text),
+                        result(text: cancelled ? nil : Self.join(prefix: context, tail: output.text),
                                stats: output.stats)
                     }
                 } catch {
@@ -147,11 +149,18 @@ public final class IncrementalCleaner: @unchecked Sendable {
         return String(chars.dropFirst(start))
     }
 
-    public static func join(prefix: String, revision: String?, tail: String) -> String {
-        var prefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let revision {
-            prefix = String(prefix.dropLast(lastSentence(prefix).count)) + revision
+    /// Drop the longest repeated boundary of up to three words at the final join.
+    public static func join(prefix: String, tail: String) -> String {
+        let prefixWords = prefix.split(whereSeparator: { $0.isWhitespace })
+        var tailWords = tail.split(whereSeparator: { $0.isWhitespace })
+        let normalise: (Substring) -> String = { $0.filter { !$0.isPunctuation }.lowercased() }
+        for count in stride(from: min(3, prefixWords.count, tailWords.count), through: 1, by: -1) {
+            let boundary = prefixWords.suffix(count).map(normalise)
+            if boundary.allSatisfy({ !$0.isEmpty }), boundary == tailWords.prefix(count).map(normalise) {
+                tailWords.removeFirst(count)
+                break
+            }
         }
-        return (prefix + " " + tail).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return (prefixWords + tailWords).joined(separator: " ")
     }
 }

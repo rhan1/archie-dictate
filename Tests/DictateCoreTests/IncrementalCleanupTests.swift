@@ -106,11 +106,11 @@ struct IncrementalCleanupTests {
         #expect(result.text == nil)
     }
 
-    @Test func finalContextAndRevisionReplaceOnlyLastSentence() async throws {
+    @Test func finalReCleansLastSentence() async throws {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
-        let prefix = "Keep the deck. Meet Thursday at three."
-        for (index, text) in [prefix, "No, sorry, make that Friday at four.", "Bring the slides please."].enumerated() {
+        let prefix = "Let's meet on Thursday at three."
+        for (index, text) in [prefix, "no sorry make that Friday at four", ""].enumerated() {
             incremental.append(index: index, text: text)
         }
         try await transport.wait(1)
@@ -118,36 +118,56 @@ struct IncrementalCleanupTests {
         await incremental.waitForPending()
         let finish = Task { await incremental.finish(totalChunks: 3) }
         try await transport.wait(2)
-        #expect(try await transport.user(1) == "<context>\(prefix)</context>\n<dictation>No, sorry, make that Friday at four. Bring the slides please.</dictation>")
-        try await transport.respond(1, "<revised>Meet Friday at four.</revised> Bring the slides please.")
+        #expect(try await transport.user(1) == "<context></context>\n<dictation>Let's meet on Thursday at three. no sorry make that Friday at four</dictation>")
+        try await transport.respond(1, "Let's meet on Friday at four.")
         let result = await finish.value
-        #expect(result.text == "Keep the deck. Meet Friday at four. Bring the slides please.")
-        #expect(result.mode == "incremental")
-    }
-
-    @Test func finalRevisionAbsorbsTail() async throws {
-        let transport = IncrementalTransport()
-        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
-        let prefix = "Keep the deck. And let's do the review meeting on Thursday at 3."
-        let rawTail = "with the whole team, and then we can decide whether the launch date still works for everyone involved. For more information, visit www.blog.com.au"
-        for (index, text) in [prefix, rawTail, ""].enumerated() {
-            incremental.append(index: index, text: text)
-        }
-        try await transport.wait(1)
-        try await transport.respond(0, prefix)
-        await incremental.waitForPending()
-        let finish = Task { await incremental.finish(totalChunks: 3) }
-        try await transport.wait(2)
-        #expect(try await transport.user(1) == "<context>\(prefix)</context>\n<dictation>\(rawTail)</dictation>")
-        try await transport.respond(1, "<revised>And let's do the review meeting on Friday at 4 with the whole team, and then we can decide whether the launch date still works for everyone involved.</revised>")
-        let result = await finish.value
+        #expect(result.text == "Let's meet on Friday at four.")
+        #expect(result.text?.contains("Thursday") == false)
         #expect(result.mode == "incremental")
         #expect(result.fallbackReason == nil)
-        #expect(result.text == "Keep the deck. And let's do the review meeting on Friday at 4 with the whole team, and then we can decide whether the launch date still works for everyone involved.")
-        #expect(result.text?.contains("Thursday at 3") == false)
     }
 
-    @Test func finalOversizedRevisionRejectedByCombinedRatio() async throws {
+    @Test func finalCompletesQuestion() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        let prefix = "What time is the Politrace"
+        for (index, text) in [prefix, "review", "tomorrow"].enumerated() {
+            incremental.append(index: index, text: text)
+        }
+        try await transport.wait(1)
+        try await transport.respond(0, prefix)
+        await incremental.waitForPending()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await transport.user(1) == "<context></context>\n<dictation>What time is the Politrace review tomorrow</dictation>")
+        try await transport.respond(1, "What time is the Politrace review tomorrow?")
+        let result = await finish.value
+        #expect(result.mode == "incremental")
+        #expect(result.text == "What time is the Politrace review tomorrow?")
+        #expect(result.text?.hasSuffix("?") == true)
+    }
+
+    @Test func finalPreservesEarlierSentencesAndCapsContext() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        let earlier = String(repeating: "Keep the deck. ", count: 50).trimmingCharacters(in: .whitespaces)
+        let prefix = earlier + " Let's meet on Thursday at three."
+        for (index, text) in [prefix, "no sorry make that Friday at four", ""].enumerated() {
+            incremental.append(index: index, text: text)
+        }
+        try await transport.wait(1)
+        try await transport.respond(0, prefix)
+        await incremental.waitForPending()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await transport.user(1) == "<context>\(String(earlier.suffix(600)))</context>\n<dictation>Let's meet on Thursday at three. no sorry make that Friday at four</dictation>")
+        try await transport.respond(1, "Let's meet on Friday at four.")
+        let result = await finish.value
+        #expect(result.text == earlier + " Let's meet on Friday at four.")
+        #expect(result.mode == "incremental")
+    }
+
+    @Test func finalOversizedOutputRejectedByCombinedRatio() async throws {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
         let lastSentence = "Meet Thursday at three."
@@ -162,15 +182,23 @@ struct IncrementalCleanupTests {
         let finish = Task { await incremental.finish(totalChunks: 3) }
         try await transport.wait(2)
         let oversized = Array(repeating: lastSentence + " " + rawTail, count: 3).joined(separator: " ")
-        // A valid afterRevised tail isolates the revision's length guard.
-        try await transport.respond(1, "<revised>\(oversized)</revised> " + rawTail)
+        try await transport.respond(1, oversized)
         let result = await finish.value
         #expect(result.mode == "incremental_fallback")
         #expect(result.text == nil)
         #expect(result.fallbackReason == "final_rejected_ratio")
     }
 
-    @Test(arguments: ["<revised>Changed.</revised> Send the updated report to the team.", "<revised>broken", "x", String(repeating: "extra ", count: 50)])
+    @Test func joinDropsRepeatedBoundaryWords() {
+        #expect(IncrementalCleaner.join(prefix: "Is", tail: "Is TurnoutWatch still up?") == "Is TurnoutWatch still up?")
+        #expect(IncrementalCleaner.join(prefix: "Earlier. IS,", tail: "is TurnoutWatch still up?") == "Earlier. IS, TurnoutWatch still up?")
+        #expect(IncrementalCleaner.join(prefix: "Earlier. Is TurnoutWatch", tail: "is turnoutwatch still up?") == "Earlier. Is TurnoutWatch still up?")
+        #expect(IncrementalCleaner.join(prefix: "Earlier. Is TurnoutWatch still", tail: "IS TurnoutWatch still up?") == "Earlier. Is TurnoutWatch still up?")
+        #expect(IncrementalCleaner.join(prefix: "Earlier. Is TurnoutWatch", tail: "Will TurnoutWatch stay up?") == "Earlier. Is TurnoutWatch Will TurnoutWatch stay up?")
+        #expect(IncrementalCleaner.join(prefix: "Earlier. Go go", tail: "go go now.") == "Earlier. Go go now.")
+    }
+
+    @Test(arguments: ["<output>Changed.</output> Send the updated report to the team.", "<output>broken", "x", String(repeating: "extra ", count: 50)])
     func malformedOrRejectedIntermediateFallsBack(output: String) async throws {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
@@ -221,8 +249,8 @@ struct IncrementalCleanupTests {
         try await transport.respond(0, chunkText)
         try await transport.wait(2)
         #expect(await transport.maxInFlight == 1)
-        #expect(try await transport.user(1).contains("<context>\(chunkText)</context>"))
-        try await transport.respond(1, chunkText + " " + chunkText)
+        #expect(try await transport.user(1).contains("<context></context>\n<dictation>\(chunkText) \(chunkText) \(chunkText)</dictation>"))
+        try await transport.respond(1, Array(repeating: chunkText, count: 3).joined(separator: " "))
         let result = await finish.value
         #expect(result.text == Array(repeating: chunkText, count: 3).joined(separator: " "))
         #expect(await incremental.finish(totalChunks: 3).text == result.text)
@@ -249,7 +277,7 @@ struct IncrementalCleanupTests {
         if kind != "cancel" { #expect(result.mode == "incremental_fallback") }
     }
 
-    @Test(arguments: ["<revised>bad", "<revised>Changed.</revised> x", "Valid words <revised>Late.</revised>"])
+    @Test(arguments: ["<output>bad", "<output>Changed.</output> x", "Valid words <output>Late.</output>", "x"])
     func malformedOrRatioViolatingFinalFallsBack(output: String) async throws {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
@@ -266,10 +294,29 @@ struct IncrementalCleanupTests {
         #expect(result.calls == 2)
     }
 
+    @Test func incrementalInstructionsProtectUnfinishedFragments() throws {
+        let cleaner = cleaner(IncrementalTransport())
+        for final in [false, true] {
+            let request = cleaner.makeIncrementalRequest(text: chunkText, context: "Earlier.", final: final, apiKey: "key")
+            let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            let messages = body["messages"] as! [[String: String]]
+            let system = messages[0]["content"]!
+            if final {
+                #expect(system.contains("The start of <dictation> is already cleaned; keep it unless the rest of the dictation corrects, retracts, continues or completes it"))
+            } else {
+                #expect(system.contains("If the dictation ends mid-sentence, do not add final punctuation to that unfinished fragment."))
+            }
+        }
+    }
+
     @Test func simpleSentenceJoinAndContextCap() {
-        #expect(IncrementalCleaner.join(prefix: "First? Last!", revision: "Changed!", tail: " Next.\n") == "First? Changed! Next.")
-        #expect(IncrementalCleaner.join(prefix: "No sentence boundary", revision: "Replacement.", tail: "Tail.") == "Replacement. Tail.")
-        #expect(IncrementalCleaner.join(prefix: "Keep. Last", revision: "Changed.", tail: "") == "Keep. Changed.")
+        #expect(IncrementalCleaner.lastSentence("First? Last!") == "Last!")
+        #expect(IncrementalCleaner.lastSentence("No sentence boundary") == "No sentence boundary")
+        #expect(IncrementalCleaner.lastSentence("Keep. Last") == "Last")
+        #expect(IncrementalCleaner.lastSentence("Keep. Visit www.blog.com.au") == "Visit www.blog.com.au")
+        #expect(IncrementalCleaner.join(prefix: "First? Last!", tail: " Next.\n") == "First? Last! Next.")
+        #expect(IncrementalCleaner.join(prefix: "", tail: "Tail.") == "Tail.")
+        #expect(IncrementalCleaner.join(prefix: "Keep.", tail: "") == "Keep.")
         let request = cleaner(IncrementalTransport()).makeIncrementalRequest(text: chunkText,
             context: String(repeating: "x", count: 700), final: true, apiKey: "key")
         let body = try! JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
