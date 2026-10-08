@@ -28,11 +28,11 @@ public struct CaptureWarmup: Sendable {
     }
 
     /// The second tap (or the menu / ✓ path) started a dictation.
-    public mutating func recordingStarted(at time: TimeInterval) -> [Effect] {
+    public mutating func recordingStarted(at time: TimeInterval, engineRunning: Bool? = nil) -> [Effect] {
         recordingStart = time
         warmMs = nil
         var effects: [Effect] = []
-        if phase == .off {
+        if !(engineRunning ?? (phase != .off)) {
             buffersFlowing = false
             effects.append(.startEngine)
         }

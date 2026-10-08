@@ -3,7 +3,7 @@ import DictateCore
 
 /// AVAudioEngine capture, converted live to 24 kHz mono pcm16 (the rate the
 /// batch STT fallbacks receive) and kept in memory only. Nothing is ever written to disk.
-public final class AudioRecorder {
+public final class AudioRecorder: CaptureEngine {
     public static let sampleRate: Double = 24_000
     /// 100 ms of pcm16 per streamed chunk (v1.1 A1).
     public static let chunkSamples = 2_400
@@ -28,12 +28,20 @@ public final class AudioRecorder {
     /// Called on the main queue when the first audio buffer arrives after
     /// `start()` (a Bluetooth headset can take ~1.6 s to deliver it).
     public var onFirstBuffer: (() -> Void)?
-    public private(set) var isRunning = false
+    public var isRunning: Bool {
+        let state = lock.withLock { (captureRunning, engine) }
+        return state.0 && ((try? captureObjC { state.1.isRunning }) ?? false)
+    }
+    private var captureRunning = false
     private var startedAt = DispatchTime.now()
     private var recording = false
     private var configObserver: NSObjectProtocol?
 
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
+    private var tapInstalled = false
+    private var selectedDevice: MicChoice = .default
+    private let engineQueue = DispatchQueue(label: "dictate.capture.engine")
+    private var engineEpoch = 0
     private let lock = NSLock()
     private var samples: [Float] = []
     private var converter: AVAudioConverter?
@@ -56,46 +64,156 @@ public final class AudioRecorder {
         }
     }
 
-    public func start() throws {
-        lock.lock()
-        samples.removeAll(keepingCapacity: true)
-        pendingPCM.removeAll()
-        stats = CaptureStats()
-        meter.clearBatch()
-        lock.unlock()
+    /// Synchronous protocol entry point; controller uses startAsync on engineQueue.
+    public func start(device: MicChoice = .default) throws {
+        if isRunning, selectedDevice == device { return }
+        if selectedDevice != device { rebuild() }
+        selectedDevice = device
+        lock.withLock {
+            samples.removeAll(keepingCapacity: true)
+            pendingPCM.removeAll()
+            stats = CaptureStats()
+            meter.clearBatch()
+        }
         startedAt = DispatchTime.now()
-        stats.device = AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown"
+        stats.device = device == .builtIn ? "built-in" : (AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown")
+        if device == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: engine.inputNode) } }
+        registerConfigurationObserver()
         try installTapAndStart()
         stats.engineStartMs = elapsedMs()
         recording = true
-        isRunning = true
-        // A Bluetooth headset switches profile (A2DP -> HFP) when its mic opens,
-        // which reconfigures the engine mid-recording; re-tap on the new format.
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in
-            guard let self, self.recording else { return }
-            self.stats.configChanges += 1
-            self.engine.inputNode.removeTap(onBus: 0)
-            try? self.installTapAndStart()
+        lock.withLock { captureRunning = true }
+    }
+
+    /// Serial background execution keeps Bluetooth engine startup off the main thread.
+    /// stop() increments the epoch immediately; a late start is torn down before returning.
+    public func startAsync(device: MicChoice) async throws {
+        let epoch = lock.withLock { engineEpoch }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            engineQueue.async { [self] in
+                do {
+                    guard lock.withLock({ engineEpoch == epoch }) else { throw CancellationError() }
+                    try start(device: device)
+                    guard lock.withLock({ engineEpoch == epoch }) else {
+                        teardownEngine()
+                        throw CancellationError()
+                    }
+                    continuation.resume()
+                } catch {
+                    teardownEngine()
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
-    private func installTapAndStart() throws {
-        let input = engine.inputNode
-        let inputFormat = input.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw RecorderError.noInput
+    public func rebuildAsync() async {
+        await withCheckedContinuation { continuation in
+            engineQueue.async { [self] in rebuild(); continuation.resume() }
         }
-        if stats.startFormat.isEmpty {
-            stats.startFormat = "\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch"
+    }
+
+    public func rebuild() {
+        teardownEngine()
+        let fresh = AVAudioEngine()
+        lock.withLock { engine = fresh }
+        registerConfigurationObserver() // always observes the replacement, never the old engine
+    }
+
+    private func registerConfigurationObserver() {
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        let observedEngine = engine
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.engineQueue.async {
+                guard self.recording, self.engine === observedEngine,
+                      self.lock.withLock({ self.captureRunning }) else { return }
+                let epoch = self.lock.withLock { self.engineEpoch }
+                self.stats.configChanges += 1
+                do {
+                    try self.removeTap()
+                    try self.installTapAndStart()
+                    guard self.lock.withLock({ self.engineEpoch == epoch }) else {
+                        self.teardownEngine()
+                        return
+                    }
+                    self.recording = true
+                    self.lock.withLock { self.captureRunning = true }
+                } catch {
+                    AppController.note("config_retap_error=\(error as NSError)")
+                    let device = self.selectedDevice
+                    self.rebuild()
+                    do {
+                        if device == .builtIn {
+                            try captureObjC { try AudioDevices.selectBuiltIn(on: self.engine.inputNode) }
+                        }
+                        try self.installTapAndStart()
+                        guard self.lock.withLock({ self.engineEpoch == epoch }) else {
+                            self.teardownEngine()
+                            return
+                        }
+                        self.recording = true
+                        self.lock.withLock { self.captureRunning = true }
+                    } catch {
+                        AppController.note("config_retap_error=\(error as NSError) retry=fail")
+                        self.teardownEngine()
+                    }
+                }
+            }
         }
-        lock.withLock { converter = AVAudioConverter(from: inputFormat, to: targetFormat) }
-        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.consume(buffer)
+    }
+
+    private func installTapAndStart(allowRebuild: Bool = true) throws {
+        try captureObjC {
+            let input = engine.inputNode
+            let hardware = input.inputFormat(forBus: 0)
+            let output = input.outputFormat(forBus: 0)
+            guard hardware.sampleRate > 0, hardware.channelCount > 0,
+                  hardware.sampleRate == output.sampleRate, hardware.channelCount == output.channelCount else {
+                if allowRebuild {
+                    rebuild()
+                    if selectedDevice == .builtIn { try AudioDevices.selectBuiltIn(on: engine.inputNode) }
+                    try installTapAndStart(allowRebuild: false)
+                    return
+                }
+                throw RecorderError.noInput
+            }
+            if stats.startFormat.isEmpty {
+                stats.startFormat = "\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch"
+            }
+            lock.withLock { converter = AVAudioConverter(from: hardware, to: targetFormat) }
+            tapInstalled = true // remove even if installTap partially changes state then raises
+            input.installTap(onBus: 0, bufferSize: 1024, format: hardware) { [weak self] buffer, _ in
+                self?.consume(buffer)
+            }
+            engine.prepare()
+            try engine.start()
         }
-        engine.prepare()
-        try engine.start()
+    }
+
+    private func removeTap() throws {
+        guard tapInstalled else { return }
+        defer { tapInstalled = false }
+        try captureObjC { engine.inputNode.removeTap(onBus: 0) }
+    }
+
+    /// Continue cleanup after any individual exception, including a partial tap install.
+    private func teardownEngine() {
+        recording = false
+        lock.withLock { captureRunning = false; converter = nil }
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
+        let calls: [() throws -> Void] = [
+            { try self.removeTap() },
+            { try captureObjC { self.engine.stop() } },
+            { try captureObjC { self.engine.reset() } }
+        ]
+        for call in calls {
+            do { try call() }
+            catch { AppController.note("mic_teardown_error=\(error as NSError)") }
+        }
     }
 
     private func elapsedMs() -> Int {
@@ -115,15 +233,12 @@ public final class AudioRecorder {
         }
     }
 
-    public func stop() -> [Float] {
-        recording = false
-        isRunning = false
-        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
-        configObserver = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        lock.withLock { converter = nil }
+    @discardableResult public func stop() -> [Float] {
+        // Invalidates a queued/in-flight start without waiting for AVAudioEngine.
         lock.lock()
+        engineEpoch += 1
+        captureRunning = false
+        converter = nil
         let captured = samples
         let remainder = pendingPCM
         samples.removeAll()
@@ -133,6 +248,7 @@ public final class AudioRecorder {
         meter.clearBatch()
         lock.unlock()
         if !remainder.isEmpty { onPCMChunk?(remainder) }
+        engineQueue.async { [self] in teardownEngine() }
         return captured
     }
 
@@ -140,9 +256,14 @@ public final class AudioRecorder {
         // The converter must match the buffers actually arriving: a format
         // change under a live tap otherwise yields garbled (resampled-wrong) audio.
         let converter: AVAudioConverter? = lock.withLock {
+            guard captureRunning else { return nil }
             if stats.firstBufferMs == nil {
                 stats.firstBufferMs = elapsedMs()
-                DispatchQueue.main.async { [weak self] in self?.onFirstBuffer?() }
+                let epoch = engineEpoch
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.lock.withLock({ self.engineEpoch == epoch && self.captureRunning }) else { return }
+                    self.onFirstBuffer?()
+                }
             }
             if let current = self.converter, current.inputFormat == buffer.format { return current }
             if self.converter != nil { stats.formatChanges += 1 }
@@ -168,6 +289,7 @@ public final class AudioRecorder {
         let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
         var ready: [[Int16]] = []
         lock.lock()
+        guard captureRunning else { lock.unlock(); return }
         samples.append(contentsOf: chunk)
         if onPCMChunk != nil {
             pendingPCM.append(contentsOf: WAVEncoder.pcm16(from: chunk))
@@ -182,6 +304,7 @@ public final class AudioRecorder {
         guard !chunk.isEmpty else { return }
         let db = WisprLevel.db(samples: chunk)
         lock.withLock {
+            guard captureRunning else { return }
             let now = ProcessInfo.processInfo.systemUptime
             meter.append(db: db, at: now)
             if levelTimer == nil {
