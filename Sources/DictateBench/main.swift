@@ -97,6 +97,56 @@ func p50(_ values: [Int]) -> Int {
 }
 
 let args = CommandLine.arguments
+// levels <wav> [old] [gainDB]: G10 — replay the fixture through the pill's level
+// model at 30 fps; report tallest-3 % of max and bars above idle on speech frames.
+if args.count >= 3, args[1] == "levels" {
+    let old = args.count > 3 && args[3] == "old"
+    let gainDB = Float(args.count > 4 ? args[4] : "0") ?? 0
+    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2])).map { Float($0) / 32_768 * pow(10, gainDB / 20) }
+    let chunk = 1_536                       // 64 ms: a 1024-frame tap on a 16 kHz headset, at 24 kHz
+    var meter = LevelMeter()
+    var bars = PillBars()
+    var oldSmoothed = 0.0, oldPhase = 0.0
+    func oldHeights(_ level: Double) -> [Double] {   // the mapping shipped before this fix
+        oldSmoothed += (level - oldSmoothed) * (level > oldSmoothed ? 0.48 : 0.124)
+        oldPhase += 1.0 / 30
+        return (0..<10).map { i in
+            let v = 0.55 + 0.45 * (0.5 + 0.5 * sin(oldPhase * (2.1 + Double((i * 7) % 5) * 0.37) + Double((i * 3) % 7) * 0.9))
+            let c = 1 - abs(Double(i) - 4.5) / 10 * 0.6
+            return 2 + 14 * oldSmoothed * v * c
+        }
+    }
+    let frame = 800                          // 1/30 s at 24 kHz
+    var pending: Float = 0, cursor = 0
+    var top3: [Double] = [], above: [Int] = []
+    var frames: [[Double]] = []
+    for start in stride(from: 0, to: pcm.count, by: frame) {
+        let end = min(pcm.count, start + frame)
+        while cursor < end {
+            let c = Array(pcm[cursor..<min(pcm.count, cursor + chunk)])
+            let rms = AudioLevel.rms(c)
+            pending = max(pending, old ? AudioLevel.normalized(rms: rms) : meter.level(rms: rms, seconds: Double(c.count) / 24_000))
+            cursor += chunk
+        }
+        let heights: [Double]
+        if old { heights = oldHeights(Double(pending)) } else { bars.push(level: Double(pending)); bars.tick(); heights = bars.heights }
+        pending = 0
+        let frameRMS = AudioLevel.rms(Array(pcm[start..<end]))
+        if 20 * log10(max(frameRMS, 1e-7)) > -40 {      // speech frame
+            let sorted = heights.sorted(by: >)
+            top3.append((sorted[0] + sorted[1] + sorted[2]) / 3 / 16 * 100)
+            above.append(heights.filter { $0 > 2.5 }.count)
+            if frames.count < 3, top3.count > 30, top3.count % 3 == 0 { frames.append(heights) }
+        }
+    }
+    let t = top3.sorted(), a = above.sorted()
+    let pass = zip(top3, above).filter { $0 >= 70 && $1 >= 7 }.count
+    let peak = pcm.reduce(Float(0)) { max($0, abs($1)) }
+    print(String(format: "LEVELS %@ gain=%+.0fdB fixture_peak=%.1fdBFS speech_frames=%d median_top3=%.0f%% median_bars_above_idle=%d pass_rate=%.0f%%",
+                 old ? "OLD" : "NEW", gainDB, 20 * log10(Double(peak)), top3.count, t[t.count / 2], a[a.count / 2], Double(pass) / Double(top3.count) * 100))
+    for (i, f) in frames.enumerated() { print("frame \(i + 1) heights pt: \(f.map { String(format: "%.1f", $0) }.joined(separator: " "))") }
+    exit(0)
+}
 // score-text: clean stdin (an STT transcript) with local llama and Groq qwen, score vs the script.
 if args.count >= 2, args[1] == "score-text" {
     let raw = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
