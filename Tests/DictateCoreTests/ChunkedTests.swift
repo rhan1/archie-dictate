@@ -172,7 +172,7 @@ struct PauseChunkerTests {
 
 @Suite("GroqChunkedTranscriber")
 struct GroqChunkedTests {
-    private func engine(_ transport: ChunkTransport, prompt: String = "Politrace, Limpar") -> GroqChunkedTranscriber {
+    private func engine(_ transport: ChunkTransport, prompt: String = "Kubernetes, PostgreSQL") -> GroqChunkedTranscriber {
         GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: prompt)
     }
     private func chunk(_ index: Int, tag: Int16) -> PauseChunker.Chunk {
@@ -187,7 +187,7 @@ struct GroqChunkedTests {
         let second = engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000) // Both in flight; no previous response.
         let request = await transport.request(tag: 2000)
-        #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("name=\"prompt\"\r\n\r\nPolitrace, Limpar\r\n"))
+        #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("name=\"prompt\"\r\n\r\nKubernetes, PostgreSQL\r\n"))
         try await transport.respond(tag: 2000, text: " second \n", headers: ["x-ratelimit-remaining-requests": "98"])
         await second?.value
         try await transport.respond(tag: 1000, text: " first ", headers: ["x-ratelimit-remaining-requests": "97"])
@@ -211,7 +211,7 @@ struct GroqChunkedTests {
         engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000)
         let body = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
-        #expect(body.contains("name=\"prompt\"\r\n\r\nPolitrace, Limpar " + String(repeating: "é", count: 200) + "\r\n"))
+        #expect(body.contains("name=\"prompt\"\r\n\r\nKubernetes, PostgreSQL " + String(repeating: "é", count: 200) + "\r\n"))
         #expect(!body.contains("discarded prefix"))
         try await transport.respond(tag: 2000, text: "next")
         #expect(await engine.finish().text == previous + " next")

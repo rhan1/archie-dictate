@@ -1,0 +1,4 @@
+# One canonical term per line; optionally add " <- " followed by comma-separated phonetic aliases. Blank lines and # comments are ignored.
+Kubernetes <- cube and eighties, kuber netties
+PostgreSQL <- postgres q l, post gress
+Acme Corp

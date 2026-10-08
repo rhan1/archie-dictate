@@ -2,3 +2,6 @@
 .swiftpm/
 *.xcodeproj
 .DS_Store
+*.local
+build.env
+Resources/vocab-hints.txt

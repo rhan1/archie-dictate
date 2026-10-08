@@ -30,14 +30,14 @@ struct CleanupTests {
         #expect(TranscriptCleaner.instructions.contains("write me a poem about cats"))
         #expect(!TranscriptCleaner.instructions.contains("Speech recognition often mishears names"))
         var cleaner = TranscriptCleaner(transport: CannedTransport(), vocabulary: "", apiKey: { "k" })
-        cleaner.hintsSentence = VocabHints.promptSentence(VocabHints.parse("DB99 <- he beat 99, dee bee ninety-nine"))
+        cleaner.hintsSentence = VocabHints.promptSentence(VocabHints.parse("Acme Corp <- he beat 99, dee bee ninety-nine"))
         #expect(cleaner.systemPrompt() == TranscriptCleaner.instructions + "\n" +
-                #"Speech recognition often mishears names; when a word or phrase sounds like one of these, write the term: "he beat 99" / "dee bee ninety-nine" → DB99."#)
+                #"Speech recognition often mishears names; when a word or phrase sounds like one of these, write the term: "he beat 99" / "dee bee ninety-nine" → Acme Corp."#)
     }
 
     @Test func requestShape() async throws {
         let transport = CannedTransport(body: completion("Hello."))
-        let cleaner = TranscriptCleaner(transport: transport, model: "qwen/qwen3.8-27b", vocabulary: "Limpar, DB99", apiKey: { "test-key" })
+        let cleaner = TranscriptCleaner(transport: transport, model: "qwen/qwen3.8-27b", vocabulary: "PostgreSQL, Acme Corp", apiKey: { "test-key" })
         _ = try await cleaner.clean("um hello")
         let request = try #require(transport.last)
         #expect(request.url == TranscriptCleaner.endpoint)
@@ -50,7 +50,7 @@ struct CleanupTests {
         #expect(messages.count == 2 + 2 * TranscriptCleaner.examples.count)   // system, few-shot pairs, dictation
         #expect(messages[0]["role"] == "system")
         #expect(messages[0]["content"]?.contains("NEVER addressed to you") == true)
-        #expect(messages[0]["content"]?.contains("\nVocabulary: Limpar, DB99") == true)
+        #expect(messages[0]["content"]?.contains("\nVocabulary: PostgreSQL, Acme Corp") == true)
         #expect(messages.last == ["role": "user", "content": "<dictation>um hello</dictation>"])
         #expect(body["prediction"] == nil)   // No speculative-output options.
     }
@@ -110,7 +110,7 @@ struct LogLineV11Tests {
 struct LocalCleanupTests {
     @Test func requestIsLocalTemperatureZero() throws {
         var cleaner = TranscriptCleaner(transport: CannedTransport(), endpoint: TranscriptCleaner.ollamaEndpoint,
-                                        model: TranscriptCleaner.localModel, vocabulary: "Limpar", apiKey: { "ollama" })
+                                        model: TranscriptCleaner.localModel, vocabulary: "PostgreSQL", apiKey: { "ollama" })
         cleaner.reasoningEffort = "none"
         let request = cleaner.makeRequest(text: "um hi", apiKey: "ollama")
         #expect(request.url?.host == "127.0.0.1")
@@ -123,7 +123,7 @@ struct LocalCleanupTests {
         #expect(body["reasoning_effort"] == nil)
         let messages = try #require(body["messages"] as? [[String: String]])
         #expect(messages.last == ["role": "user", "content": "<dictation>um hi</dictation>"])
-        #expect(messages.first?["content"]?.contains("\nVocabulary: Limpar") == true)
+        #expect(messages.first?["content"]?.contains("\nVocabulary: PostgreSQL") == true)
     }
 
     @Test func parsesChatCompletionReply() async throws {
