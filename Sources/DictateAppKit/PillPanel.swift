@@ -30,7 +30,6 @@ public final class PillPanel {
     private let panel: NonActivatingPanel
     private let pillView: PillView
     private var animationTimer: Timer?
-    private var errorHideWork: DispatchWorkItem?
     /// G2 RED lever: with DICTATE_PILL_HIDE=1 the pill is never put on screen.
     private let suppressed = ProcessInfo.processInfo.environment["DICTATE_PILL_HIDE"] == "1"
 
@@ -65,11 +64,11 @@ public final class PillPanel {
     private let demoLevels = ProcessInfo.processInfo.environment["DICTATE_DEMO_LEVELS"] == "1"
     private var demoPhase: CGFloat = 0
 
-    public func show(_ newMode: Mode, held: Bool = false) {
-        errorHideWork?.cancel()
+    public func show(_ newMode: Mode, held: Bool = false, status: String? = nil) {
         mode = newMode
         pillView.mode = newMode
         pillView.held = held && newMode == .error
+        pillView.status = status
         guard newMode != .hidden else { return hide() }
         if newMode == .recording || newMode == .warming { pillView.resetLevels() }
         if !panel.isVisible && !suppressed {
@@ -77,15 +76,9 @@ public final class PillPanel {
             panel.orderFrontRegardless()
         }
         startAnimating()
-        if newMode == .error {
-            let work = DispatchWorkItem { [weak self] in self?.hide() }
-            errorHideWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
-        }
     }
 
     public func hide() {
-        errorHideWork?.cancel()
         mode = .hidden
         pillView.mode = .hidden
         animationTimer?.invalidate()
@@ -130,6 +123,7 @@ final class PillView: NSView {
     var onFinish: (() -> Void)?
     var mode: PillPanel.Mode = .hidden { didSet { needsDisplay = true } }
     var held = false { didSet { needsDisplay = true } }
+    var status: String? { didSet { needsDisplay = true } }
 
     private static let capsuleColor = NSColor.black
     private static let outlineColor = NSColor(srgbRed: 0x20 / 255.0, green: 0x20 / 255.0, blue: 0x1F / 255.0, alpha: 1)
@@ -195,7 +189,7 @@ final class PillView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         if cancelRect.insetBy(dx: -3, dy: -3).contains(p) {
             onCancel?()
-        } else if finishRect.insetBy(dx: -3, dy: -3).contains(p), mode == .recording || mode == .warming {
+        } else if finishRect.insetBy(dx: -3, dy: -3).contains(p), mode == .recording || mode == .warming || (mode == .error && held) {
             onFinish?()
         }
     }
@@ -226,7 +220,7 @@ final class PillView: NSView {
         case .warming: drawBars(live: false)
         case .recording: drawBars(live: true)
         case .transcribing: drawDots()
-        case .error: drawErrorMark()
+        case .error: drawStatus()
         case .hidden: break
         }
     }
@@ -295,15 +289,14 @@ final class PillView: NSView {
         }
     }
 
-    private func drawErrorMark() {
-        let c = NSPoint(x: bounds.midX, y: bounds.midY)
-        let r: CGFloat = 4
-        NSColor.systemRed.setStroke()
-        let x = NSBezierPath()
-        x.lineWidth = 2
-        x.lineCapStyle = .round
-        x.move(to: NSPoint(x: c.x - r, y: c.y - r)); x.line(to: NSPoint(x: c.x + r, y: c.y + r))
-        x.move(to: NSPoint(x: c.x - r, y: c.y + r)); x.line(to: NSPoint(x: c.x + r, y: c.y - r))
-        x.stroke()
+    private func drawStatus() {
+        let text = (status ?? "error") as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.white,
+        ]
+        let size = text.size(withAttributes: attributes)
+        let centreX = (cancelRect.maxX + finishRect.minX) / 2
+        text.draw(at: NSPoint(x: centreX - size.width / 2, y: capsuleRect.midY - size.height / 2),
+                  withAttributes: attributes)
     }
 }

@@ -79,13 +79,13 @@ public enum TranscriptionError: Error, Equatable, Sendable {
 }
 
 public struct TranscriptionClient: Sendable {
-    public static let endpoint = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
-    public static let model = "gpt-4o-transcribe"
+    public static let endpoint = URL(string: "https://api.groq.com/openai/v1/audio/transcriptions")!
+    public static let model = "whisper-large-v3-turbo"
     public let transport: HTTPTransport
     public let apiKey: @Sendable () throws -> String
 
     public static let groqEndpoint = URL(string: "https://api.groq.com/openai/v1/audio/transcriptions")!
-    /// Overridable per instance (Groq whisper-large-v3-turbo for the bench).
+    /// Overridable model for Groq benchmark comparisons.
     public var endpointURL: URL = TranscriptionClient.endpoint
     public var modelName: String = TranscriptionClient.model
 
@@ -146,7 +146,7 @@ public struct TranscriptionClient: Sendable {
 }
 
 public enum KeychainAPIKey {
-    public static func read(service: String = "openai-api", account: String = "razakhan") throws -> String {
+    public static func read(service: String = "groq-api", account: String = NSUserName()) throws -> String {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,

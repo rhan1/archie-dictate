@@ -12,6 +12,10 @@ public struct InsertionTarget: Equatable, Sendable {
 
     public static func decide(start: InsertionTarget?, now: InsertionTarget?) -> Decision {
         guard let start else { return .paste }
+        let transientAgents = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter",
+                               "com.apple.coreservices.uiagent", "com.apple.CoreServicesUIAgent",
+                               "com.razakhan.dictate"]
+        if transientAgents.contains(start.bundleID) { return .paste }
         return start.pid == now?.pid ? .paste : .hold
     }
 }

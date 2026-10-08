@@ -31,15 +31,14 @@ struct CleanupRejectTests {
         }
     }
 
-    @Test(arguments: [TranscriptCleaner.groqEndpoint, TranscriptCleaner.endpoint, TranscriptCleaner.ollamaEndpoint])
+    @Test(arguments: [TranscriptCleaner.groqEndpoint, TranscriptCleaner.ollamaEndpoint])
     func stopAccepted(endpoint: URL) async throws {
         let c = try cleaner(output: raw, reason: "stop", endpoint: endpoint)
         #expect(try await c.clean(raw) == raw)
     }
 
-    // The native Ollama client is gone (lane A). Port its length reproduction through the
-    // surviving OpenAI-compatible local endpoint as well as both cloud endpoints.
-    @Test(arguments: ["length", "content_filter"], [TranscriptCleaner.groqEndpoint, TranscriptCleaner.endpoint, TranscriptCleaner.ollamaEndpoint])
+    // Verify rejection on both Groq and the local chat endpoint.
+    @Test(arguments: ["length", "content_filter"], [TranscriptCleaner.groqEndpoint, TranscriptCleaner.ollamaEndpoint])
     func incompleteCompletionRejected(reason: String, endpoint: URL) async throws {
         let c = try cleaner(output: raw, reason: reason, endpoint: endpoint)
         await expectRejection(c, input: raw, reason: reason)

@@ -26,7 +26,16 @@ else
     /usr/bin/codesign --force --sign - "$BIN"
 fi
 
-# Keys exist only in the child's environment; do not echo or persist them.
-GROQ_API_KEY="$(/usr/bin/security find-generic-password -w -s groq-api -a razakhan)" \
-OPENAI_API_KEY="$(/usr/bin/security find-generic-password -w -s openai-api -a razakhan)" \
+# Only cloud modes need a key; local/Apple benchmarks remain usable offline.
+case "$1" in
+    stt-groq|stt-groq-chunked|cleanup|score-text) NEED_GROQ_KEY=1 ;;
+    eval) [[ "${2:-}" == "groq" ]] && NEED_GROQ_KEY=1 || NEED_GROQ_KEY=0 ;;
+    *) NEED_GROQ_KEY=0 ;;
+esac
+if [[ "$NEED_GROQ_KEY" == 1 ]]; then
+    # Key exists only in the child's environment; never echo or persist it.
+    GROQ_API_KEY="$(/usr/bin/security find-generic-password -w -s groq-api -a "$(id -un)")" \
+        "$BIN" "$@"
+else
     "$BIN" "$@"
+fi

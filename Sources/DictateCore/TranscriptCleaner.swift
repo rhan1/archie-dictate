@@ -4,10 +4,8 @@ import Foundation
 /// would have typed. It never adds content; on any error or overrun the caller
 /// pastes the raw transcript instead.
 public struct TranscriptCleaner: Sendable {
-    public static let endpoint = URL(string: "https://api.openai.com/v1/chat/completions")!
-    /// Fastest measured (p50 over 5 warm calls on a 37-word fixture, 2026-10-08):
-    /// gpt-4.1-nano 913 ms, gpt-4.1-mini 955, gpt-5.4-nano 1102, gpt-5.4-mini 1135.
-    public static let defaultModel = "gpt-4.1-nano"
+    public static let endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
+    public static let defaultModel = "qwen/qwen3.8-27b"
     public static let ollamaEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
     public static let localModel = "llama3.2:3b-instruct-q4_K_M"
     public static let deadline: TimeInterval = 2.5
@@ -52,19 +50,17 @@ public struct TranscriptCleaner: Sendable {
     """#
 
     public let transport: HTTPTransport
-    /// OpenAI by default; Groq's OpenAI-compatible endpoint also works.
+    /// Groq cleanup with a local Ollama fallback.
     public let endpoint: URL
     public let model: String
     public let vocabulary: String
     public let apiKey: @Sendable () throws -> String
     /// nil reloads the editable file for each cleanup; a value supplies fixture hints.
     public var hintsSentence: String?
-    /// Predicted outputs on (default); the bench turns it off for before/after.
-    public var usePrediction = true
     /// Scales the local cleanup deadline with transcript length.
     public var timeoutInterval: TimeInterval = TranscriptCleaner.deadline
     /// Overrides the reasoning effort sent (Groq's gpt-oss / qwen3 models).
-    public var reasoningEffort: String?
+    public var reasoningEffort: String? = "none"
 
     private var isLocal: Bool { endpoint.host == "127.0.0.1" }
 
@@ -106,45 +102,39 @@ public struct TranscriptCleaner: Sendable {
             "temperature": 0,
             "messages": Self.messages(system: systemPrompt(), text: text),
         ]
-        // GPT-5-family models reason by default; "none" is the fastest setting
-        // they accept ("minimal" is rejected by gpt-5.4-*).
-        if !isLocal {
-            if let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
-            else if model.hasPrefix("gpt-5") { body["reasoning_effort"] = "none" }
-        }
-        // Predicted outputs: the cleaned text is mostly the raw text verbatim,
-        // which is exactly what speculative decoding accelerates (gpt-4.1/4o only).
-        if usePrediction, endpoint.host == "api.openai.com", model.hasPrefix("gpt-4") { body["prediction"] = ["type": "content", "content": text] }
+        if !isLocal, let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return request
     }
 
-    /// Loads the local model, or warms the cloud HTTPS connection while recording.
+    /// Native no-prompt load request; never includes credentials or transcript text.
+    public static func makeLocalWarmRequest(model: String = TranscriptCleaner.localModel) -> URLRequest {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:11434/api/generate")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 2
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": model, "keep_alive": "30m",
+        ], options: [.sortedKeys])
+        return request
+    }
+
+    /// Call in an unawaited task so loading or TLS never delays dictation.
     public func warmUp() async {
         if isLocal {
-            var request = makeRequest(text: "ok", apiKey: (try? apiKey()) ?? "")
-            request.timeoutInterval = 30
-            request.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "model": model,
-                "temperature": 0,
-                "max_tokens": 1,
-                "messages": [["role": "user", "content": "ok"]],
-            ], options: [.sortedKeys])
-            _ = try? await transport.send(request)
+            _ = try? await transport.send(Self.makeLocalWarmRequest(model: model))
             return
         }
-        guard let key = try? apiKey(), !key.isEmpty,
-              let url = URL(string: "https://\(endpoint.host ?? "api.openai.com")/\(endpoint.host == "api.groq.com" ? "openai/" : "")v1/models/\(model)") else { return }
-        var request = URLRequest(url: url)
+        guard let key = try? apiKey(), !key.isEmpty else { return }
+        var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/models")!)
+        request.timeoutInterval = 2
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         _ = try? await transport.send(request)
     }
 
-    /// Timing and predicted-output usage of one cleanup call (stderr timeline).
+    /// Response timing and token count for the stderr timeline.
     public struct Stats: Sendable, Equatable {
         public var firstByteMs: Int?
-        public var acceptedPredictionTokens: Int?
-        public var rejectedPredictionTokens: Int?
         public var completionTokens: Int?
     }
 
@@ -192,10 +182,7 @@ public struct TranscriptCleaner: Sendable {
             throw TranscriptionError.rejected("ratio")
         }
         let usage = json["usage"] as? [String: Any]
-        let details = usage?["completion_tokens_details"] as? [String: Any]
         stats.completionTokens = usage?["completion_tokens"] as? Int
-        stats.acceptedPredictionTokens = details?["accepted_prediction_tokens"] as? Int
-        stats.rejectedPredictionTokens = details?["rejected_prediction_tokens"] as? Int
         return (cleaned, stats)
     }
 }
