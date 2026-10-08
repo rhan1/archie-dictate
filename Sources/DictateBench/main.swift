@@ -98,7 +98,9 @@ case "stt-batch":
         }
     }
 case "cleanup":
-    let cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: args[2], vocabulary: prompt, apiKey: key)
+    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: args[2], vocabulary: prompt, apiKey: key)
+    cleaner.usePrediction = ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] != "1"
+    print("prediction=\(cleaner.usePrediction)")
     // One unmeasured call warms the keep-alive connection, as the app does during recording.
     _ = try? await cleaner.clean(cleanupFixture)
     for run in 1...runs {
@@ -117,5 +119,5 @@ default:
     exit(2)
 }
 if !results.isEmpty {
-    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
+    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") \(ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] == "1" ? "prediction=off " : "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
 }
