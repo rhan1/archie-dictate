@@ -1,0 +1,21 @@
+// swift-tools-version:6.0
+import PackageDescription
+
+// DictateCore is pure Foundation (no AppKit) so it tests headless.
+// DictateAppKit holds every AppKit/AVFoundation/CoreGraphics piece; DictateApp
+// is the thin executable that boots it.
+let package = Package(
+    name: "Dictate",
+    platforms: [.macOS(.v15)],
+    products: [
+        .executable(name: "Dictate", targets: ["DictateApp"]),
+    ],
+    targets: [
+        .target(name: "DictateCore"),
+        .target(name: "DictateAppKit", dependencies: ["DictateCore"]),
+        .executableTarget(name: "DictateApp", dependencies: ["DictateAppKit"]),
+        .testTarget(name: "DictateCoreTests", dependencies: ["DictateCore"]),
+        .testTarget(name: "DictateAppKitTests", dependencies: ["DictateAppKit"]),
+    ],
+    swiftLanguageModes: [.v5]
+)
