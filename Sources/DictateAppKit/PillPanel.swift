@@ -5,14 +5,16 @@ import AppKit
 public final class PillPanel {
     public enum Mode: Equatable { case hidden, warming, recording, transcribing, error }
 
-    /// Measured from Wispr Flow's own pill (2x capture ÷ 2): 100 × 28 pt.
-    public static let capsuleSize = NSSize(width: 100, height: 28)
+    /// Measured from Wispr Flow's own pill on this Mac (2026-10-09 01:01, 2x
+    /// capture ÷ 2): 102 × 30 pt including a 1 pt #20201F outline.
+    public static let capsuleSize = NSSize(width: 102, height: 30)
     /// Transparent margin around the capsule so its soft shadow is not clipped.
     public static let shadowMargin: CGFloat = 6
     public static var size: NSSize {
         NSSize(width: capsuleSize.width + 2 * shadowMargin, height: capsuleSize.height + 2 * shadowMargin)
     }
-    public static let dockGap: CGFloat = 24
+    /// Wispr sits 14 pt above the bottom of the screen's usable area.
+    public static let dockGap: CGFloat = 14
 
     public var onCancel: (() -> Void)? {
         get { pillView.onCancel }
@@ -53,8 +55,14 @@ public final class PillPanel {
     }
 
     public func push(level: Float) {
+        guard !demoLevels else { return }
         pillView.push(level: CGFloat(level))
     }
+
+    /// QA lever (DICTATE_DEMO_LEVELS=1): drive the bars with a synthetic voice
+    /// level so the animation can be captured without anyone speaking.
+    private let demoLevels = ProcessInfo.processInfo.environment["DICTATE_DEMO_LEVELS"] == "1"
+    private var demoPhase: CGFloat = 0
 
     public func show(_ newMode: Mode) {
         errorHideWork?.cancel()
@@ -98,7 +106,12 @@ public final class PillPanel {
     private func startAnimating() {
         guard animationTimer == nil else { return }
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            self?.pillView.tick()
+            guard let self else { return }
+            if self.demoLevels {
+                self.demoPhase += 1.0 / 30.0
+                self.pillView.push(level: 0.55 + 0.4 * sin(self.demoPhase * 5))
+            }
+            self.pillView.tick()
         }
         RunLoop.main.add(timer, forMode: .common)
         animationTimer = timer
@@ -116,18 +129,30 @@ final class PillView: NSView {
     var mode: PillPanel.Mode = .hidden { didSet { needsDisplay = true } }
 
     private static let capsuleColor = NSColor.black
+    private static let outlineColor = NSColor(srgbRed: 0x20 / 255.0, green: 0x20 / 255.0, blue: 0x1F / 255.0, alpha: 1)
     private static let cancelFill = NSColor(srgbRed: 0x3E / 255.0, green: 0x3B / 255.0, blue: 0x32 / 255.0, alpha: 1)
-    static let barCount = 8
+    private static let finishFill = NSColor(srgbRed: 0xFC / 255.0, green: 0xFC / 255.0, blue: 0xFA / 255.0, alpha: 1)
+    static let outlineWidth: CGFloat = 1
+    static let barCount = 10
     static let buttonDiameter: CGFloat = 18
-    static let buttonInset: CGFloat = 5
+    /// From the capsule's outer edge to the button (1 pt outline + 5 pt).
+    static let buttonInset: CGFloat = 6
     static let barWidth: CGFloat = 2
     static let barGap: CGFloat = 2
-    static let barIdleHeight: CGFloat = 2.5
-    static let barPeakHeight: CGFloat = 14
+    static let barIdleHeight: CGFloat = 2
+    static let barPeakHeight: CGFloat = 16
+    /// Smoothing for the in-place bar motion (~50 ms attack, ~250 ms decay at 30 fps).
+    static let attack: CGFloat = 0.48
+    static let decay: CGFloat = 0.124
 
-    private var levels = [CGFloat](repeating: 0, count: PillView.barCount)
-    private var displayed = [CGFloat](repeating: 0, count: PillView.barCount)
+    /// Latest mic level and its smoothed value. Bars never scroll: each one
+    /// scales about its own centre from this single level times a slow per-bar
+    /// variation, so the pill "breathes" like Wispr's instead of sweeping.
+    private var target: CGFloat = 0
+    private(set) var smoothed: CGFloat = 0
     private var phase: CGFloat = 0
+    private let barSpeed: [CGFloat] = (0..<PillView.barCount).map { 2.1 + CGFloat(($0 * 7) % 5) * 0.37 }
+    private let barOffset: [CGFloat] = (0..<PillView.barCount).map { CGFloat(($0 * 3) % 7) * 0.9 }
 
     override var isFlipped: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -145,21 +170,32 @@ final class PillView: NSView {
     }
 
     func resetLevels() {
-        levels = [CGFloat](repeating: 0, count: PillView.barCount)
-        displayed = levels
+        target = 0
+        smoothed = 0
     }
 
     func push(level: CGFloat) {
-        levels.removeFirst()
-        levels.append(max(0, min(1, level)))
+        target = max(0, min(1, level))
     }
 
     func tick() {
         phase += 1.0 / 30.0
-        for i in displayed.indices {
-            displayed[i] += (levels[i] - displayed[i]) * 0.45
-        }
+        smoothed += (target - smoothed) * (target > smoothed ? PillView.attack : PillView.decay)
         needsDisplay = true
+    }
+
+    /// Height of bar `i` right now (x never changes; only this does).
+    func barHeight(_ i: Int) -> CGFloat {
+        let variation = 0.55 + 0.45 * (0.5 + 0.5 * sin(phase * barSpeed[i] + barOffset[i]))
+        let centre = 1 - abs(CGFloat(i) - CGFloat(PillView.barCount - 1) / 2) / CGFloat(PillView.barCount) * 0.6
+        return PillView.barIdleHeight + (PillView.barPeakHeight - PillView.barIdleHeight) * smoothed * variation * centre
+    }
+
+    /// x of bar `i` — fixed, centred between the two buttons.
+    func barX(_ i: Int) -> CGFloat {
+        let total = CGFloat(PillView.barCount) * PillView.barWidth + CGFloat(PillView.barCount - 1) * PillView.barGap
+        let start = ((cancelRect.maxX + finishRect.minX) / 2 - total / 2).rounded()
+        return start + CGFloat(i) * (PillView.barWidth + PillView.barGap)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -176,15 +212,19 @@ final class PillView: NSView {
         bounds.fill()
         let c = capsuleRect
         let capsule = NSBezierPath(roundedRect: c, xRadius: c.height / 2, yRadius: c.height / 2)
+        let inner = c.insetBy(dx: PillView.outlineWidth, dy: PillView.outlineWidth)
+        let fill = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
         NSGraphicsContext.saveGraphicsState()
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
         shadow.shadowBlurRadius = 4
         shadow.shadowOffset = NSSize(width: 0, height: -1)
         shadow.set()
-        PillView.capsuleColor.setFill()
+        PillView.outlineColor.setFill()
         capsule.fill()
         NSGraphicsContext.restoreGraphicsState()
+        PillView.capsuleColor.setFill()
+        fill.fill()
 
         drawCancelButton()
         drawFinishButton()
@@ -213,7 +253,7 @@ final class PillView: NSView {
     }
 
     private func drawFinishButton() {
-        NSColor.white.withAlphaComponent(mode == .recording ? 1 : 0.55).setFill()
+        PillView.finishFill.withAlphaComponent(mode == .recording ? 1 : 0.55).setFill()
         NSBezierPath(ovalIn: finishRect).fill()
         NSColor.black.setStroke()
         let c = NSPoint(x: finishRect.midX, y: finishRect.midY)
@@ -230,18 +270,13 @@ final class PillView: NSView {
     /// `live: false` = WARMING: grey, flat, still — the mic is not delivering
     /// audio yet (Bluetooth profile switch).
     private func drawBars(live: Bool) {
-        let barWidth = PillView.barWidth, gap = PillView.barGap
-        let total = CGFloat(PillView.barCount) * barWidth + CGFloat(PillView.barCount - 1) * gap
-        // Centred between the two buttons.
-        var x = ((cancelRect.maxX + finishRect.minX) / 2 - total / 2).rounded()
+        let barWidth = PillView.barWidth
         (live ? NSColor.white : NSColor(white: 0.45, alpha: 1)).setFill()
         for i in 0..<PillView.barCount {
-            // Quiet = flat 2.5 pt dashes, like Wispr; voice lifts them toward 14 pt.
-            let level = live ? displayed[i] : 0
-            let h = PillView.barIdleHeight + (PillView.barPeakHeight - PillView.barIdleHeight) * level
-            let rect = NSRect(x: x, y: capsuleRect.midY - h / 2, width: barWidth, height: h)
+            // Quiet = 2 pt dots, like Wispr; voice scales each bar in place.
+            let h = live ? barHeight(i) : PillView.barIdleHeight
+            let rect = NSRect(x: barX(i), y: capsuleRect.midY - h / 2, width: barWidth, height: h)
             NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
-            x += barWidth + gap
         }
     }
 
