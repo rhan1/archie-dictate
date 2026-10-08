@@ -8,6 +8,8 @@ public struct TranscriptCleaner: Sendable {
     /// Fastest measured (p50 over 5 warm calls on a 37-word fixture, 2026-10-08):
     /// gpt-4.1-nano 913 ms, gpt-4.1-mini 955, gpt-5.4-nano 1102, gpt-5.4-mini 1135.
     public static let defaultModel = "gpt-4.1-nano"
+    public static let ollamaEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
+    public static let localModel = "llama3.2:3b-instruct-q4_K_M"
     public static let deadline: TimeInterval = 2.5
     /// Raw transcripts this short have little to fix; cleanup is skipped (v1.1).
     public static let minWords = 6
@@ -59,8 +61,12 @@ public struct TranscriptCleaner: Sendable {
     public let apiKey: @Sendable () throws -> String
     /// Predicted outputs on (default); the bench turns it off for before/after.
     public var usePrediction = true
+    /// Scales the local cleanup deadline with transcript length.
+    public var timeoutInterval: TimeInterval = TranscriptCleaner.deadline
     /// Overrides the reasoning effort sent (Groq's gpt-oss / qwen3 models).
     public var reasoningEffort: String?
+
+    private var isLocal: Bool { endpoint.host == "127.0.0.1" }
 
     public static let groqEndpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
 
@@ -80,8 +86,8 @@ public struct TranscriptCleaner: Sendable {
     public func makeRequest(text: String, apiKey: String) -> URLRequest {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = Self.deadline
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = timeoutInterval
+        if !isLocal || !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = [
             "model": model,
@@ -90,8 +96,10 @@ public struct TranscriptCleaner: Sendable {
         ]
         // GPT-5-family models reason by default; "none" is the fastest setting
         // they accept ("minimal" is rejected by gpt-5.4-*).
-        if let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
-        else if model.hasPrefix("gpt-5") { body["reasoning_effort"] = "none" }
+        if !isLocal {
+            if let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
+            else if model.hasPrefix("gpt-5") { body["reasoning_effort"] = "none" }
+        }
         // Predicted outputs: the cleaned text is mostly the raw text verbatim,
         // which is exactly what speculative decoding accelerates (gpt-4.1/4o only).
         if usePrediction, endpoint.host == "api.openai.com", model.hasPrefix("gpt-4") { body["prediction"] = ["type": "content", "content": text] }
@@ -99,9 +107,20 @@ public struct TranscriptCleaner: Sendable {
         return request
     }
 
-    /// Opens (and keeps alive) the HTTPS connection while the user is still
-    /// talking, so the cleanup call after the finish tap skips the TLS handshake.
+    /// Loads the local model, or warms the cloud HTTPS connection while recording.
     public func warmUp() async {
+        if isLocal {
+            var request = makeRequest(text: "ok", apiKey: (try? apiKey()) ?? "")
+            request.timeoutInterval = 30
+            request.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "model": model,
+                "temperature": 0,
+                "max_tokens": 1,
+                "messages": [["role": "user", "content": "ok"]],
+            ], options: [.sortedKeys])
+            _ = try? await transport.send(request)
+            return
+        }
         guard let key = try? apiKey(), !key.isEmpty,
               let url = URL(string: "https://\(endpoint.host ?? "api.openai.com")/\(endpoint.host == "api.groq.com" ? "openai/" : "")v1/models/\(model)") else { return }
         var request = URLRequest(url: url)
@@ -123,8 +142,11 @@ public struct TranscriptCleaner: Sendable {
 
     public func cleanWithStats(_ text: String) async throws -> (text: String, stats: Stats) {
         let key: String
-        do { key = try apiKey() } catch { throw TranscriptionError.missingKey }
-        guard !key.isEmpty else { throw TranscriptionError.missingKey }
+        do { key = try apiKey() } catch {
+            guard isLocal else { throw TranscriptionError.missingKey }
+            key = ""
+        }
+        guard isLocal || !key.isEmpty else { throw TranscriptionError.missingKey }
         let data: Data
         let response: HTTPURLResponse
         var stats = Stats()
