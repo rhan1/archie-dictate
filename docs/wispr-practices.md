@@ -104,5 +104,4 @@ Effort is relative to the supplied Swift architecture. Benefits are proposals/in
 - What are comparable stop-to-paste distributions and correction rates on the same clips, microphones, networks, and Macs? Published figures are not a controlled Dictate comparison. [E19; E41; E47]
 - What proves normal macOS insertion across target apps? Clipboard consumption need not prove that the intended field changed. No helper execution or visual testing was performed. [E32; E33]
 
-Completion record: DONE — researched allowed sources and wrote only this report; no implementation changes. Discovery followed the docs index/sitemap and website blog index. **22 distinct public URLs** were fetched successfully, including the linked Baseten case study. Verification is limited to the requested non-empty/BORROW LIST and secret-pattern checks.
-
+Completion record: DONE — researched allowed sources and wrote only this report; no implementation changes. Discovery followed the docs index/sitemap and website blog index. **22 distinct public URLs** were fetched successfully, including the linked Baseten case study. Verification: the requested non-empty/section check passes; the requested secret-pattern scan prints nothing.
