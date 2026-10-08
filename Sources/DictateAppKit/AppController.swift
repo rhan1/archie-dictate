@@ -49,9 +49,21 @@ public final class AppController {
             // Without the grant there is no tap; retry quietly until the user approves.
             retryTapUntilGranted()
         }
+        if !trusted { watchAccessibilityGrant() }
         AudioRecorder.requestMicrophoneAccess { [weak self] granted in
             self?.micAvailable = granted
             AppController.note("microphone=\(granted)")
+        }
+    }
+
+    /// ⌘V is only delivered once Accessibility is granted; note the moment it is.
+    private func watchAccessibilityGrant() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            if AXIsProcessTrusted() {
+                AppController.note("accessibility=true after grant")
+            } else {
+                self?.watchAccessibilityGrant()
+            }
         }
     }
 
