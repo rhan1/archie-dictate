@@ -1,6 +1,5 @@
 // Latency harness for gate G6 and the A3 cleanup-model choice. Prints only
 // counts and milliseconds — never transcript text, never the key.
-//   DictateBench stt-realtime <fixture.wav> <runs>   stream at real-time pace, time commit -> final
 //   DictateBench stt-batch    <fixture.wav> <runs>   v1 path: time upload+transcribe after finish
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
@@ -13,6 +12,13 @@ let vocabURL = FileManager.default.homeDirectoryForCurrentUser
 let prompt = Vocabulary.buildPrompt(fileURL: vocabURL)
 let key: @Sendable () throws -> String = { try KeychainAPIKey.read() }
 let groqKey: @Sendable () throws -> String = { try KeychainAPIKey.read(service: "groq-api") }
+
+func makeLocalCleaner(model: String) -> TranscriptCleaner {
+    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 30), endpoint: TranscriptCleaner.ollamaEndpoint,
+                                     model: model, vocabulary: prompt, apiKey: { "ollama" })
+    cleaner.timeoutInterval = 30
+    return cleaner
+}
 
 /// Fable's standard live-test script as a raw STT result (fillers, a
 /// self-correction, a list, a question) so bench and live compare like for like.
@@ -151,7 +157,7 @@ if args.count >= 3, args[1] == "levels" {
 if args.count >= 2, args[1] == "score-text" {
     let raw = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     print("RAW \(scriptScore(raw))")
-    let local = OllamaCleaner(transport: URLSessionTransport(timeout: 30), vocabulary: prompt, deadline: 30)
+    let local = makeLocalCleaner(model: TranscriptCleaner.localModel)
     if let out = try? await local.cleanWithStats(raw).text { print("LOCAL-llama3.2:3b \(scriptScore(out))") }
     var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: "qwen/qwen3.8-27b", vocabulary: prompt, apiKey: groqKey)
     groq.reasoningEffort = "none"
@@ -159,7 +165,7 @@ if args.count >= 2, args[1] == "score-text" {
     exit(0)
 }
 guard args.count >= 4 else {
-    print("usage: DictateBench stt-realtime|stt-batch <wav> <runs> | cleanup <model> <runs>")
+    print("usage: DictateBench stt-batch|stt-groq <wav> <runs> | cleanup <model> <runs>")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
@@ -167,40 +173,6 @@ var results: [Int] = []
 var lastText: String?
 
 switch args[1] {
-case "stt-realtime":
-    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
-    print("fixture samples=\(pcm.count) seconds=\(String(format: "%.1f", Double(pcm.count) / 24_000))")
-    for run in 1...runs {
-        let transcriber = RealtimeTranscriber(transport: URLSessionWebSocketTransport(), apiKey: key)
-        let openStart = DispatchTime.now()
-        do { try await transcriber.open(timeout: Double(ProcessInfo.processInfo.environment["BENCH_OPEN_TIMEOUT"] ?? "1.5") ?? 1.5) } catch { print("run \(run) open error=\(error)"); continue }
-        let openMs = ms(since: openStart)
-        // Real-time pace, 100 ms chunks, like the microphone.
-        let chunk = 2_400
-        for start in stride(from: 0, to: pcm.count, by: chunk) {
-            transcriber.append(Array(pcm[start..<min(pcm.count, start + chunk)]))
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-        // The mic keeps streaming quiet audio between the last word and the
-        // finish tap; BENCH_TAIL_MS models that reaction time (0 = tap instantly).
-        let tailMs = Int(ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "0") ?? 0
-        for _ in stride(from: 0, to: tailMs, by: 100) {
-            transcriber.append([Int16](repeating: 0, count: chunk))
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-        let commit = DispatchTime.now()
-        FileHandle.standardError.write(Data("rt \(commit.uptimeNanoseconds / 1_000_000) FINISH\n".utf8))
-        do {
-            let text = try await transcriber.finish()
-            let elapsed = ms(since: commit)
-            results.append(elapsed)
-            lastText = text
-            print("run \(run) open_ms=\(openMs) tail_ms=\(tailMs) finish_to_final_ms=\(elapsed) segments=\(transcriber.segmentCount) chars=\(text.count)")
-        } catch {
-            print("run \(run) finish error=\(error)")
-        }
-        transcriber.close()
-    }
 case "stt-batch", "stt-groq":
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let wav = WAVEncoder.encode(samples: pcm, sampleRate: 24_000)
@@ -243,7 +215,7 @@ case "cleanup":
         }
     }
 case "cleanup-local":
-    let cleaner = OllamaCleaner(transport: URLSessionTransport(timeout: 30), model: args[2], vocabulary: prompt, deadline: 30)
+    let cleaner = makeLocalCleaner(model: args[2])
     await cleaner.warmUp()
     for run in 1...runs {
         let start = DispatchTime.now()
@@ -261,8 +233,8 @@ case "eval":
     let model = args[3]
     var groqCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: model, vocabulary: prompt, apiKey: groqKey)
     groqCleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"]
-    let cleaner: TextCleaner = args[2] == "local"
-        ? OllamaCleaner(transport: URLSessionTransport(timeout: 30), model: model, vocabulary: prompt, deadline: 30)
+    let cleaner: TranscriptCleaner = args[2] == "local"
+        ? makeLocalCleaner(model: model)
         : args[2] == "groq"
             ? groqCleaner
             : TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: model, vocabulary: prompt, apiKey: key)
@@ -289,7 +261,7 @@ if !results.isEmpty {
     if let text = lastText, ProcessInfo.processInfo.environment["SHOW_TEXT"] == "1" { print("TEXT \(text)") }
     if let raw = lastText, ProcessInfo.processInfo.environment["BENCH_SCORE"] == "1" {
         // Score STT on the standard script AFTER the local cleanup pass.
-        let cleaned = (try? await OllamaCleaner(transport: URLSessionTransport(timeout: 30), vocabulary: prompt, deadline: 30).cleanWithStats(raw).text) ?? raw
+        let cleaned = (try? await makeLocalCleaner(model: TranscriptCleaner.localModel).cleanWithStats(raw).text) ?? raw
         print("SCORE \(scriptScore(cleaned))")
     }
     print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") \(ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] == "1" ? "prediction=off " : "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
