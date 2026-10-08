@@ -44,6 +44,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let client: TranscriptionClient
     private let vocabulary: String
     private let includesFillerLeadIn: Bool
+    private let onChunkText: (@Sendable (Int, String) -> Void)?
     private var chunker: PauseChunker
     private var tasks: [Task<Void, Never>] = []
     private var texts: [Int: String] = [:]
@@ -55,7 +56,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var closed = false
 
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
-                fillerLeadIn: Bool = true, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0) {
+                fillerLeadIn: Bool = true, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
+                onChunkText: (@Sendable (Int, String) -> Void)? = nil) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
@@ -63,6 +65,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         // Cap only vocabulary: preserve the lead-in and the bounded previous tail.
         vocabulary = String(prompt.prefix(Vocabulary.maxPromptLength))
         includesFillerLeadIn = fillerLeadIn
+        self.onChunkText = onChunkText
         chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
     }
 
@@ -147,6 +150,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                     calls.append(Call(index: chunk.index, attempt: attempt,
                                       milliseconds: Self.ms(from: start), status: status))
                 }
+                onChunkText?(chunk.index, transcript.text.trimmingCharacters(in: .whitespacesAndNewlines))
                 return
             } catch {
                 lock.withLock {
