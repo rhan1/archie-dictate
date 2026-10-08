@@ -1,12 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+# Existing installations can keep their identifiers outside the checkout.
+BUILD_ENV="$HOME/Library/Application Support/Dictate/build.env"
+if [[ -f "$BUILD_ENV" ]]; then
+    source "$BUILD_ENV"
+fi
+DICTATE_SIGNING_IDENTITY="${DICTATE_SIGNING_IDENTITY:-Dictate Dev}"
+DICTATE_BUNDLE_ID="${DICTATE_BUNDLE_ID:-dev.dictate.app}"
+DICTATE_LABEL="${DICTATE_LABEL:-$DICTATE_BUNDLE_ID}"
+
 # D7: run Dictate at login under launchd. KeepAlive only on a crash, so Quit
 # from the menu stays quit until the next login.
-LABEL="com.razakhan.dictate"
+LABEL="$DICTATE_LABEL"
 APP_BIN="${DICTATE_APP_PATH:-$HOME/Applications/Dictate.app}/Contents/MacOS/Dictate"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="$HOME/.claude/logs"
+LOG_DIR="$HOME/Library/Logs/Dictate"
 
 if [[ ! -x "$APP_BIN" ]]; then
     echo "ERROR: $APP_BIN missing — run tools/make-app.sh first." >&2

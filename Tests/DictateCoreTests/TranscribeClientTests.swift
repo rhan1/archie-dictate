@@ -45,11 +45,11 @@ struct TranscribeClientTests {
 
     @Test func multipartContainsRequiredPartsAndBytes() throws {
         let wav = Data([0x52, 0x49, 0x46, 0x46, 0x00, 0xff, 0x80])
-        let request = client().makeRequest(wav: wav, prompt: "Raza, Limpar", apiKey: "test-key", boundary: "test-boundary")
+        let request = client().makeRequest(wav: wav, prompt: "Acme Corp, PostgreSQL", apiKey: "test-key", boundary: "test-boundary")
         let body = try #require(request.httpBody)
         let string = String(decoding: body, as: UTF8.self)
         #expect(string.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo"))
-        #expect(string.contains("name=\"prompt\"\r\n\r\nRaza, Limpar"))
+        #expect(string.contains("name=\"prompt\"\r\n\r\nAcme Corp, PostgreSQL"))
         #expect(string.contains("name=\"file\"; filename=\"audio.wav\""))
         #expect(string.contains("name=\"language\"\r\n\r\nen"))
         #expect(string.contains("name=\"response_format\"\r\n\r\njson"))
@@ -58,7 +58,7 @@ struct TranscribeClientTests {
             "--test-boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n" +
             "--test-boundary\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n" +
             "--test-boundary\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nen\r\n" +
-            "--test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nRaza, Limpar\r\n" +
+            "--test-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nAcme Corp, PostgreSQL\r\n" +
             "--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
         ).utf8)
         expected.append(wav)
@@ -74,7 +74,7 @@ struct TranscribeClientTests {
     }
     @Test func trimsSuccessfulTranscriptAndUsesRandomBoundary() async throws {
         let transport = FakeTransport(body: #"{"text":" hello world \n"}"#)
-        #expect(try await client(transport).transcribe(wav: Data([1, 2]), prompt: "Raza") == "hello world")
+        #expect(try await client(transport).transcribe(wav: Data([1, 2]), prompt: "Acme Corp") == "hello world")
         let request = try #require(transport.lastRequest)
         let header = try #require(request.value(forHTTPHeaderField: "Content-Type"))
         #expect(header.hasPrefix("multipart/form-data; boundary=dictate-"))

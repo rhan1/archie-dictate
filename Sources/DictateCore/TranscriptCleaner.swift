@@ -57,6 +57,8 @@ public struct TranscriptCleaner: Sendable {
     public let apiKey: @Sendable () throws -> String
     /// nil reloads the editable file for each cleanup; a value supplies fixture hints.
     public var hintsSentence: String?
+    /// App callers reload canonical terms together with phonetic hints.
+    public var reloadVocabularyFromHints = false
     /// Scales the local cleanup deadline with transcript length.
     public var timeoutInterval: TimeInterval = TranscriptCleaner.deadline
     /// Overrides the reasoning effort sent (Groq's gpt-oss / qwen3 models).
@@ -76,19 +78,19 @@ public struct TranscriptCleaner: Sendable {
     }
 
     public func systemPrompt() -> String {
-        var prompt = vocabulary.isEmpty ? Self.instructions : Self.instructions + "\nVocabulary: " + vocabulary
-        let hints = hintsSentence ?? Self.loadHintsSentence()
+        let loadedHints = reloadVocabularyFromHints ? VocabHints.load() : nil
+        let terms = loadedHints.map { $0.map(\.term).joined(separator: ", ") } ?? vocabulary
+        var prompt = terms.isEmpty ? Self.instructions : Self.instructions + "\nVocabulary: " + terms
+        let hints = hintsSentence ?? loadedHints.map(VocabHints.promptSentence) ?? Self.loadHintsSentence()
         if !hints.isEmpty { prompt += "\n" + hints }
         return prompt
     }
 
     public static func loadHintsSentence(
-        fileURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Projects/dictate/Resources/vocab-hints.txt"),
-        bundledURL: URL? = Bundle.main.url(forResource: "vocab-hints", withExtension: "txt")
+        fileURL: URL = AppPaths().vocabularyURL,
+        bundledURL: URL? = Bundle.main.url(forResource: "vocab-hints.sample", withExtension: "txt")
     ) -> String {
-        let url = FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : bundledURL
-        guard let url, let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
-        return VocabHints.promptSentence(VocabHints.parse(text))
+        VocabHints.promptSentence(VocabHints.load(fileURL: fileURL, bundledURL: bundledURL))
     }
 
     public func makeRequest(text: String, apiKey: String) -> URLRequest {

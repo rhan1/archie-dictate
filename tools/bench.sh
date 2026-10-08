@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+# Existing installations can keep their identifiers outside the checkout.
+BUILD_ENV="$HOME/Library/Application Support/Dictate/build.env"
+if [[ -f "$BUILD_ENV" ]]; then
+    source "$BUILD_ENV"
+fi
+DICTATE_SIGNING_IDENTITY="${DICTATE_SIGNING_IDENTITY:-Dictate Dev}"
+DICTATE_BUNDLE_ID="${DICTATE_BUNDLE_ID:-dev.dictate.app}"
+DICTATE_LABEL="${DICTATE_LABEL:-$DICTATE_BUNDLE_ID}"
+
 if [[ $# -eq 0 ]]; then
     echo "Usage: tools/bench.sh <DictateBench args…>" >&2
     exit 2
@@ -13,7 +22,7 @@ cd "$REPO_DIR"
 BIN="$("$SW" build -c release --product DictateBench --show-bin-path)/DictateBench"
 
 # Match make-app.sh's persistent login-keychain identity lookup.
-SIGNING_IDENTITY_NAME="${DICTATE_SIGNING_IDENTITY:-Archie Dev}"
+SIGNING_IDENTITY_NAME="$DICTATE_SIGNING_IDENTITY"
 LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 SIGNING_IDENTITY_HASH="$(
     /usr/bin/security find-identity -v -p codesigning "$LOGIN_KEYCHAIN" 2>/dev/null \

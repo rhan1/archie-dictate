@@ -1,3 +1,5 @@
+import Foundation
+
 /// The application that was frontmost when recording began.
 public struct InsertionTarget: Equatable, Sendable {
     public var pid: Int32
@@ -10,12 +12,12 @@ public struct InsertionTarget: Equatable, Sendable {
 
     public enum Decision: Equatable, Sendable { case paste, hold }
 
-    public static func decide(start: InsertionTarget?, now: InsertionTarget?) -> Decision {
+    public static func decide(start: InsertionTarget?, now: InsertionTarget?,
+                              appBundleID: String? = Bundle.main.bundleIdentifier) -> Decision {
         guard let start else { return .paste }
         let transientAgents = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter",
-                               "com.apple.coreservices.uiagent", "com.apple.CoreServicesUIAgent",
-                               "com.razakhan.dictate"]
-        if transientAgents.contains(start.bundleID) { return .paste }
+                               "com.apple.coreservices.uiagent", "com.apple.CoreServicesUIAgent"]
+        if transientAgents.contains(start.bundleID) || start.bundleID == appBundleID { return .paste }
         return start.pid == now?.pid ? .paste : .hold
     }
 }

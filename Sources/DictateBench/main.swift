@@ -8,9 +8,7 @@ import DictateAppKit
 import DictateCore
 import Foundation
 
-let vocabURL = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".claude/projects/-Users-razakhan/memory/reference-raza-vocabulary.md")
-let prompt = Vocabulary.buildPrompt(fileURL: vocabURL)
+let prompt = Vocabulary.buildPrompt()
 func environmentKey(_ name: String) throws -> String {
     guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
         throw TranscriptionError.missingKey

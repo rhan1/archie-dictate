@@ -1,10 +1,19 @@
 #!/bin/bash
 set -uo pipefail
 
+# Existing installations can keep their identifiers outside the checkout.
+BUILD_ENV="$HOME/Library/Application Support/Dictate/build.env"
+if [[ -f "$BUILD_ENV" ]]; then
+    source "$BUILD_ENV"
+fi
+DICTATE_SIGNING_IDENTITY="${DICTATE_SIGNING_IDENTITY:-Dictate Dev}"
+DICTATE_BUNDLE_ID="${DICTATE_BUNDLE_ID:-dev.dictate.app}"
+DICTATE_LABEL="${DICTATE_LABEL:-$DICTATE_BUNDLE_ID}"
+
 # Removes the Dictate LaunchAgent; pass --delete-app to also remove the bundle.
 # Prints every step it takes. To go back to Wispr Flow afterwards:
 #   open -a "Wispr Flow"   (and re-add it under System Settings > General > Login Items)
-LABEL="com.razakhan.dictate"
+LABEL="$DICTATE_LABEL"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 APP="${DICTATE_APP_PATH:-$HOME/Applications/Dictate.app}"
 
@@ -30,4 +39,4 @@ if [[ "${1:-}" == "--delete-app" ]]; then
 else
     echo "kept $APP (pass --delete-app to remove it)"
 fi
-echo "logs left in place: ~/.claude/logs/dictate.log"
+echo "logs left in place: $HOME/Library/Logs/Dictate/dictate.log"
