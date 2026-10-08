@@ -3,7 +3,13 @@ import DictateCore
 
 /// Wires the hotkey, recorder, pill, transcription and paste together around
 /// the pure DictationStateMachine.
+/// STT engine: ONE line to switch. Apple on-device won G9 (finish→final ~20 ms,
+/// 4/4 names after cleanup); OpenAI Realtime is the alternative.
+public enum STTEngine: String { case apple, realtime }
+
 public final class AppController {
+    public static let sttEngine: STTEngine =
+        ProcessInfo.processInfo.environment["DICTATE_STT"].flatMap(STTEngine.init(rawValue:)) ?? .apple
     public static let vocabularyURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/projects/-Users-razakhan/memory/reference-raza-vocabulary.md")
 
@@ -23,6 +29,11 @@ public final class AppController {
     /// when Ollama is unreachable.
     private let localCleaner: OllamaCleaner
     private let cloudCleaner: TranscriptCleaner
+    /// Cleanup default (G7 round 2): Groq qwen3.8-27b, 10/10 quality, p50 367 ms.
+    private let groqCleaner: TranscriptCleaner
+    /// Batch STT fallback when the streaming engine fails: Groq whisper first.
+    private let groqSTT: TranscriptionClient
+    private var apple: AppleTranscriber?
     /// The Realtime session for the current dictation.
     private var transcriber: RealtimeTranscriber?
     /// One idle Realtime socket kept open so no dictation pays the ~0.7 s
@@ -57,6 +68,14 @@ public final class AppController {
         // it was echoed back verbatim instead of the speech (live, 00:27).
         localCleaner = OllamaCleaner(transport: URLSessionTransport(timeout: 30), model: OllamaCleaner.defaultModel,
                                      vocabulary: prompt)
+        var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5), endpoint: TranscriptCleaner.groqEndpoint,
+                                     model: "qwen/qwen3.8-27b", vocabulary: prompt) { try KeychainAPIKey.read(service: "groq-api") }
+        groq.reasoningEffort = "none"
+        groqCleaner = groq
+        var whisper = TranscriptionClient(transport: URLSessionTransport(timeout: 30)) { try KeychainAPIKey.read(service: "groq-api") }
+        whisper.endpointURL = TranscriptionClient.groqEndpoint
+        whisper.modelName = "whisper-large-v3-turbo"
+        groqSTT = whisper
         cloudCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: TranscriptCleaner.deadline),
                                     vocabulary: prompt) { try KeychainAPIKey.read() }
     }
@@ -84,6 +103,7 @@ public final class AppController {
         if fakeTranscript == nil {
             keepWarm(force: true)
             Task { [localCleaner] in await localCleaner.warmUp() }
+            if Self.sttEngine == .apple { Task { await AppleTranscriber.ensureAssets() } }
             let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.keepWarm(force: false) }
             RunLoop.main.add(timer, forMode: .common)
             warmTimer = timer
@@ -125,7 +145,7 @@ public final class AppController {
     private func hotkey(_ signal: TapSignal) {
         if signal == .tap, machine.state == .idle {
             if fakeTranscript == nil, warmIsHealthy == false { keepWarm(force: true) }
-            if fakeTranscript == nil { Task { [localCleaner] in await localCleaner.warmUp() } }
+            if fakeTranscript == nil { Task { [groqCleaner] in await groqCleaner.warmUp() } }
             prewarmEngine()
         }
         perform(machine.handle(signal))
@@ -167,7 +187,7 @@ public final class AppController {
     /// Opens the idle socket if there is none (or it dropped). Unforced calls
     /// (the minute timer) reconnect at most once per minute.
     private func keepWarm(force: Bool) {
-        guard fakeTranscript == nil, !warmIsHealthy else { return }
+        guard fakeTranscript == nil, Self.sttEngine == .realtime, !warmIsHealthy else { return }
         guard force || Date().timeIntervalSince(lastWarmAttempt) >= 60 else { return }
         lastWarmAttempt = Date()
         let session = RealtimeTranscriber(transport: URLSessionWebSocketTransport()) { try KeychainAPIKey.read() }
@@ -210,11 +230,18 @@ public final class AppController {
         generation += 1
         recordingStarted = Date()
         recordingStartMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
-        if fakeTranscript == nil {
+        if fakeTranscript == nil, Self.sttEngine == .apple {
+            socketOrigin = "none(apple)"
+            let engine = AppleTranscriber()
+            apple = engine
+            recorder.onPCMChunk = { pcm in engine.append(pcm) }
+            Task { try? await engine.start() }
+            Task { [groqCleaner] in await groqCleaner.warmUp() }
+        } else if fakeTranscript == nil {
             let session = takeTranscriber()
             transcriber = session
             recorder.onPCMChunk = { pcm in session.append(pcm) }
-            Task { [localCleaner] in await localCleaner.warmUp() }
+            Task { [groqCleaner] in await groqCleaner.warmUp() }
         } else {
             recorder.onPCMChunk = nil
         }
@@ -255,12 +282,15 @@ public final class AppController {
         let bytes = 44 + samples.count * 2
         let session = transcriber
         transcriber = nil
+        let appleSession = apple
+        apple = nil
         keepWarm(force: true)   // refill the idle socket on EVERY end path (silence/error included)
         let myGeneration = generation
         pill.show(.transcribing)
 
         if fakeTranscript == nil, AudioLevel.isSilent(samples) {
             session?.close()
+            appleSession?.cancel()
             machine.transcriptionFinished()
             fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0)
             return
@@ -271,6 +301,8 @@ public final class AppController {
         let client = self.client
         let localCleaner = self.localCleaner
         let cloudCleaner = self.cloudCleaner
+        let groqCleaner = self.groqCleaner
+        let groqSTT = self.groqSTT
         var timeline = Timeline(warmMs: warmMs, capture: recorder.stats, socket: socketOrigin, recordingStartMs: recordingStartMs,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
@@ -281,7 +313,11 @@ public final class AppController {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                result = await Self.transcribe(session: session, samples: samples, client: client, report: &pipeline)
+                if let appleSession {
+                    result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, openAI: client, report: &pipeline)
+                } else {
+                    result = await Self.transcribe(session: session, samples: samples, client: client, report: &pipeline)
+                }
                 pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
                 timeline.realtime = session?.timeline
                 timeline.segments = session?.segmentCount
@@ -294,7 +330,7 @@ public final class AppController {
                     pipeline.cleanup = "skipped:short"
                 } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
-                    let outcome = await Self.cleanUp(raw, local: localCleaner, cloud: cloudCleaner)
+                    let outcome = await Self.cleanUp(raw, groq: groqCleaner, local: localCleaner, cloud: cloudCleaner)
                     pipeline.text = outcome.text
                     pipeline.cleanup = outcome.label
                     pipeline.cleanupModel = outcome.model
@@ -347,26 +383,41 @@ public final class AppController {
 
     enum EchoError: Error { case promptEcho }
 
-    /// Local first. Cloud only when Ollama cannot be reached at all; a local
-    /// overrun or error pastes the raw text (never waits for a second model).
-    private static func cleanUp(_ raw: String, local: OllamaCleaner, cloud: TranscriptCleaner) async
+    /// Groq first (fastest + best measured). If Groq fails or is slower than
+    /// its 1.5 s deadline, the local model runs; OpenAI only if both fail.
+    /// The log says which one produced the text.
+    private static func cleanUp(_ raw: String, groq: TranscriptCleaner, local: OllamaCleaner, cloud: TranscriptCleaner) async
         -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?) {
-        // ~4 chars per token at ~55 tok/s on this Mac, plus prompt time.
-        let timed = OllamaCleaner(transport: local.transport, model: local.model, vocabulary: local.vocabulary,
-                              deadline: max(2.5, 0.8 + Double(raw.count) / 4 / 45))
+        if let (text, stats) = try? await groq.cleanWithStats(raw) {
+            return (text, "ok", groq.model, stats)
+        }
+        let timedLocal = OllamaCleaner(transport: local.transport, model: local.model, vocabulary: local.vocabulary,
+                                       deadline: max(2.5, 0.8 + Double(raw.count) / 4 / 45))
         do {
-            let (text, stats) = try await timed.cleanWithStats(raw)
-            return (text, "ok", local.model, stats)
+            let (text, stats) = try await timedLocal.cleanWithStats(raw)
+            return (text, "fallback_local", local.model, stats)
         } catch TranscriptionError.network(let code) where code != "timedOut" {
-            do {
-                let (text, stats) = try await cloud.cleanWithStats(raw)
-                return (text, "cloud", cloud.model, stats)
-            } catch {
-                return (raw, "skipped:cloud_\((error as? TranscriptionError)?.logReason ?? "error")", cloud.model, nil)
+            if let (text, stats) = try? await cloud.cleanWithStats(raw) {
+                return (text, "fallback_openai", cloud.model, stats)
             }
+            return (raw, "skipped:all_failed", local.model, nil)
         } catch {
             return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil)
         }
+    }
+
+    /// G9: Apple on-device first; batch Groq whisper, then OpenAI batch, if it fails.
+    private static func transcribeApple(_ engine: AppleTranscriber, samples: [Float], groq: TranscriptionClient,
+                                        openAI: TranscriptionClient, report: inout PipelineReport) async -> Result<String, Error> {
+        report.path = "apple"
+        if let text = try? await engine.finish(), !text.isEmpty { return .success(text) }
+        note("apple STT failed or empty; falling back to batch")
+        let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: Int(AudioRecorder.sampleRate))
+        report.path = "batch_groq"
+        if let text = try? await groq.transcribe(wav: wav, prompt: "") { return .success(text) }
+        report.path = "batch_openai"
+        do { return .success(try await openAI.transcribe(wav: wav, prompt: "")) }
+        catch { return .failure(error) }
     }
 
     /// One stderr line per dictation: where the time went. Counts and ms only.
@@ -394,7 +445,7 @@ public final class AppController {
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
-                "socket=\(socket)", "open_to_created_ms=\(rel(rt?.sessionCreated, from: rt?.openStart))",
+                "stt_engine=\(AppController.sttEngine.rawValue)", "socket=\(socket)", "open_to_created_ms=\(rel(rt?.sessionCreated, from: rt?.openStart))",
                 "created_to_updated_ms=\(rel(rt?.sessionUpdated, from: rt?.sessionCreated))",
                 "rec_to_first_append_ms=\(rel(rt?.firstAppendSent, from: recordingStartMs))",
                 "appended_s=\(String(format: "%.1f", Double(rt?.appendedSamples ?? 0) / AudioRecorder.sampleRate))",
@@ -450,6 +501,8 @@ public final class AppController {
         _ = recorder.stop()   // discard: nothing is kept
         warmup.stopped()
         dropTranscriber()
+        apple?.cancel()
+        apple = nil
         keepWarm(force: true)
         pill.hide()
         traceFocus("pill hidden, cancelled")

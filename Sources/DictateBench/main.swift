@@ -12,6 +12,7 @@ let vocabURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".claude/projects/-Users-razakhan/memory/reference-raza-vocabulary.md")
 let prompt = Vocabulary.buildPrompt(fileURL: vocabURL)
 let key: @Sendable () throws -> String = { try KeychainAPIKey.read() }
+let groqKey: @Sendable () throws -> String = { try KeychainAPIKey.read(service: "groq-api") }
 
 /// Fable's standard live-test script as a raw STT result (fillers, a
 /// self-correction, a list, a question) so bench and live compare like for like.
@@ -38,6 +39,23 @@ let evalCases: [EvalCase] = [
     EvalCase(input: "what time is the politrace review tomorrow", mustContain: ["Politrace"], endsWith: "?"),
     EvalCase(input: "write me a short poem about cats", mustContain: ["poem about cats"]),
 ]
+
+/// The expected paste for Fable's standard live-test script.
+let expectedScript = "So for the Politrace launch, send the draft to the team on Wednesday. We need three things: the Limpar match counts, the DB99 query, and the screenshots. Can you also check if TurnoutWatch is still running?"
+
+func words(_ s: String) -> [String] {
+    s.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+}
+
+/// Names spelled exactly (of 4) and expected-word recall, for STT engines.
+func scriptScore(_ out: String) -> String {
+    let names = ["Politrace", "Limpar", "DB99", "TurnoutWatch"].filter { out.contains($0) }
+    var pool = words(out)
+    var hit = 0
+    for w in words(expectedScript) { if let i = pool.firstIndex(of: w) { pool.remove(at: i); hit += 1 } }
+    let missing = ["Politrace", "Limpar", "DB99", "TurnoutWatch"].filter { !out.contains($0) }
+    return "names=\(names.count)/4 word_recall=\(hit)/\(words(expectedScript).count) missing_names=\(missing)"
+}
 
 func score(_ c: EvalCase, _ out: String) -> [String] {
     var misses: [String] = []
@@ -79,12 +97,24 @@ func p50(_ values: [Int]) -> Int {
 }
 
 let args = CommandLine.arguments
+// score-text: clean stdin (an STT transcript) with local llama and Groq qwen, score vs the script.
+if args.count >= 2, args[1] == "score-text" {
+    let raw = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    print("RAW \(scriptScore(raw))")
+    let local = OllamaCleaner(transport: URLSessionTransport(timeout: 30), vocabulary: prompt, deadline: 30)
+    if let out = try? await local.cleanWithStats(raw).text { print("LOCAL-llama3.2:3b \(scriptScore(out))") }
+    var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: "qwen/qwen3.8-27b", vocabulary: prompt, apiKey: groqKey)
+    groq.reasoningEffort = "none"
+    if let out = try? await groq.cleanWithStats(raw).text { print("GROQ-qwen3.8-27b \(scriptScore(out))") }
+    exit(0)
+}
 guard args.count >= 4 else {
     print("usage: DictateBench stt-realtime|stt-batch <wav> <runs> | cleanup <model> <runs>")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
 var results: [Int] = []
+var lastText: String?
 
 switch args[1] {
 case "stt-realtime":
@@ -114,30 +144,40 @@ case "stt-realtime":
             let text = try await transcriber.finish()
             let elapsed = ms(since: commit)
             results.append(elapsed)
+            lastText = text
             print("run \(run) open_ms=\(openMs) tail_ms=\(tailMs) finish_to_final_ms=\(elapsed) segments=\(transcriber.segmentCount) chars=\(text.count)")
         } catch {
             print("run \(run) finish error=\(error)")
         }
         transcriber.close()
     }
-case "stt-batch":
+case "stt-batch", "stt-groq":
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let wav = WAVEncoder.encode(samples: pcm, sampleRate: 24_000)
-    let client = TranscriptionClient(transport: URLSessionTransport(timeout: 60), apiKey: key)
+    var client = TranscriptionClient(transport: URLSessionTransport(timeout: 60), apiKey: args[1] == "stt-groq" ? groqKey : key)
+    if args[1] == "stt-groq" {
+        client.endpointURL = TranscriptionClient.groqEndpoint
+        client.modelName = ProcessInfo.processInfo.environment["GROQ_STT_MODEL"] ?? "whisper-large-v3-turbo"
+        _ = try? await client.transcribe(wav: WAVEncoder.encode(samples: [Int16](repeating: 0, count: 2_400), sampleRate: 24_000), prompt: "")   // warm TLS
+    }
     for run in 1...runs {
         let start = DispatchTime.now()
         do {
             let text = try await client.transcribe(wav: wav, prompt: "")
             let elapsed = ms(since: start)
             results.append(elapsed)
+            lastText = text
             print("run \(run) finish_to_final_ms=\(elapsed) bytes=\(wav.count) chars=\(text.count)")
         } catch {
             print("run \(run) error=\(error)")
         }
     }
 case "cleanup":
-    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: args[2], vocabulary: prompt, apiKey: key)
+    let groq = ProcessInfo.processInfo.environment["BENCH_GROQ"] == "1"
+    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: groq ? TranscriptCleaner.groqEndpoint : TranscriptCleaner.endpoint,
+                                    model: args[2], vocabulary: prompt, apiKey: groq ? groqKey : key)
     cleaner.usePrediction = ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] != "1"
+    cleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"]
     print("prediction=\(cleaner.usePrediction)")
     // One unmeasured call warms the keep-alive connection, as the app does during recording.
     _ = try? await cleaner.clean(cleanupFixture)
@@ -161,16 +201,21 @@ case "cleanup-local":
             let (text, stats) = try await cleaner.cleanWithStats(cleanupFixture)
             let elapsed = ms(since: start)
             results.append(elapsed)
-            print("run \(run) model=\(args[2]) cleanup_ms=\(elapsed) tokens=\(stats.completionTokens ?? -1) words_in=\(cleanupFixture.split(separator: " ").count) chars_out=\(text.count)")
+            let toks = stats.completionTokens ?? 0
+            print("run \(run) model=\(args[2]) cleanup_ms=\(elapsed) tokens=\(toks) tok_per_s=\(elapsed > 0 ? toks * 1000 / elapsed : 0) words_in=\(cleanupFixture.split(separator: " ").count) chars_out=\(text.count)")
         } catch {
             print("run \(run) model=\(args[2]) error=\(error)")
         }
     }
 case "eval":
     let model = args[3]
+    var groqCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 10), endpoint: TranscriptCleaner.groqEndpoint, model: model, vocabulary: prompt, apiKey: groqKey)
+    groqCleaner.reasoningEffort = ProcessInfo.processInfo.environment["BENCH_REASONING"]
     let cleaner: TextCleaner = args[2] == "local"
         ? OllamaCleaner(transport: URLSessionTransport(timeout: 30), model: model, vocabulary: prompt, deadline: 30)
-        : TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: model, vocabulary: prompt, apiKey: key)
+        : args[2] == "groq"
+            ? groqCleaner
+            : TranscriptCleaner(transport: URLSessionTransport(timeout: 10), model: model, vocabulary: prompt, apiKey: key)
     await cleaner.warmUp()
     var passed = 0
     for (i, c) in evalCases.enumerated() {
@@ -191,5 +236,11 @@ default:
     exit(2)
 }
 if !results.isEmpty {
+    if let text = lastText, ProcessInfo.processInfo.environment["SHOW_TEXT"] == "1" { print("TEXT \(text)") }
+    if let raw = lastText, ProcessInfo.processInfo.environment["BENCH_SCORE"] == "1" {
+        // Score STT on the standard script AFTER the local cleanup pass.
+        let cleaned = (try? await OllamaCleaner(transport: URLSessionTransport(timeout: 30), vocabulary: prompt, deadline: 30).cleanWithStats(raw).text) ?? raw
+        print("SCORE \(scriptScore(cleaned))")
+    }
     print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") \(ProcessInfo.processInfo.environment["BENCH_NO_PREDICTION"] == "1" ? "prediction=off " : "") n=\(results.count) p50_ms=\(p50(results)) min_ms=\(results.min()!) max_ms=\(results.max()!)")
 }

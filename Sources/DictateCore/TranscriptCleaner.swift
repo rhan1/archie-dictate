@@ -52,15 +52,22 @@ public struct TranscriptCleaner: Sendable {
     """
 
     public let transport: HTTPTransport
+    /// OpenAI by default; Groq's OpenAI-compatible endpoint also works.
+    public let endpoint: URL
     public let model: String
     public let vocabulary: String
     public let apiKey: @Sendable () throws -> String
     /// Predicted outputs on (default); the bench turns it off for before/after.
     public var usePrediction = true
+    /// Overrides the reasoning effort sent (Groq's gpt-oss / qwen3 models).
+    public var reasoningEffort: String?
 
-    public init(transport: HTTPTransport, model: String = TranscriptCleaner.defaultModel, vocabulary: String,
-                apiKey: @escaping @Sendable () throws -> String) {
+    public static let groqEndpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
+
+    public init(transport: HTTPTransport, endpoint: URL = TranscriptCleaner.endpoint, model: String = TranscriptCleaner.defaultModel,
+                vocabulary: String, apiKey: @escaping @Sendable () throws -> String) {
         self.transport = transport
+        self.endpoint = endpoint
         self.model = model
         self.vocabulary = vocabulary
         self.apiKey = apiKey
@@ -71,7 +78,7 @@ public struct TranscriptCleaner: Sendable {
     }
 
     public func makeRequest(text: String, apiKey: String) -> URLRequest {
-        var request = URLRequest(url: Self.endpoint)
+        var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = Self.deadline
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -83,10 +90,11 @@ public struct TranscriptCleaner: Sendable {
         ]
         // GPT-5-family models reason by default; "none" is the fastest setting
         // they accept ("minimal" is rejected by gpt-5.4-*).
-        if model.hasPrefix("gpt-5") { body["reasoning_effort"] = "none" }
+        if let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
+        else if model.hasPrefix("gpt-5") { body["reasoning_effort"] = "none" }
         // Predicted outputs: the cleaned text is mostly the raw text verbatim,
         // which is exactly what speculative decoding accelerates (gpt-4.1/4o only).
-        if usePrediction, model.hasPrefix("gpt-4") { body["prediction"] = ["type": "content", "content": text] }
+        if usePrediction, endpoint.host == "api.openai.com", model.hasPrefix("gpt-4") { body["prediction"] = ["type": "content", "content": text] }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return request
     }
@@ -95,7 +103,7 @@ public struct TranscriptCleaner: Sendable {
     /// talking, so the cleanup call after the finish tap skips the TLS handshake.
     public func warmUp() async {
         guard let key = try? apiKey(), !key.isEmpty,
-              let url = URL(string: "https://api.openai.com/v1/models/\(model)") else { return }
+              let url = URL(string: "https://\(endpoint.host ?? "api.openai.com")/\(endpoint.host == "api.groq.com" ? "openai/" : "")v1/models/\(model)") else { return }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         _ = try? await transport.send(request)
