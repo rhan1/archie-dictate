@@ -1,8 +1,7 @@
 import Foundation
 
 /// The output device's MUTE FLAG only — no volume level is ever read or written
-/// (Raza's standing rule; muting while dictating is his one explicit exception,
-/// 2026-10-09 01:1x: "I just want to mute it while I'm talking").
+/// while recording. The volume level is never changed.
 public protocol OutputMuteDevice: AnyObject {
     func defaultOutputUID() -> String?
     /// nil when the device is gone or has no settable mute flag.
@@ -22,8 +21,7 @@ public final class OutputMuter {
     public private(set) var mutedUID: String?
     private var prior = false
 
-    public static let defaultStateFile = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/run-status/dictate-muted")
+    public static let defaultStateFile = AppPaths().mutedStateURL
 
     public init(device: OutputMuteDevice, stateFile: URL = OutputMuter.defaultStateFile) {
         self.device = device

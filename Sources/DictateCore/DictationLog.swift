@@ -65,8 +65,7 @@ public struct DictationLogEntry: Equatable, Sendable {
 }
 
 public enum DictationLog {
-    public static let defaultURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/logs/dictate.log")
+    public static let defaultURL = AppPaths().logURL
 
     @discardableResult
     public static func append(_ entry: DictationLogEntry, to url: URL = defaultURL) -> Bool {

@@ -1,7 +1,7 @@
 import Foundation
 
 /// What Dictate can ask of the system's media playback. Read-only queries plus
-/// the play/pause media key — never volume or mute (Raza's standing rule).
+/// the play/pause media key — never volume or mute (volume levels are never changed).
 public protocol MediaControl: AnyObject {
     /// Bundle ids of media apps currently producing audio, or nil when the
     /// playing state cannot be determined.

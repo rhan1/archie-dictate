@@ -4,9 +4,6 @@ import DictateCore
 /// Wires the hotkey, recorder, pill, transcription and paste together around
 /// the pure DictationStateMachine.
 public final class AppController {
-    public static let vocabularyURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/projects/-Users-razakhan/memory/reference-raza-vocabulary.md")
-
     private var machine = DictationStateMachine()
     private let hotkeys = HotkeyMonitor()
     private let recorder = AudioRecorder()
@@ -14,7 +11,7 @@ public final class AppController {
     private let statusItem = StatusItemController()
     private let inserter = TextInserter()
     private let keyStore = KeyStore()
-    private let prompt: String
+    private var prompt: String { Vocabulary.buildPrompt() }
     /// Local cleanup is the fallback when Groq fails.
     private let localCleaner: TranscriptCleaner
     /// Cleanup default (G7 round 2): Groq qwen3.8-27b, 10/10 quality, p50 367 ms.
@@ -30,8 +27,8 @@ public final class AppController {
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private var warmup = CaptureWarmup()
-    /// Raza (2026-10-09): media keeps PLAYING, muted while he talks. Output
-    /// mute flag only; pausing is the fallback for devices without one.
+    /// Media keeps playing, muted while recording. Pausing is the fallback
+    /// for devices without a settable output mute flag.
     private let muter = OutputMuter(device: SystemOutputMute())
     private let media = MediaPauser(control: SystemMedia())
     private var muteWatchdog: DispatchWorkItem?
@@ -58,22 +55,20 @@ public final class AppController {
     private var recoveryTap: DispatchWorkItem?
 
     public init() {
-        if !FileManager.default.fileExists(atPath: AppController.vocabularyURL.path) {
-            AppController.note("vocabulary file missing at \(AppController.vocabularyURL.path); using seed terms only")
-        }
-        prompt = Vocabulary.buildPrompt(fileURL: AppController.vocabularyURL)
-        // The vocabulary feeds ONLY the cleanup prompt: given to the STT model
-        // it was echoed back verbatim instead of the speech (live, 00:27).
+        let prompt = Vocabulary.buildPrompt()
         let keys = keyStore
         let groqKey: @Sendable () throws -> String = {
             guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
             return key
         }
-        localCleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 2), endpoint: TranscriptCleaner.ollamaEndpoint,
+        var local = TranscriptCleaner(transport: URLSessionTransport(timeout: 2), endpoint: TranscriptCleaner.ollamaEndpoint,
                                          model: TranscriptCleaner.localModel, vocabulary: prompt, apiKey: { "ollama" })
+        local.reloadVocabularyFromHints = true
+        localCleaner = local
         var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5), endpoint: TranscriptCleaner.groqEndpoint,
                                      model: TranscriptCleaner.defaultModel, vocabulary: prompt, apiKey: groqKey)
         groq.reasoningEffort = "none"
+        groq.reloadVocabularyFromHints = true
         groqCleaner = groq
         var whisper = TranscriptionClient(transport: URLSessionTransport(timeout: 30), apiKey: groqKey)
         whisper.endpointURL = TranscriptionClient.groqEndpoint
@@ -82,6 +77,12 @@ public final class AppController {
     }
 
     public func start() {
+        do {
+            let copied = try AppPaths.migrate()
+            AppController.note("migrated=\(copied.isEmpty ? "none" : copied.joined(separator: ","))")
+        } catch {
+            AppController.note("migration_error=\(error.localizedDescription)")
+        }
         keyStore.prefetch(services: ["groq-api"])
         logKeyStates()
         hotkeys.onSignal = { [weak self] signal in self?.hotkey(signal) }
@@ -580,6 +581,7 @@ public final class AppController {
         let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
         var timedLocal = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline), endpoint: local.endpoint,
                                            model: local.model, vocabulary: local.vocabulary, apiKey: local.apiKey)
+        timedLocal.reloadVocabularyFromHints = local.reloadVocabularyFromHints
         timedLocal.timeoutInterval = deadline
         do {
             let (text, stats) = try await timedLocal.cleanWithStats(raw)

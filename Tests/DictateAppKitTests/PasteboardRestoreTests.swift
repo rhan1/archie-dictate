@@ -13,7 +13,7 @@ struct PasteboardRestoreTests {
     @Test func roundTripRestoresStringAndCustomType() {
         let pb = privatePasteboard()
         defer { pb.releaseGlobally() }
-        let custom = NSPasteboard.PasteboardType("com.razakhan.dictate.test")
+        let custom = NSPasteboard.PasteboardType("dev.dictate.test")
         let item = NSPasteboardItem()
         item.setString("SENTINEL-123", forType: .string)
         item.setData(Data([0, 1, 2, 255]), forType: custom)

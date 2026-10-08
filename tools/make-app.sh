@@ -1,12 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+# Existing installations can keep their identifiers outside the checkout.
+BUILD_ENV="$HOME/Library/Application Support/Dictate/build.env"
+if [[ -f "$BUILD_ENV" ]]; then
+    source "$BUILD_ENV"
+fi
+DICTATE_SIGNING_IDENTITY="${DICTATE_SIGNING_IDENTITY:-Dictate Dev}"
+DICTATE_BUNDLE_ID="${DICTATE_BUNDLE_ID:-dev.dictate.app}"
+DICTATE_LABEL="${DICTATE_LABEL:-$DICTATE_BUNDLE_ID}"
+
 # Builds ~/Applications/Dictate.app from the Dictate product.
 #
-# The toolchain is PINNED to the same 6.3.3 release Archie uses: a .build made
+# The toolchain is PINNED to the 6.3.3 release: a .build made
 # by the Command Line Tools' 6.2.4 makes the 6.3.3 test runner discover zero
 # tests while exiting 0, which looks exactly like a pass.
-SW="${DICTATE_SWIFT:-$HOME/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift}"
+SW="$HOME/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
@@ -29,12 +38,12 @@ echo "==> Assembling bundle at $APP_PATH..."
 rm -rf "$CONTENTS"
 mkdir -p "$MACOS" "$CONTENTS/Resources"
 cp "$RELEASE_BIN" "$MACOS/Dictate"
-cp "$REPO_DIR/Resources/vocab-hints.txt" "$CONTENTS/Resources/vocab-hints.txt"
+cp "$REPO_DIR/Resources/vocab-hints.sample.txt" "$CONTENTS/Resources/vocab-hints.sample.txt"
 chmod +x "$MACOS/Dictate"
 
 # LSUIElement: menu-bar only, no Dock icon. The microphone usage string must be
 # in place BEFORE codesign seals the bundle.
-cat << 'PLIST' > "$CONTENTS/Info.plist"
+cat << PLIST > "$CONTENTS/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -46,7 +55,7 @@ cat << 'PLIST' > "$CONTENTS/Info.plist"
 	<key>CFBundleExecutable</key>
 	<string>Dictate</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.razakhan.dictate</string>
+	<string>$DICTATE_BUNDLE_ID</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -73,10 +82,9 @@ PLIST
 
 # A STABLE signing identity, not ad-hoc: macOS ties the Accessibility and
 # Microphone grants to the signature, and a fresh ad-hoc signature on every
-# rebuild revokes them. Default is the self-signed "Archie Dev" identity that
-# already sits trusted in the login keychain (only the keychain identity is
-# shared, no Archie code); override with DICTATE_SIGNING_IDENTITY.
-SIGNING_IDENTITY_NAME="${DICTATE_SIGNING_IDENTITY:-Archie Dev}"
+# rebuild revokes them. tools/ensure-signing-identity.sh can create the default
+# self-signed "Dictate Dev" identity; override it through build.env or the environment.
+SIGNING_IDENTITY_NAME="$DICTATE_SIGNING_IDENTITY"
 LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 SIGNING_IDENTITY_HASH="$(
     /usr/bin/security find-identity -v -p codesigning "$LOGIN_KEYCHAIN" 2>/dev/null \
