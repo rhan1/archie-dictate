@@ -3,7 +3,7 @@ import DictateCore
 
 /// AVAudioEngine capture, converted live to 24 kHz mono pcm16 (the rate the
 /// batch STT fallbacks receive) and kept in memory only. Nothing is ever written to disk.
-public final class AudioRecorder {
+public final class AudioRecorder: CaptureEngine {
     public static let sampleRate: Double = 24_000
     /// 100 ms of pcm16 per streamed chunk (v1.1 A1).
     public static let chunkSamples = 2_400
@@ -56,7 +56,7 @@ public final class AudioRecorder {
         }
     }
 
-    public func start() throws {
+    public func start(device: MicChoice = .default) throws {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         pendingPCM.removeAll()
@@ -80,6 +80,8 @@ public final class AudioRecorder {
             try? self.installTapAndStart()
         }
     }
+
+    public func rebuild() { _ = stop() }
 
     private func installTapAndStart() throws {
         let input = engine.inputNode

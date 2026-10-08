@@ -26,7 +26,7 @@ public final class AppController {
     private var chunked: GroqChunkedTranscriber?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
-    private var warmup = CaptureWarmup()
+    private lazy var capture = CaptureLifecycle(engine: recorder)
     /// Media keeps playing, muted while recording. Pausing is the fallback
     /// for devices without a settable output mute flag.
     private let muter = OutputMuter(device: SystemOutputMute())
@@ -77,6 +77,7 @@ public final class AppController {
     }
 
     public func start() {
+        configureCapture()
         do {
             let copied = try AppPaths.migrate()
             AppController.note("migrated=\(copied.isEmpty ? "none" : copied.joined(separator: ","))")
@@ -97,7 +98,7 @@ public final class AppController {
         recorder.onLevel = { [weak self] level in self?.pill.push(level: level) }
         recorder.onFirstBuffer = { [weak self] in
             guard let self else { return }
-            self.apply(self.warmup.bufferArrived(at: ProcessInfo.processInfo.systemUptime))
+            self.capture.bufferArrived(at: ProcessInfo.processInfo.systemUptime)
         }
 
         let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
@@ -229,31 +230,33 @@ public final class AppController {
 
     /// First ⌥ tap: start the engine now so a Bluetooth headset's profile
     /// switch overlaps the second tap. Stopped silently if no ⌥⌥ follows.
-    private func prewarmEngine() {
-        apply(warmup.firstTap())
-        prewarmExpiry?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.machine.state == .idle else { return }
-            self.apply(self.warmup.prewarmExpired())
-        }
-        prewarmExpiry = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + CaptureWarmup.prewarmTimeout, execute: work)
-    }
+    private func prewarmEngine() { capture.firstTap() }
 
-    private func apply(_ effects: [CaptureWarmup.Effect]) {
-        for effect in effects {
+    private func configureCapture() {
+        capture.note = { AppController.note($0) }
+        capture.cancelExpiry = { [weak self] in
+            self?.prewarmExpiry?.cancel()
+            self?.prewarmExpiry = nil
+        }
+        capture.scheduleExpiry = { [weak self] in
+            guard let self else { return }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.machine.state == .idle else { return }
+                self.capture.end(.prewarmExpired)
+            }
+            self.prewarmExpiry = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + CaptureWarmup.prewarmTimeout, execute: work)
+        }
+        capture.onEffect = { [weak self] effect in
+            guard let self else { return }
             switch effect {
-            case .startEngine:
-                do { try recorder.start() } catch { AppController.note("engine start failed: \(error)") }
-            case .stopEngine:
-                _ = recorder.stop()
-            case .showWarming:
-                pill.show(.warming)
+            case .showWarming: self.pill.show(.warming)
             case .showLive:
-                if machine.state == .recording {
-                    pill.show(.recording)
-                    pauseMedia()
+                if self.machine.state == .recording {
+                    self.pill.show(.recording)
+                    self.pauseMedia()
                 }
+            default: break
             }
         }
     }
@@ -366,12 +369,11 @@ public final class AppController {
         } else {
             recorder.onPCMChunk = nil
         }
-        prewarmExpiry?.cancel()
-        apply(warmup.recordingStarted(at: ProcessInfo.processInfo.systemUptime))
+        capture.beginRecording(at: ProcessInfo.processInfo.systemUptime)
         recorder.resetCapture()      // pre-roll from the pre-warm is not part of the dictation
         if !recorder.isRunning, fakeTranscript == nil {
             machine = DictationStateMachine()
-            warmup.stopped()
+            capture.end(.fail)
             dropTranscriber()
             apple?.cancel()
             apple = nil
@@ -398,10 +400,9 @@ public final class AppController {
         statusItem.setRecording(false)
         let finishedAt = Date()
         let finishClock = DispatchTime.now()
-        let samples = recorder.stop()      // also flushes final audio to both engines
+        let warmMs = capture.warmup.warmMs
+        let samples = capture.end(.finished(.ok)) // flush final audio before detaching sessions
         recorder.onPCMChunk = nil
-        let warmMs = warmup.warmMs
-        warmup.stopped()
         let mediaEvents = resumeMedia()
         let duration = finishedAt.timeIntervalSince(recordingStarted ?? finishedAt)
         let bytes = 44 + samples.count * 2
@@ -659,8 +660,7 @@ public final class AppController {
         generation += 1
         statusItem.setRecording(false)
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
-        _ = recorder.stop()   // discard: nothing is kept
-        warmup.stopped()
+        capture.end(.cancel) // discard: nothing is kept
         let mediaEvents = resumeMedia()
         if mediaEvents != "-" { AppController.note("cancel media=\(mediaEvents)") }
         dropTranscriber()
