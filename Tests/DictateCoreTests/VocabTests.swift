@@ -10,12 +10,28 @@ struct VocabTests {
         title: **Ignored** `Hidden`
         ---
         Ordinary prose with Uppercase words is ignored.
-        | **Limpar** | **TurnoutWatch** |
+        | **Limp R**, "limp r" | **Limpar** — the org database |
+        | **WarGone** | **TurnoutWatch** |
         Use `DB99` here.
         - Ask Politrace about GrantWatch
         """
         #expect(Vocabulary.extractTerms(markdown: fixture) ==
                 ["Limpar", "TurnoutWatch", "DB99", "Ask", "Politrace", "GrantWatch"])
+    }
+    /// D5 (Fable, 2026-10-08): table rows map misheard -> meant. Only the
+    /// right-hand meaning column may feed the prompt; the misheard forms would
+    /// bias the model toward them.
+    @Test func tableTakesOnlyTheMeaningColumn() {
+        let fixture = """
+        | he writes / says | he means |
+        |---|---|
+        | **Limp R**, "limp r", "Limp Are" | **Limpar** — the org database ([[reference-db-connections]]) |
+        | **WarGone**, "War Gone" | **TurnoutWatch** (the Grogan IL turnout dashboard) |
+        """
+        let terms = Vocabulary.extractTerms(markdown: fixture)
+        #expect(terms == ["Limpar", "TurnoutWatch"])
+        #expect(!terms.contains("Limp R"))
+        #expect(!terms.contains("WarGone"))
     }
     @Test func capKeepsWholeTerms() {
         let terms = (0..<200).map { "LongVocabularyTerm\($0)" }
