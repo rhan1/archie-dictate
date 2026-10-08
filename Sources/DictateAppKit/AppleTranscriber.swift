@@ -5,7 +5,7 @@ import Speech
 /// G9: Apple's on-device SpeechAnalyzer (macOS 26). Audio is streamed in while
 /// the user speaks; after the finish tap only finalisation is left (~20 ms
 /// measured on the standard script). No network, no API key.
-final class AppleTranscriber: @unchecked Sendable {
+public final class AppleTranscriber: @unchecked Sendable {
     enum AppleError: Error { case unavailable, noFormat }
 
     private let transcriber: SpeechTranscriber
@@ -21,23 +21,23 @@ final class AppleTranscriber: @unchecked Sendable {
     private var started = false
     private var pending: [[Int16]] = []
 
-    init() {
+    public init() {
         transcriber = SpeechTranscriber(locale: Locale(identifier: "en-US"), preset: .progressiveTranscription)
         analyzer = SpeechAnalyzer(modules: [transcriber])
         (input, inputContinuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
     }
 
-    static var isAvailable: Bool { SpeechTranscriber.isAvailable }
+    public static var isAvailable: Bool { SpeechTranscriber.isAvailable }
 
     /// Makes sure the on-device model is installed (no-op once it is).
-    static func ensureAssets() async {
+    public static func ensureAssets() async {
         let probe = SpeechTranscriber(locale: Locale(identifier: "en-US"), preset: .progressiveTranscription)
         if let request = try? await AssetInventory.assetInstallationRequest(supporting: [probe]) {
             try? await request.downloadAndInstall()
         }
     }
 
-    func start() async throws {
+    public func start() async throws {
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
             throw AppleError.noFormat
         }
@@ -61,7 +61,7 @@ final class AppleTranscriber: @unchecked Sendable {
     }
 
     /// Thread-safe; chunks arriving before `start()` finishes are queued.
-    func append(_ samples: [Int16]) {
+    public func append(_ samples: [Int16]) {
         let ready = lock.withLock { () -> Bool in
             if !started { pending.append(samples) }
             return started
@@ -94,14 +94,14 @@ final class AppleTranscriber: @unchecked Sendable {
     }
 
     /// Finalises and returns the full transcript.
-    func finish() async throws -> String {
+    public func finish() async throws -> String {
         inputContinuation.finish()
         try await analyzer.finalizeAndFinishThroughEndOfInput()
         guard let collector else { throw AppleError.unavailable }
         return try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func cancel() {
+    public func cancel() {
         inputContinuation.finish()
         collector?.cancel()
         Task { [analyzer] in await analyzer.cancelAndFinishNow() }
