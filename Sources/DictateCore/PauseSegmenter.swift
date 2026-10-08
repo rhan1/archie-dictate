@@ -9,11 +9,18 @@ public struct PauseSegmenter: Sendable {
     public static let quietRMS: Float = 0.01
     public static let minQuietSeconds = 0.2
     public static let minSegmentSeconds = 1.0
+    /// Long fluent speech (measured live: 3 segments in 15 s through a headset
+    /// whose noise floor sits above −40 dBFS) left a 1.1 s final transcription.
+    /// After this much uncommitted audio a 100 ms dip is enough to commit.
+    public static let longSegmentSeconds = 3.0
+    /// A chunk 12 dB under the running speech level also counts as quiet.
+    public static let relativeQuiet: Float = 0.25
 
     public let enabled: Bool
     private var uncommitted = 0
     private var quietRun = 0
     private var heardSpeech = false
+    private var speechLevel: Float = 0
 
     public init(enabled: Bool = true) { self.enabled = enabled }
 
@@ -27,14 +34,17 @@ public struct PauseSegmenter: Sendable {
     public mutating func shouldCommit(after samples: [Int16]) -> Bool {
         uncommitted += samples.count
         let rms = Self.rms(samples)
-        if rms < Self.quietRMS {
+        let quiet = rms < Self.quietRMS || (speechLevel > 0 && rms < speechLevel * Self.relativeQuiet)
+        if quiet {
             quietRun += samples.count
         } else {
             quietRun = 0
             heardSpeech = true
+            speechLevel = speechLevel == 0 ? rms : speechLevel * 0.9 + rms * 0.1
         }
-        guard enabled, heardSpeech,
-              quietRun >= Int(Self.minQuietSeconds * Double(Self.sampleRate)),
+        let long = uncommitted >= Int(Self.longSegmentSeconds * Double(Self.sampleRate))
+        let neededQuiet = long ? Self.sampleRate / 10 : Int(Self.minQuietSeconds * Double(Self.sampleRate))
+        guard enabled, heardSpeech, quietRun >= neededQuiet,
               uncommitted >= Int(Self.minSegmentSeconds * Double(Self.sampleRate)) else { return false }
         markCommitted()
         return true

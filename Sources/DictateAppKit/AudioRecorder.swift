@@ -25,6 +25,10 @@ public final class AudioRecorder {
         public var configChanges = 0
     }
     public private(set) var stats = CaptureStats()
+    /// Called on the main queue when the first audio buffer arrives after
+    /// `start()` (a Bluetooth headset can take ~1.6 s to deliver it).
+    public var onFirstBuffer: (() -> Void)?
+    public private(set) var isRunning = false
     private var startedAt = DispatchTime.now()
     private var recording = false
     private var configObserver: NSObjectProtocol?
@@ -62,6 +66,7 @@ public final class AudioRecorder {
         try installTapAndStart()
         stats.engineStartMs = elapsedMs()
         recording = true
+        isRunning = true
         // A Bluetooth headset switches profile (A2DP -> HFP) when its mic opens,
         // which reconfigures the engine mid-recording; re-tap on the new format.
         configObserver = NotificationCenter.default.addObserver(
@@ -96,8 +101,18 @@ public final class AudioRecorder {
     }
 
     /// Stops capture and hands back everything recorded, as 16 kHz mono floats.
+    /// Dictation begins on an engine that may already be running (pre-warmed on
+    /// the first ⌥ tap): drop the pre-roll so only post-double-tap audio counts.
+    public func resetCapture() {
+        lock.withLock {
+            samples.removeAll(keepingCapacity: true)
+            pendingPCM.removeAll()
+        }
+    }
+
     public func stop() -> [Float] {
         recording = false
+        isRunning = false
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
         engine.inputNode.removeTap(onBus: 0)
@@ -117,7 +132,10 @@ public final class AudioRecorder {
         // The converter must match the buffers actually arriving: a format
         // change under a live tap otherwise yields garbled (resampled-wrong) audio.
         let converter: AVAudioConverter? = lock.withLock {
-            if stats.firstBufferMs == nil { stats.firstBufferMs = elapsedMs() }
+            if stats.firstBufferMs == nil {
+                stats.firstBufferMs = elapsedMs()
+                DispatchQueue.main.async { [weak self] in self?.onFirstBuffer?() }
+            }
             if let current = self.converter, current.inputFormat == buffer.format { return current }
             if self.converter != nil { stats.formatChanges += 1 }
             self.converter = AVAudioConverter(from: buffer.format, to: targetFormat)
