@@ -25,6 +25,8 @@ public final class AppController {
     /// Batch STT fallback when the streaming engine fails: Groq whisper first.
     private let groqSTT: TranscriptionClient
     private var apple: AppleTranscriber?
+    private let chunkedEnabled = ProcessInfo.processInfo.environment["DICTATE_STT"] == "groq-chunked"
+    private var chunked: GroqChunkedTranscriber?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private var warmup = CaptureWarmup()
@@ -251,7 +253,13 @@ public final class AppController {
         if fakeTranscript == nil {
             let engine = AppleTranscriber()
             apple = engine
-            recorder.onPCMChunk = { pcm in engine.append(pcm) }
+            let streaming = chunkedEnabled ? GroqChunkedTranscriber(transport: groqSTT.transport,
+                                                                   apiKey: groqSTT.apiKey, prompt: prompt) : nil
+            chunked = streaming
+            recorder.onPCMChunk = { pcm in
+                engine.append(pcm)
+                streaming?.append(pcm)
+            }
             Task { try? await engine.start() }
             Task { [groqCleaner] in await groqCleaner.warmUp() }
         } else {
@@ -278,12 +286,15 @@ public final class AppController {
 
     private func dropTranscriber() {
         recorder.onPCMChunk = nil
+        chunked?.cancel()
+        chunked = nil
     }
 
     private func endRecording() {
         capTimer?.invalidate()
         statusItem.setRecording(false)
         let finishedAt = Date()
+        let finishClock = DispatchTime.now()
         let samples = recorder.stop()      // also flushes the last chunk to the Apple engine
         recorder.onPCMChunk = nil
         let warmMs = warmup.warmMs
@@ -293,11 +304,14 @@ public final class AppController {
         let bytes = 44 + samples.count * 2
         let appleSession = apple
         apple = nil
+        let chunkedSession = chunked
+        chunked = nil
         let myGeneration = generation
         pill.show(.transcribing)
 
         if fakeTranscript == nil, AudioLevel.isSilent(samples) {
             appleSession?.cancel()
+            chunkedSession?.cancel()
             machine.transcriptionFinished()
             fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0)
             return
@@ -315,14 +329,43 @@ public final class AppController {
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
             var pipeline = PipelineReport()
-            var shadow: Task<(appleNames: Int, groqNames: Int, milliseconds: Int), Never>?
+            var shadow: Task<(appleNames: Int, groqNames: Int, milliseconds: Int)?, Never>?
             var result: Result<String, Error>
             if let fake {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, openAI: client, report: &pipeline)
-                pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
+                if let chunkedSession {
+                    // Finalise Apple immediately, while outstanding uploads finish.
+                    let appleFinal = Task { try? await appleSession?.finish() }
+                    let joined = await chunkedSession.finish(at: finishClock)
+                    pipeline.chunks = joined.chunks
+                    pipeline.lastChunkMs = joined.lastChunkMs
+                    timeline.chunked = joined
+                    if joined.failedCount > 0 || joined.text.isEmpty {
+                        pipeline.path = "apple"
+                        pipeline.chunkFallback = joined.failedCount
+                        if let raw = await appleFinal.value, !raw.isEmpty { result = .success(raw) }
+                        else { result = .failure(TranscriptionError.decode) }
+                    } else {
+                        pipeline.path = "groq-chunked"
+                        result = .success(joined.text)
+                        if shadowEnabled {
+                            shadow = Task.detached {
+                                let raw = await appleFinal.value ?? ""
+                                guard ShadowScore.overlap(raw) >= 0.60 else { return nil }
+                                let start = DispatchTime.now()
+                                let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: 24_000)
+                                let groqRaw = (try? await groqSTT.transcribe(wav: wav, prompt: vocabularyPrompt)) ?? ""
+                                let elapsed = Int((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+                                return (ShadowScore.nameCount(raw), ShadowScore.nameCount(groqRaw), elapsed)
+                            }
+                        }
+                    }
+                } else {
+                    result = await Self.transcribeApple(appleSession, samples: samples, groq: groqSTT, openAI: client, report: &pipeline)
+                }
+                pipeline.sttMs = Int(Date().timeIntervalSince(chunkedSession == nil ? sttStart : finishedAt) * 1000)
                 if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
                    ShadowScore.overlap(raw) >= 0.60 {
                     let appleNames = ShadowScore.nameCount(raw)
@@ -349,7 +392,7 @@ public final class AppController {
             if let shadow, case .success(let raw) = result {
                 let pastedNames = ShadowScore.nameCount(pipeline.text ?? raw)
                 Task.detached {
-                    let counts = await shadow.value
+                    guard let counts = await shadow.value else { return }
                     Self.note(ShadowScore.line(appleNames: counts.appleNames, pastedNames: pastedNames,
                                               groqNames: counts.groqNames, milliseconds: counts.milliseconds))
                 }
@@ -370,6 +413,9 @@ public final class AppController {
                         e.cleanupMs = report.cleanupMs
                         e.cleanupModel = report.cleanupModel
                         e.cleanup = report.cleanup
+                        e.chunks = report.chunks
+                        e.lastChunkMs = report.lastChunkMs
+                        e.chunkFallback = report.chunkFallback
                     }
                     return e
                 }
@@ -404,7 +450,8 @@ public final class AppController {
                     DictationLog.append(entry(0, AppController.frontmostBundleID(), .error(reason)))
                 }
                 if fake == nil {
-                    AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path))
+                    AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path,
+                                                          chunkFallback: report.chunkFallback))
                 }
             }
         }
@@ -454,9 +501,10 @@ public final class AppController {
         var capturedSeconds: Double
         var peakDBFS: Double
         var cleanup: TranscriptCleaner.Stats?
+        var chunked: GroqChunkedTranscriber.Result?
 
-        func line(sttMs: Int?, cleanupMs: Int?, path: String) -> String {
-            return [
+        func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?) -> String {
+            var fields = [
                 "timeline:",
                 "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)",
                 "conflict=\(AppController.conflictingDictationApps())", "fmt=\(capture.startFormat)",
@@ -468,7 +516,22 @@ public final class AppController {
                 "pred_accepted=\(cleanup?.acceptedPredictionTokens.map(String.init) ?? "-")",
                 "pred_rejected=\(cleanup?.rejectedPredictionTokens.map(String.init) ?? "-")",
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
-            ].joined(separator: " ")
+            ]
+            if let chunked {
+                fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
+                           "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
+                           "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
+                for call in chunked.calls {
+                    fields.append("chunk_\(call.index)_attempt_\(call.attempt)_ms=\(call.milliseconds)")
+                }
+                if let limits = chunked.rateLimits {
+                    for name in GroqChunkedTranscriber.RateLimits.names where limits.headers[name] != nil {
+                        fields.append("\(name)=\(limits.count(name))")
+                    }
+                }
+            }
+            if let chunkFallback { fields.append("chunk_fallback=\(chunkFallback)") }
+            return fields.joined(separator: " ")
         }
     }
 
@@ -480,6 +543,9 @@ public final class AppController {
         var cleanupMs: Int?
         var cleanup: String?
         var text: String?
+        var chunks: Int?
+        var lastChunkMs: Int?
+        var chunkFallback: Int?
     }
 
     private func cancelAll() {

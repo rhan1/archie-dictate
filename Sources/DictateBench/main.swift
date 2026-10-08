@@ -289,7 +289,7 @@ if args.count >= 3, args[1] == "levels" {
 if args.count >= 2 {
     switch args[1] {
     case "score-text": requireKey("GROQ_API_KEY")
-    case "stt-groq" where args.count >= 4: requireKey("GROQ_API_KEY")
+    case "stt-groq" where args.count >= 4, "stt-groq-chunked" where args.count >= 4: requireKey("GROQ_API_KEY")
     case "stt-batch" where args.count >= 4: requireKey("OPENAI_API_KEY")
     case "cleanup" where args.count >= 4:
         requireKey(ProcessInfo.processInfo.environment["BENCH_GROQ"] == "1" ? "GROQ_API_KEY" : "OPENAI_API_KEY")
@@ -310,7 +310,7 @@ if args.count >= 2, args[1] == "score-text" {
     exit(0)
 }
 guard args.count >= 4 else {
-    print("usage: DictateBench pill-match <wav> | stt-batch|stt-groq <wav> <runs> | cleanup <model> <runs>")
+    print("usage: DictateBench pill-match <wav> | stt-batch|stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
@@ -318,6 +318,37 @@ var results: [Int] = []
 var lastText: String?
 
 switch args[1] {
+case "stt-groq-chunked":
+    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
+    let transport = URLSessionTransport(timeout: 30)
+    for run in 1...runs {
+        var chunker = PauseChunker()
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: groqKey, prompt: prompt)
+        let started = DispatchTime.now().uptimeNanoseconds
+        var fed = 0
+        func feed(_ samples: [Int16]) async throws {
+            for chunk in chunker.append(samples) { engine.submit(chunk) }
+            fed += samples.count
+            let deadline = started + UInt64(Double(fed) / 24_000 * 1_000_000_000)
+            let now = DispatchTime.now().uptimeNanoseconds
+            if deadline > now { try await Task.sleep(nanoseconds: deadline - now) }
+        }
+        for offset in stride(from: 0, to: pcm.count, by: 2_400) {
+            try await feed(Array(pcm[offset..<min(pcm.count, offset + 2_400)]))
+        }
+        for _ in 0..<15 { try await feed([Int16](repeating: 0, count: 2_400)) }
+        let finish = DispatchTime.now()
+        for chunk in chunker.finish() where chunk.samples.count >= 7_200 { engine.submit(chunk) }
+        let joined = await engine.finish(at: finish)
+        let elapsed = ms(since: finish)
+        if joined.failedCount == 0 {
+            results.append(elapsed)
+            lastText = joined.text
+            print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+        } else {
+            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)")
+        }
+    }
 case "stt-apple":
     // F9 / G9: Apple on-device SpeechAnalyzer, the app's own AppleTranscriber,
     // fed at real-time pace in 100 ms chunks plus a 300 ms tap tail.

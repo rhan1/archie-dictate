@@ -94,7 +94,8 @@ public struct TranscriptionClient: Sendable {
         self.apiKey = apiKey
     }
 
-    public func makeRequest(wav: Data, prompt: String, apiKey: String, boundary: String) -> URLRequest {
+    public func makeRequest(wav: Data, prompt: String, apiKey: String, boundary: String,
+                            includeEmptyPrompt: Bool = false) -> URLRequest {
         var request = URLRequest(url: endpointURL)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -107,7 +108,7 @@ public struct TranscriptionClient: Sendable {
         part("model", modelName)
         part("response_format", "json")
         part("language", "en")
-        if !prompt.isEmpty { part("prompt", prompt) }
+        if includeEmptyPrompt || !prompt.isEmpty { part("prompt", prompt) }
         append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n")
         body.append(wav)
         append("\r\n--\(boundary)--\r\n")

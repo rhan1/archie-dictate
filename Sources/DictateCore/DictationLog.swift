@@ -30,6 +30,9 @@ public struct DictationLogEntry: Equatable, Sendable {
     public var cleanupMs: Int?
     public var cleanupModel: String?
     public var cleanup: String?
+    public var chunks: Int?
+    public var lastChunkMs: Int?
+    public var chunkFallback: Int?
 
     public init(time: Date, durationSeconds: Double, audioBytes: Int, latencyMs: Int,
                 chars: Int, frontmostBundleID: String, outcome: DictationOutcome) {
@@ -51,6 +54,9 @@ public struct DictationLogEntry: Equatable, Sendable {
         var line = "\(formatter.string(from: time)) duration=\(duration)s bytes=\(audioBytes) latency_ms=\(latencyMs) chars=\(chars) app=\(app) outcome=\(outcome.label)"
         if let path { line += " path=\(path)" }
         if let sttMs { line += " stt_ms=\(sttMs)" }
+        if let chunks { line += " chunks=\(chunks)" }
+        if let lastChunkMs { line += " last_chunk_ms=\(lastChunkMs)" }
+        if let chunkFallback { line += " chunk_fallback=\(chunkFallback)" }
         if let cleanupMs { line += " cleanup_ms=\(cleanupMs)" }
         if let cleanupModel { line += " model=\(cleanupModel)" }
         if let cleanup { line += " cleanup=\(cleanup)" }
