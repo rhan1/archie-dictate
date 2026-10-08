@@ -20,9 +20,17 @@ public final class AppController {
     }
     private let prompt: String
     private let cleaner: TranscriptCleaner
-    /// The Realtime session for the current (or about-to-start) dictation.
+    /// The Realtime session for the current dictation.
     private var transcriber: RealtimeTranscriber?
-    private var speculativeOpenWork: DispatchWorkItem?
+    /// One idle Realtime socket kept open so no dictation pays the ~0.7 s
+    /// handshake; reconnected when it drops, at most once a minute.
+    private var warm: RealtimeTranscriber?
+    private var warmOpenedAt = Date.distantPast
+    private var lastWarmAttempt = Date.distantPast
+    private var warmTimer: Timer?
+    /// Per-dictation facts for the stderr timeline.
+    private var socketOrigin = ""
+    private var recordingStartMs: UInt64 = 0
     /// L4 lever: bypasses the network with a fixed transcript.
     private let fakeTranscript = ProcessInfo.processInfo.environment["DICTATE_FAKE_TRANSCRIPT"]
     /// QA lever: notes pill show/hide with the frontmost app (G4) to stderr.
@@ -38,7 +46,8 @@ public final class AppController {
             AppController.note("vocabulary file missing at \(AppController.vocabularyURL.path); using seed terms only")
         }
         prompt = Vocabulary.buildPrompt(fileURL: AppController.vocabularyURL)
-        // A4: the same vocabulary feeds the STT prompt and the cleanup prompt.
+        // The vocabulary feeds ONLY the cleanup prompt: given to the STT model
+        // it was echoed back verbatim instead of the speech (live, 00:27).
         cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: TranscriptCleaner.deadline),
                                     vocabulary: prompt) { try KeychainAPIKey.read() }
     }
@@ -59,6 +68,12 @@ public final class AppController {
             retryTapUntilGranted()
         }
         if !trusted { watchAccessibilityGrant() }
+        if fakeTranscript == nil {
+            keepWarm(force: true)
+            let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.keepWarm(force: false) }
+            RunLoop.main.add(timer, forMode: .common)
+            warmTimer = timer
+        }
         AudioRecorder.requestMicrophoneAccess { [weak self] granted in
             self?.micAvailable = granted
             AppController.note("microphone=\(granted)")
@@ -92,30 +107,46 @@ public final class AppController {
     private func doubleTap() { perform(machine.doubleTap()) }
 
     /// ⌥⌥ starts, one clean ⌥ tap finishes (A2). A clean tap while idle may be
-    /// the first half of a double-tap, so the socket is opened right then to
-    /// hide its ~0.7 s handshake (A1); it is dropped if no double-tap follows.
+    /// the first half of a double-tap: make sure a warm socket exists.
     private func hotkey(_ signal: TapSignal) {
-        if signal == .tap, machine.state == .idle { openTranscriberSpeculatively() }
+        if signal == .tap, machine.state == .idle, fakeTranscript == nil, warmIsHealthy == false {
+            keepWarm(force: true)
+        }
         perform(machine.handle(signal))
     }
 
-    private func openTranscriberSpeculatively() {
-        guard fakeTranscript == nil else { return }
-        if transcriber == nil || transcriber?.hasFailed == true {
-            let session = RealtimeTranscriber(transport: URLSessionWebSocketTransport(), prompt: prompt) {
-                try KeychainAPIKey.read()
-            }
-            transcriber = session
-            Task { try? await session.open() }
+    private var warmIsHealthy: Bool {
+        guard let warm else { return false }
+        return !warm.hasFailed
+    }
+
+    /// Opens the idle socket if there is none (or it dropped). Unforced calls
+    /// (the minute timer) reconnect at most once per minute.
+    private func keepWarm(force: Bool) {
+        guard fakeTranscript == nil, !warmIsHealthy else { return }
+        guard force || Date().timeIntervalSince(lastWarmAttempt) >= 60 else { return }
+        lastWarmAttempt = Date()
+        let session = RealtimeTranscriber(transport: URLSessionWebSocketTransport()) { try KeychainAPIKey.read() }
+        warm = session
+        warmOpenedAt = Date()
+        Task { try? await session.open() }
+    }
+
+    /// Hands the warm socket to a new dictation (or opens a fresh one).
+    private func takeTranscriber() -> RealtimeTranscriber {
+        if let warm, !warm.hasFailed {
+            self.warm = nil
+            socketOrigin = warm.isConnected
+                ? "prewarmed(age=\(Int(Date().timeIntervalSince(warmOpenedAt)))s)"
+                : "prewarming(age_ms=\(Int(Date().timeIntervalSince(warmOpenedAt) * 1000)))"
+            return warm
         }
-        speculativeOpenWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.machine.state == .idle else { return }
-            self.transcriber?.close()
-            self.transcriber = nil
-        }
-        speculativeOpenWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+        warm?.close()
+        warm = nil
+        socketOrigin = "fresh"
+        let session = RealtimeTranscriber(transport: URLSessionWebSocketTransport()) { try KeychainAPIKey.read() }
+        Task { try? await session.open() }
+        return session
     }
     private func finishButton() { perform(machine.finishButton()) }
     private func cancel() { perform(machine.cancel()) }
@@ -134,14 +165,11 @@ public final class AppController {
     private func beginRecording() {
         generation += 1
         recordingStarted = Date()
-        speculativeOpenWork?.cancel()
+        recordingStartMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
         if fakeTranscript == nil {
-            if transcriber == nil || transcriber?.hasFailed == true {
-                openTranscriberSpeculatively()
-                speculativeOpenWork?.cancel()
-            }
-            let session = transcriber
-            recorder.onPCMChunk = { pcm in session?.append(pcm) }
+            let session = takeTranscriber()
+            transcriber = session
+            recorder.onPCMChunk = { pcm in session.append(pcm) }
             Task { [cleaner] in await cleaner.warmUp() }
         } else {
             recorder.onPCMChunk = nil
@@ -193,25 +221,37 @@ public final class AppController {
         }
 
         let fake = fakeTranscript
-        let prompt = self.prompt
+        let vocabulary = self.prompt
         let client = self.client
         let cleaner = self.cleaner
+        var timeline = Timeline(capture: recorder.stats, socket: socketOrigin, recordingStartMs: recordingStartMs,
+                                capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
+                                peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
             var pipeline = PipelineReport()
-            let result: Result<String, Error>
+            var result: Result<String, Error>
             if let fake {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                result = await Self.transcribe(session: session, samples: samples, client: client, prompt: prompt, report: &pipeline)
+                result = await Self.transcribe(session: session, samples: samples, client: client, report: &pipeline)
                 pipeline.sttMs = Int(Date().timeIntervalSince(sttStart) * 1000)
+                timeline.realtime = session?.timeline
+                timeline.segments = session?.segmentCount
+                // Echo guard: an STT result that IS the vocabulary list is never pasted.
+                if case .success(let raw) = result, PromptEcho.isEcho(raw, vocabulary: vocabulary) {
+                    result = .failure(EchoError.promptEcho)
+                    timeline.echoGuard = "tripped"
+                }
                 if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
                     pipeline.cleanup = "skipped:short"
                 } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
                     do {
-                        pipeline.text = try await cleaner.clean(raw)
+                        let (text, stats) = try await cleaner.cleanWithStats(raw)
+                        pipeline.text = text
                         pipeline.cleanup = "ok"
+                        timeline.cleanup = stats
                     } catch {
                         pipeline.text = raw
                         pipeline.cleanup = "skipped:\((error as? TranscriptionError)?.logReason ?? "error")"
@@ -220,6 +260,8 @@ public final class AppController {
                 }
             }
             let report = pipeline
+            let finalTimeline = timeline
+            let finalResult = result
             await MainActor.run {
                 guard myGeneration == self.generation, self.machine.state == .transcribing else { return }
                 self.machine.transcriptionFinished()
@@ -236,7 +278,7 @@ public final class AppController {
                     }
                     return e
                 }
-                switch result {
+                switch finalResult {
                 case .success(let raw) where !raw.isEmpty:
                     let text = report.text ?? raw
                     self.pill.hide()
@@ -248,11 +290,58 @@ public final class AppController {
                     self.pill.show(.error)
                     DictationLog.append(entry(0, AppController.frontmostBundleID(), .error("empty_transcript")))
                 case .failure(let error):
-                    let reason = (error as? TranscriptionError)?.logReason ?? (error as? RealtimeError)?.logReason ?? "unknown"
+                    let reason = (error as? TranscriptionError)?.logReason ?? (error as? RealtimeError)?.logReason
+                        ?? (error as? EchoError).map { _ in "prompt_echo" } ?? "unknown"
                     self.pill.show(.error)
                     DictationLog.append(entry(0, AppController.frontmostBundleID(), .error(reason)))
                 }
+                if fake == nil {
+                    AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path))
+                    self.keepWarm(force: true)   // refill the idle socket for the next dictation
+                }
             }
+        }
+    }
+
+    enum EchoError: Error { case promptEcho }
+
+    /// One stderr line per dictation: where the time went. Counts and ms only.
+    struct Timeline {
+        var capture: AudioRecorder.CaptureStats
+        var socket: String
+        var recordingStartMs: UInt64
+        var capturedSeconds: Double
+        var peakDBFS: Double
+        var realtime: RealtimeTimeline?
+        var segments: Int?
+        var cleanup: TranscriptCleaner.Stats?
+        var echoGuard = "pass"
+
+        func line(sttMs: Int?, cleanupMs: Int?, path: String) -> String {
+            func rel(_ t: UInt64?, from base: UInt64?) -> String {
+                guard let t, let base else { return "-" }
+                return String(Int64(t) - Int64(base))
+            }
+            let rt = realtime
+            return [
+                "timeline:",
+                "device=\"\(capture.device)\"", "fmt=\(capture.startFormat)",
+                "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
+                "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
+                String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
+                "socket=\(socket)", "open_to_created_ms=\(rel(rt?.sessionCreated, from: rt?.openStart))",
+                "created_to_updated_ms=\(rel(rt?.sessionUpdated, from: rt?.sessionCreated))",
+                "rec_to_first_append_ms=\(rel(rt?.firstAppendSent, from: recordingStartMs))",
+                "appended_s=\(String(format: "%.1f", Double(rt?.appendedSamples ?? 0) / AudioRecorder.sampleRate))",
+                "tap_to_commit_ms=\(rel(rt?.lastCommitSent, from: rt?.finishCalled))",
+                "commit_to_completed_ms=\(rel(rt?.completed, from: rt?.lastCommitSent))",
+                "segments=\(segments.map(String.init) ?? "-")", "path=\(path)", "stt_ms=\(sttMs.map(String.init) ?? "-")",
+                "echo_guard=\(echoGuard)",
+                "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
+                "pred_accepted=\(cleanup?.acceptedPredictionTokens.map(String.init) ?? "-")",
+                "pred_rejected=\(cleanup?.rejectedPredictionTokens.map(String.init) ?? "-")",
+                "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
+            ].joined(separator: " ")
         }
     }
 
@@ -268,7 +357,7 @@ public final class AppController {
     /// A1: the streamed Realtime transcript; the batch upload only when the
     /// socket never opened (1.5 s) or failed.
     private static func transcribe(session: RealtimeTranscriber?, samples: [Float], client: TranscriptionClient,
-                                   prompt: String, report: inout PipelineReport) async -> Result<String, Error> {
+                                   report: inout PipelineReport) async -> Result<String, Error> {
         if let session, session.isConnected, !session.hasFailed {
             do {
                 let text = try await session.finish(timeout: 5)
@@ -283,7 +372,7 @@ public final class AppController {
         }
         report.path = "batch"
         let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: Int(AudioRecorder.sampleRate))
-        do { return .success(try await client.transcribe(wav: wav, prompt: prompt)) }
+        do { return .success(try await client.transcribe(wav: wav, prompt: "")) }   // no STT prompt (echo risk)
         catch { return .failure(error) }
     }
 

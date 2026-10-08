@@ -55,6 +55,12 @@ public enum AudioLevel {
     /// for pure silence, so a silent recording must never reach the API.
     public static let silencePeak: Float = 0.01
 
+    /// Peak level in dBFS (−120 for silence), for the stderr timeline.
+    public static func peakDBFS(_ samples: [Float]) -> Double {
+        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        return peak > 0 ? 20 * log10(Double(peak)) : -120
+    }
+
     public static func isSilent(_ samples: [Float]) -> Bool {
         !samples.contains { abs($0) >= silencePeak }
     }
