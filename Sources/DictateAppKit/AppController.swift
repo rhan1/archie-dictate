@@ -42,6 +42,9 @@ public final class AppController {
     private let trace = ProcessInfo.processInfo.environment["DICTATE_TRACE"] == "1"
 
     private var recordingStarted: Date?
+    private var recordingTarget: InsertionTarget?
+    private var lastDictation: String?
+    private var lastDictationTimer: Timer?
     private var capTimer: Timer?
     private var generation = 0
     private var micAvailable = false
@@ -71,6 +74,10 @@ public final class AppController {
         pill.onCancel = { [weak self] in self?.cancel() }
         pill.onFinish = { [weak self] in self?.finishButton() }
         statusItem.onToggle = { [weak self] in self?.doubleTap() }
+        statusItem.onPasteLastDictation = { [weak self] in
+            guard let self, let text = self.lastDictation else { return }
+            self.inserter.insert(text)
+        }
         recorder.onLevel = { [weak self] level in self?.pill.push(level: level) }
         recorder.onFirstBuffer = { [weak self] in
             guard let self else { return }
@@ -236,6 +243,7 @@ public final class AppController {
     // MARK: - Flow
 
     private func beginRecording() {
+        recordingTarget = Self.frontmostTarget()
         generation += 1
         recordingStarted = Date()
         if fakeTranscript == nil {
@@ -344,11 +352,25 @@ public final class AppController {
                 switch finalResult {
                 case .success(let raw) where !raw.isEmpty:
                     let text = report.text ?? raw
-                    self.pill.hide()
-                    self.traceFocus("pill hidden, pasting")
-                    let app = AppController.frontmostBundleID()
-                    self.inserter.insert(text)
-                    DictationLog.append(entry(text.count, app, .ok))
+                    let start = self.recordingTarget
+                    self.inserter.insert(text, shouldInsert: {
+                        let now = Self.frontmostTarget()
+                        let app = now?.bundleID ?? ""
+                        switch InsertionTarget.decide(start: start, now: now) {
+                        case .paste:
+                            self.pill.hide()
+                            self.traceFocus("pill hidden, pasting")
+                            DictationLog.append(entry(text.count, app, .ok))
+                            return true
+                        case .hold:
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(text, forType: .string)
+                            self.rememberHeldDictation(text)
+                            self.pill.show(.error, held: true)
+                            DictationLog.append(entry(text.count, app, .held("focus_changed")))
+                            return false
+                        }
+                    })
                 case .success:
                     self.pill.show(.error)
                     DictationLog.append(entry(0, AppController.frontmostBundleID(), .error("empty_transcript")))
@@ -379,6 +401,8 @@ public final class AppController {
         do {
             let (text, stats) = try await timedLocal.cleanWithStats(raw)
             return (text, "fallback_local", local.model, stats)
+        } catch TranscriptionError.rejected(let reason) {
+            return (raw, "rejected:\(reason)", local.model, nil)
         } catch {
             return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil)
         }
@@ -479,6 +503,24 @@ public final class AppController {
 
     private static func frontmostBundleID() -> String {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+    }
+
+    private static func frontmostTarget() -> InsertionTarget? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        return InsertionTarget(pid: app.processIdentifier, bundleID: app.bundleIdentifier ?? "")
+    }
+
+    private func rememberHeldDictation(_ text: String) {
+        lastDictationTimer?.invalidate()
+        lastDictation = text
+        statusItem.setLastDictationAvailable(true)
+        let timer = Timer(timeInterval: 10 * 60, repeats: false) { [weak self] _ in
+            self?.lastDictation = nil
+            self?.statusItem.setLastDictationAvailable(false)
+            self?.lastDictationTimer = nil
+        }
+        lastDictationTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Diagnostics go to stderr (the LaunchAgent routes it to dictate.stderr.log),

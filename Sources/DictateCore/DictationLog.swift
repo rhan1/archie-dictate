@@ -1,13 +1,15 @@
 import Foundation
 
 public enum DictationOutcome: Equatable, Sendable {
-    case ok, cancel, error(String)
+    case ok, cancel, error(String), held(String)
     public var label: String {
         switch self {
         case .ok: return "ok"
         case .cancel: return "cancel"
         case .error(let reason):
             return "error:" + String(reason.map { $0.isWhitespace ? "_" : $0 }.prefix(60))
+        case .held(let reason):
+            return "held:" + String(reason.map { $0.isWhitespace ? "_" : $0 }.prefix(60))
         }
     }
 }

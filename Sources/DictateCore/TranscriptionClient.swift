@@ -62,6 +62,7 @@ public struct URLSessionTransport: HTTPTransport {
 
 public enum TranscriptionError: Error, Equatable, Sendable {
     case missingKey, auth, server(Int), client(Int), network(String), decode
+    case rejected(String)
 
     public var logReason: String {
         switch self {
@@ -72,6 +73,7 @@ public enum TranscriptionError: Error, Equatable, Sendable {
         case .network(let code):
             return "network_" + String(code.map { $0.isWhitespace ? "_" : $0 })
         case .decode: return "decode"
+        case .rejected(let reason): return "rejected_\(reason)"
         }
     }
 }

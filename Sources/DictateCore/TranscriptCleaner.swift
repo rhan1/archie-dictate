@@ -165,11 +165,20 @@ public struct TranscriptCleaner: Sendable {
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
+              let choice = choices.first
+        else { throw TranscriptionError.decode }
+        let finishReason = choice["finish_reason"] as? String ?? "missing"
+        guard finishReason == "stop" else { throw TranscriptionError.rejected(finishReason) }
+        guard let message = choice["message"] as? [String: Any],
               let content = message["content"] as? String
         else { throw TranscriptionError.decode }
         let cleaned = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { throw TranscriptionError.decode }
+        let inputCount = Double(text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
+        let outputCount = Double(cleaned.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").count)
+        guard outputCount >= 0.5 * inputCount, outputCount <= 1.5 * inputCount else {
+            throw TranscriptionError.rejected("ratio")
+        }
         let usage = json["usage"] as? [String: Any]
         let details = usage?["completion_tokens_details"] as? [String: Any]
         stats.completionTokens = usage?["completion_tokens"] as? Int
