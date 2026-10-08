@@ -467,7 +467,8 @@ public final class AppController {
             let rt = realtime
             return [
                 "timeline:",
-                "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)", "fmt=\(capture.startFormat)",
+                "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)",
+                "conflict=\(AppController.conflictingDictationApps())", "fmt=\(capture.startFormat)",
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
@@ -553,6 +554,14 @@ public final class AppController {
     private func traceFocus(_ event: String) {
         guard trace else { return }
         AppController.note("\(event) frontmost=\(AppController.frontmostBundleID()) onScreen=\(pill.isOnScreen) frame=\(NSStringFromRect(pill.frame))")
+    }
+
+    /// Another dictation app listening for the same ⌥⌥ pastes its own text
+    /// alongside ours (seen 01:0x: Wispr Flow reopened → raw + cleaned pasted).
+    static func conflictingDictationApps() -> String {
+        let ids = NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        let hits = ids.filter { $0.hasPrefix("com.electron.wispr") }
+        return hits.isEmpty ? "none" : "wispr_running"
     }
 
     private static func frontmostBundleID() -> String {
