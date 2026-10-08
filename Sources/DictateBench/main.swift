@@ -229,6 +229,23 @@ func replayPill(_ pcm: [Float]) -> (frames: [[Double]], diff: PillMatchDiff, spe
 }
 
 let args = CommandLine.arguments
+if args.count >= 2, args[1] == "pill-render" {
+    guard args.count == 6, ["0", "1"].contains(args[4]) else {
+        print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png>")
+        exit(2)
+    }
+    let kind: PillOutcome.Kind
+    switch args[2] {
+    case "held": kind = .held(args[3])
+    case "error": kind = .error(args[3])
+    case "raw": kind = .rawPasted(args[3])
+    default: print("pill-render kind must be held, error, or raw"); exit(2)
+    }
+    let outcome = PillOutcome(kind, hasText: args[4] == "1")
+    try PillPanel.renderOutcomePNG(label: outcome.label ?? "error", held: outcome.showsPasteAffordance,
+                                   to: URL(fileURLWithPath: args[5]))
+    exit(0)
+}
 if args.count >= 3, args[1] == "pill-match" {
     // Literal controls prove that the comparison gate accepts good and rejects bad.
     var good = PillMatchDiff(), bad = PillMatchDiff()
@@ -308,7 +325,7 @@ if args.count >= 2, args[1] == "score-text" {
     exit(0)
 }
 guard args.count >= 4 else {
-    print("usage: DictateBench pill-match <wav> | stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
+    print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png> | pill-match <wav> | stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5

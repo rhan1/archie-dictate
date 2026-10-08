@@ -89,6 +89,25 @@ public final class PillPanel {
     public var isOnScreen: Bool { panel.isVisible }
     public var frame: NSRect { panel.frame }
 
+    /// Offscreen bench proof using the panel's actual view, at 2× resolution.
+    public static func renderOutcomePNG(label: String, held: Bool, to url: URL) throws {
+        let view = PillView(frame: NSRect(origin: .zero, size: size))
+        view.mode = .error
+        view.held = held
+        view.status = label
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else { throw CocoaError(.fileWriteUnknown) }
+        bitmap.size = size
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try png.write(to: url)
+    }
+
     /// Bottom-centre of the screen holding the mouse, the CAPSULE 24 pt above the
     /// Dock edge (visibleFrame already excludes the Dock and the menu bar).
     public static func origin(for size: NSSize) -> NSPoint {
@@ -214,7 +233,7 @@ final class PillView: NSView {
         fill.fill()
 
         drawCancelButton()
-        drawFinishButton()
+        if mode != .error || held { drawFinishButton() }
 
         switch mode {
         case .warming: drawBars(live: false)
@@ -295,7 +314,8 @@ final class PillView: NSView {
             .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.white,
         ]
         let size = text.size(withAttributes: attributes)
-        let centreX = (cancelRect.maxX + finishRect.minX) / 2
+        let rightEdge = held ? finishRect.minX : capsuleRect.maxX - PillView.buttonInset
+        let centreX = (cancelRect.maxX + rightEdge) / 2
         text.draw(at: NSPoint(x: centreX - size.width / 2, y: capsuleRect.midY - size.height / 2),
                   withAttributes: attributes)
     }

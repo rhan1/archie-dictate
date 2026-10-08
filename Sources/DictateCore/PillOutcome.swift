@@ -17,15 +17,18 @@ public struct PillOutcome: Equatable, Sendable {
         guard isVisible else { return false }
         switch kind { case .held, .error: return true; default: return false }
     }
+    public var showsPasteAffordance: Bool { isRecoverable && hasText }
     public var label: String? {
         guard isVisible else { return nil }
         switch kind {
         case .held(let reason): return reason == "no_stt" ? "no speech" : "held"
         case .error(let reason):
             let reason = reason.lowercased()
+            if reason.contains("mic_start") || reason.contains("mic_denied") { return "no mic" }
             if reason.contains("missing_key") { return "no key" }
             if reason.contains("timedout") { return "timeout" }
             if reason.contains("cannotconnecttohost") || reason.contains("notconnected") || reason.contains("not connected") || reason.contains("-1004") || reason.contains("-1009") { return "offline" }
+            if reason == "silence" { return "no speech" }
             return "error"
         case .rawPasted: return "raw"
         case .ok: return nil
