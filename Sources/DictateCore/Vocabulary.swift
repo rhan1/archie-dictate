@@ -13,6 +13,9 @@ public enum Vocabulary {
            }) {
             lines.removeFirst(end + 1)
         }
+        // Table rows map misheard -> meant: blank every cell but the last
+        // (meaning) column, keeping offsets, so misheard forms never reach the prompt.
+        lines = lines.map(maskingAllButLastTableCell)
         let source = lines.joined(separator: "\n")
         let nsSource = source as NSString
         var matches: [(offset: Int, term: String)] = []
@@ -46,6 +49,16 @@ public enum Vocabulary {
         }
         var seen = Set<String>()
         return ordered.compactMap { seen.insert($0.element.term).inserted ? $0.element.term : nil }
+    }
+
+    private static func maskingAllButLastTableCell(_ line: String) -> String {
+        guard line.trimmingCharacters(in: .whitespaces).hasPrefix("|") else { return line }
+        var cells = line.components(separatedBy: "|")
+        guard let last = cells.lastIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return line }
+        for i in cells.indices where i != last {
+            cells[i] = String(repeating: " ", count: (cells[i] as NSString).length)
+        }
+        return cells.joined(separator: "|")
     }
 
     public static func filePrompt(fileURL: URL) -> String {
