@@ -3,6 +3,8 @@ import Foundation
 /// Thread-safe streaming capture; each cut starts an independent upload.
 /// WAV is encoded in memory using the existing Core encoder. No file APIs.
 public final class GroqChunkedTranscriber: @unchecked Sendable {
+    public static let fillerLeadIn = "Um, so, uh, like,"
+
     public struct RateLimits: Sendable, Equatable {
         public static let names = ["x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
                                    "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens", "retry-after"]
@@ -41,7 +43,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let lock = NSLock()
     private let client: TranscriptionClient
     private let vocabulary: String
-    private var chunker = PauseChunker()
+    private let includesFillerLeadIn: Bool
+    private var chunker: PauseChunker
     private var tasks: [Task<Void, Never>] = []
     private var texts: [Int: String] = [:]
     private var failures: Set<Int> = []
@@ -51,12 +54,16 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var finishAt: UInt64?
     private var closed = false
 
-    public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String) {
+    public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
+                fillerLeadIn: Bool = true, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
         self.client = client
-        vocabulary = prompt
+        // Cap only vocabulary: preserve the lead-in and the bounded previous tail.
+        vocabulary = String(prompt.prefix(Vocabulary.maxPromptLength))
+        includesFillerLeadIn = fillerLeadIn
+        chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
     }
 
     public func append(_ pcm: [Int16]) {
@@ -117,7 +124,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 guard !key.isEmpty else { throw TranscriptionError.missingKey }
                 let prompt = lock.withLock {
                     let tail = texts[chunk.index - 1].map { String($0.suffix(200)) } ?? ""
-                    return vocabulary + (tail.isEmpty ? "" : " " + tail)
+                    return (includesFillerLeadIn ? Self.fillerLeadIn + " " : "") + vocabulary +
+                           (tail.isEmpty ? "" : " " + tail)
                 }
                 let request = client.makeRequest(wav: wav, prompt: prompt, apiKey: key,
                                                  boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true)
