@@ -54,6 +54,12 @@ plutil -lint "$PLIST"
 
 # Re-bootstrap cleanly if an older copy is loaded.
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+for ((i = 0; i < 25; i++)); do
+    if ! launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.2
+done
 launchctl bootstrap "gui/$UID" "$PLIST"
 echo "==> Loaded $LABEL"
 launchctl print "gui/$UID/$LABEL" | grep -E "^\s*(state|pid) =" || true
