@@ -168,6 +168,44 @@ struct PauseChunkerTests {
         #expect(empty.finish().isEmpty)
     }
 
+    @Test func finishTrimsTrailingSilence() throws {
+        var chunker = PauseChunker()
+        #expect(chunker.append(pcm(1.5) + pcm(1.0, 0)).isEmpty)
+        let chunks = chunker.finish()
+        #expect(chunks.count == 1)
+        let chunk = try #require(chunks.first)
+        #expect(chunk.samples.count >= 36_000)
+        #expect(chunk.samples.count <= 42_000)
+        #expect(Array(chunk.samples.prefix(36_000)) == pcm(1.5))
+        #expect(chunker.finish().isEmpty)
+    }
+
+    @Test func finishDropsAllQuietPartial() {
+        var chunker = PauseChunker()
+        _ = chunker.append(pcm(0.1, 0))
+        _ = chunker.append(pcm(2.9))
+        let cuts = chunker.append(pcm(0.15, 0))
+        #expect(cuts.count == 1)
+        #expect(chunker.append(pcm(0.8, 0)).isEmpty)
+        #expect(chunker.finish().isEmpty)
+        #expect(chunker.finish().isEmpty)
+    }
+
+    @Test(arguments: [1, 599, 1_199]) func finishTrimsIncompleteQuietWindow(extraSamples: Int) throws {
+        var chunker = PauseChunker()
+        let speech = pcm(1.5)
+        #expect(chunker.append(speech + pcm(1.0, 0) + Array(repeating: 0, count: extraSamples)).isEmpty)
+        let chunk = try #require(chunker.finish().first)
+        #expect(chunk.samples.count == speech.count + 6_000)
+        #expect(Array(chunk.samples.prefix(speech.count)) == speech)
+    }
+
+    @Test func finishDropsQuietPartialWithoutCompleteWindow() {
+        var chunker = PauseChunker()
+        #expect(chunker.append(Array(repeating: 0, count: 599)).isEmpty)
+        #expect(chunker.finish().isEmpty)
+    }
+
     @Test func firstChunkWaitsThreeSeconds() {
         var chunker = PauseChunker()
         #expect(chunker.append(pcm(0.1, 0)).isEmpty)

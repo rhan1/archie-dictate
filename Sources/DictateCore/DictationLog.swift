@@ -30,6 +30,7 @@ public struct DictationLogEntry: Equatable, Sendable {
     public var cleanupMs: Int?
     public var cleanupModel: String?
     public var cleanup: String?
+    public var cleanupMode: String?
     public var chunks: Int?
     public var lastChunkMs: Int?
     public var chunkFallback: Int?
@@ -60,6 +61,7 @@ public struct DictationLogEntry: Equatable, Sendable {
         if let cleanupMs { line += " cleanup_ms=\(cleanupMs)" }
         if let cleanupModel { line += " model=\(cleanupModel)" }
         if let cleanup { line += " cleanup=\(cleanup)" }
+        if let cleanupMode { line += " cleanup_mode=\(cleanupMode)" }
         return line
     }
 }

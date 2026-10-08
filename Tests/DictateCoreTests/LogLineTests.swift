@@ -46,6 +46,12 @@ struct LogLineTests {
         #expect(!line.contains("text="))
         #expect(!line.contains("\n"))
     }
+    @Test func cleanupModeContainsOnlyLabel() {
+        var entry = entry()
+        entry.cleanupMode = "incremental_fallback"
+        #expect(entry.formatted().hasSuffix("cleanup_mode=incremental_fallback"))
+        #expect(!entry.formatted().contains("text="))
+    }
     @Test func appendFailureReturnsFalse() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
