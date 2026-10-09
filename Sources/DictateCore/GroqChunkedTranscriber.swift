@@ -3,7 +3,7 @@ import Foundation
 /// Thread-safe streaming capture; each cut starts an independent upload.
 /// WAV is encoded in memory using the existing Core encoder. No file APIs.
 public final class GroqChunkedTranscriber: @unchecked Sendable {
-    public static let fillerLeadIn = "Um, so, uh, like,"
+    public static let fillerLeadIn = "Um, so, uh, like, Tuesday, no, Wednesday."
 
     public struct RateLimits: Sendable, Equatable {
         public static let names = ["x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
