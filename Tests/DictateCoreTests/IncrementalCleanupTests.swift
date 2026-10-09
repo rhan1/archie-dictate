@@ -46,6 +46,61 @@ private actor IncrementalTransport: HTTPTransport {
     }
 }
 
+private actor RaceIncrementalTransport: HTTPTransport {
+    let midMs: Int
+    private var count = 0
+    private var started = false
+    private var cancelled = false
+    init(midMs: Int) { self.midMs = midMs }
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        count += 1
+        let mid = count == 1
+        started = true
+        do { try await Task.sleep(for: .milliseconds(mid ? midMs : 1)) }
+        catch { cancelled = true; throw error }
+        let content = mid ? "Send the updated report to the team." :
+            "Send the updated report to the team. Send the updated report to the team. Send the updated report to the team."
+        let data = try JSONSerialization.data(withJSONObject: ["choices": [["finish_reason": "stop", "message": ["content": content]]]])
+        return (data, HTTPURLResponse(url: TranscriptCleaner.groqEndpoint, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+    func waitForStart() async throws {
+        for _ in 0..<500 {
+            if started { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        throw URLError(.timedOut)
+    }
+    func waitForCancellation() async throws {
+        for _ in 0..<200 {
+            if cancelled { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(cancelled)
+    }
+}
+
+private actor SingleProbe {
+    let delayMs: Int
+    private(set) var startedAt: ContinuousClock.Instant?
+    private(set) var raw: String?
+    private var cancelled = false
+    init(delayMs: Int) { self.delayMs = delayMs }
+    func clean(_ text: String) async -> IncrementalCleaner.SingleResult {
+        raw = text
+        startedAt = .now
+        do { try await Task.sleep(for: .milliseconds(delayMs)) }
+        catch { cancelled = true }
+        return .init(text: "Single winner.", label: "ok", model: "fake", stats: nil, calls: 1)
+    }
+    func waitForCancellation() async throws {
+        for _ in 0..<200 {
+            if cancelled { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(cancelled)
+    }
+}
+
 @Suite("IncrementalCleanup")
 struct IncrementalCleanupTests {
     private func cleaner(_ transport: IncrementalTransport) -> TranscriptCleaner {
@@ -55,6 +110,105 @@ struct IncrementalCleanupTests {
     }
     private let chunkText = "Send the updated report to the team."
 
+    @Test(arguments: [true, false]) func raceStartsSingleAfter600AndFirstWins(singleWins: Bool) async throws {
+        let transport = RaceIncrementalTransport(midMs: singleWins ? 1_000 : 640)
+        let incremental = IncrementalCleaner(cleaner: TranscriptCleaner(
+            transport: transport, vocabulary: "", apiKey: { "hermetic-key" }))
+        incremental.append(index: 0, text: chunkText)
+        incremental.append(index: 1, text: chunkText)
+        try await transport.waitForStart()
+        incremental.seal()
+        incremental.append(index: 2, text: chunkText)
+        let single = SingleProbe(delayMs: singleWins ? 5 : 1_000)
+        let start = ContinuousClock.now
+        let result = await incremental.finish(totalChunks: 3, rawText: chunkText + " " + chunkText + " " + chunkText,
+            single: { raw in await single.clean(raw) })
+        #expect(result.mode == (singleWins ? "race_single" : "race_incremental"))
+        #expect(result.text == (singleWins ? "Single winner." : "Send the updated report to the team. Send the updated report to the team. Send the updated report to the team."))
+        #expect(result.calls == (singleWins ? 2 : 3))
+        #expect(result.fallbackReason == "mid_slow_at_finish")
+        #expect(start.duration(to: .now) < .milliseconds(850))
+        let delay = try #require(await single.startedAt)
+        #expect(start.duration(to: delay) >= .milliseconds(580))
+        #expect(await single.raw == chunkText + " " + chunkText + " " + chunkText)
+        if singleWins { try await transport.waitForCancellation() }
+        else { try await single.waitForCancellation() }
+    }
+
+    @Test func failedMidStartsSingleImmediately() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport), raceAfterMs: 30)
+        for index in 0..<2 { incremental.append(index: index, text: chunkText) }
+        try await transport.wait(1)
+        await transport.fail(0)
+        await incremental.waitForPending()
+        incremental.seal()
+        incremental.append(index: 2, text: chunkText)
+        let single = SingleProbe(delayMs: 1)
+        let start = ContinuousClock.now
+        let result = await incremental.finish(totalChunks: 3, rawText: "full raw fixture",
+            single: { raw in await single.clean(raw) })
+        #expect(start.duration(to: .now) < .milliseconds(25))
+        #expect(result.mode == "incremental_fallback")
+        #expect(result.fallbackReason == "mid_network_timedOut")
+        #expect(result.text == "Single winner.")
+        #expect(result.calls == 2)
+        #expect(await single.raw == "full raw fixture")
+    }
+
+    @Test func threeChunksUseIncremental() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        incremental.append(index: 0, text: "Keep this. Last sentence.")
+        incremental.append(index: 1, text: "Tail one.")
+        try await transport.wait(1)
+        #expect(try await transport.user(0) == "<context></context>\n<dictation>Keep this. Last sentence.</dictation>")
+        incremental.seal()
+        incremental.append(index: 2, text: "Tail two.")
+        try await transport.respond(0, "Keep this. Last sentence.")
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await transport.user(1) == "<context>Keep this.</context>\n<dictation>Last sentence. Tail one. Tail two.</dictation>")
+        try await transport.respond(1, "Last sentence. Tail one. Tail two.")
+        let result = await finish.value
+        #expect(result.mode == "incremental")
+        #expect(result.calls == 2)
+        #expect(result.text == "Keep this. Last sentence. Tail one. Tail two.")
+        #expect(result.skippedReason == nil)
+    }
+
+    @Test func skipReasonLogged() async {
+        for total in [2, 3] {
+            let incremental = IncrementalCleaner(cleaner: cleaner(IncrementalTransport()))
+            incremental.seal()
+            for index in 0..<total { incremental.append(index: index, text: chunkText) }
+            let result = await incremental.finish(totalChunks: total)
+            #expect(result.mode == "single")
+            #expect(result.skippedReason == (total == 2 ? "short" : "none_cleanable_before_finish"))
+            var entry = DictationLogEntry(time: Date(), durationSeconds: 1, audioBytes: 0,
+                latencyMs: 0, chars: 0, frontmostBundleID: "test", outcome: .ok)
+            entry.cleanupMode = result.mode
+            entry.incrementalSkipped = result.skippedReason
+            #expect(entry.formatted().contains("incremental_skipped=" + result.skippedReason!))
+        }
+    }
+
+    @Test func finishAfterFailedMidIsImmediate() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        for index in 0..<3 { incremental.append(index: index, text: chunkText) }
+        try await transport.wait(1)
+        await transport.fail(0)
+        await incremental.waitForPending()
+        let start = ContinuousClock.now
+        let result = await incremental.finish(totalChunks: 3)
+        #expect(start.duration(to: .now) < .milliseconds(50))
+        #expect(result.mode == "incremental_fallback")
+        #expect(result.fallbackReason == "mid_network_timedOut")
+        #expect(result.calls == 1)
+        #expect(await transport.count == 1)
+    }
+
     @Test func batchingContiguityAndSerialCalls() async throws {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
@@ -63,12 +217,13 @@ struct IncrementalCleanupTests {
         #expect(await transport.count == 0) // Missing index zero: not cleanable.
         incremental.append(index: 0, text: chunkText)
         try await transport.wait(1)
+        #expect(try await transport.user(0) == "<context></context>\n<dictation>\(chunkText) \(chunkText)</dictation>")
         incremental.append(index: 3, text: chunkText)
         #expect(await transport.count == 1) // Only one new cleanable chunk.
         incremental.append(index: 4, text: chunkText)
         incremental.append(index: 5, text: chunkText)
         #expect(await transport.count == 1) // First request is still in flight.
-        try await transport.respond(0, chunkText)
+        try await transport.respond(0, chunkText + " " + chunkText)
         try await transport.wait(2)
         #expect(await transport.count == 2)
         #expect(try await transport.user(1).contains(Array(repeating: chunkText, count: 3).joined(separator: " ")))
@@ -105,9 +260,9 @@ struct IncrementalCleanupTests {
         try await transport.wait(1)
         try await transport.respond(0, chunkText)
         await incremental.waitForPending()
-        incremental.append(index: 3, text: chunkText)
         incremental.seal()                                   // finish tap
-        incremental.append(index: 4, text: chunkText)        // would make 2 more cleanable
+        incremental.append(index: 3, text: chunkText)
+        incremental.append(index: 4, text: chunkText)
         incremental.append(index: 5, text: chunkText)
         #expect(await transport.count == 1)                  // no new intermediate call
         let finish = Task { await incremental.finish(totalChunks: 6) }
@@ -122,6 +277,7 @@ struct IncrementalCleanupTests {
     @Test(arguments: [1, 2]) func shortDictationUsesSinglePath(chunks: Int) async {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        incremental.seal()
         for index in 0..<chunks { incremental.append(index: index, text: chunkText) }
         let result = await incremental.finish(totalChunks: chunks)
         #expect(await transport.count == 0)

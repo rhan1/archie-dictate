@@ -57,10 +57,88 @@ private actor ChunkTransport: HTTPTransport {
     func count(tag: Int) -> Int { requests[tag, default: []].count }
 }
 
+/// Timed, cancellation-aware responses exercise the hedge without networking.
+private actor HedgeTransport: HTTPTransport {
+    enum Plan { case duplicateWins, primaryWins, fast, failures, duplicateFails, primaryFails }
+    let plan: Plan
+    private(set) var requests: [URLRequest] = []
+    private(set) var cancelled: Set<Int> = []
+    init(_ plan: Plan) { self.plan = plan }
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let number = requests.count + 1
+        requests.append(request)
+        let delay: Int
+        switch plan {
+        case .fast: delay = 10
+        case .duplicateWins: delay = number == 1 ? 250 : 1
+        case .primaryWins: delay = number == 1 ? 80 : 250
+        case .failures: delay = number == 1 ? 80 : 60
+        case .duplicateFails: delay = number == 1 ? 100 : 1
+        case .primaryFails: delay = number == 1 ? 70 : 40
+        }
+        do { try await Task.sleep(for: .milliseconds(delay)) }
+        catch { cancelled.insert(number); throw error }
+        let fails = plan == .failures || (plan == .duplicateFails && number == 2) ||
+                    (plan == .primaryFails && number == 1)
+        if fails { throw URLError(.timedOut) }
+        let data = try JSONSerialization.data(withJSONObject: ["text": number == 1 ? "primary" : "duplicate"])
+        return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+    func waitForCancellation(_ number: Int) async throws {
+        for _ in 0..<200 {
+            if cancelled.contains(number) { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(cancelled.contains(number))
+    }
+}
+
 @Suite("PauseChunker")
 struct PauseChunkerTests {
     private func pcm(_ seconds: Double, _ value: Int16 = 12_000) -> [Int16] {
         [Int16](repeating: value, count: Int((seconds * 24_000).rounded()))
+    }
+
+    @Test func finalSplitLeavesShortTail() throws {
+        var chunker = PauseChunker(firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+        let input = pcm(4.2) + pcm(0.1, 400) + pcm(1.7)
+        #expect(chunker.append(input).isEmpty)
+        let pieces = chunker.finish(splitOver: 2)
+        #expect(pieces.map(\.samples.count) == [100_800, 43_200])
+        #expect(pieces.map(\.index) == [0, 1])
+        #expect(pieces.flatMap(\.samples) == input)
+        #expect(chunker.finish(splitOver: 2).isEmpty)
+    }
+
+    @Test func noSplitUnderTwoSeconds() {
+        var chunker = PauseChunker()
+        _ = chunker.append(pcm(2))
+        #expect(chunker.finish(splitOver: 2).map(\.samples.count) == [48_000])
+    }
+
+    @Test func splitThresholdStillCapsTailAtTwoSeconds() {
+        var chunker = PauseChunker(firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+        let input = pcm(3.2) + pcm(0.1, 400) + pcm(2.7)
+        _ = chunker.append(input)
+        let pieces = chunker.finish(splitOver: 3)
+        #expect(pieces.count == 2)
+        #expect(pieces.last.map { (12_000...48_000).contains($0.samples.count) } == true)
+        #expect(pieces.flatMap(\.samples) == input)
+    }
+
+    @Test func splitDisabledByNil() {
+        var chunker = PauseChunker(firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+        _ = chunker.append(pcm(6))
+        #expect(chunker.finish(splitOver: nil).map(\.samples.count) == [144_000])
+    }
+
+    @Test func finalSplitTrimsFirstAndBoundsTail() {
+        var chunker = PauseChunker(firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+        _ = chunker.append(pcm(4.2) + pcm(0.1, 400) + pcm(0.7) + pcm(1, 0))
+        let pieces = chunker.finish(splitOver: 2)
+        #expect(pieces.map(\.samples.count) == [100_800, 25_200])
+        #expect(pieces.last.map { (12_000...48_000).contains($0.samples.count) } == true)
     }
 
     @Test func firstChunkCutsAfterThreeSecondsAnd150MillisecondsOfQuiet() {
@@ -256,6 +334,126 @@ struct GroqChunkedTests {
     }
     private func chunk(_ index: Int, tag: Int16) -> PauseChunker.Chunk {
         .init(index: index, samples: [Int16](repeating: tag, count: 2_400))
+    }
+
+    @Test func hedgeFiresOnSlowChunkAndFirstWins() async throws {
+        let transport = HedgeTransport(.duplicateWins)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
+                                            prompt: "fixture", hedgeAfterMs: 50)
+        engine.submit(chunk(0, tag: 1000))
+        let start = ContinuousClock.now
+        let result = await engine.finish()
+        #expect(start.duration(to: .now) < .milliseconds(200))
+        #expect(result.text == "duplicate")
+        #expect(result.hedges == 1)
+        #expect(result.hedgeWins == 1)
+        #expect(result.calls.first?.hedgeFired == true)
+        #expect(result.calls.first?.winningRequest == 2)
+        #expect(result.failedCount == 0)
+        let requests = await transport.requests
+        #expect(requests.count == 2)
+        if requests.count == 2 { #expect(requests[0].httpBody == requests[1].httpBody) }
+        try await transport.waitForCancellation(1)
+    }
+
+    @Test func noHedgeWhenFast() async {
+        let transport = HedgeTransport(.fast)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
+                                            prompt: "", hedgeAfterMs: 50)
+        engine.submit(chunk(0, tag: 1000))
+        let result = await engine.finish()
+        #expect(result.text == "primary")
+        #expect(result.hedges == 0)
+        #expect(result.hedgeWins == 0)
+        #expect(result.calls.first?.hedgeFired == false)
+        #expect(result.calls.first?.winningRequest == 1)
+        #expect(await transport.requests.count == 1)
+    }
+
+    @Test func hedgeCapsRequests() async {
+        let transport = HedgeTransport(.failures)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
+                                            prompt: "", hedgeAfterMs: 50)
+        engine.submit(chunk(0, tag: 1000))
+        let result = await engine.finish()
+        #expect(await transport.requests.count == 3) // Positive control: hedge + unhedged retry.
+        #expect(result.hedges == 1)
+        #expect(result.hedgeWins == 0)
+        #expect(result.failedCount == 1)
+        #expect(result.text.isEmpty)
+        #expect(result.calls.map(\.attempt) == [1, 2])
+        #expect(result.calls.map(\.hedgeFired) == [true, false])
+        #expect(result.calls.allSatisfy { $0.winningRequest == nil })
+    }
+
+    @Test func primaryCanWinAfterHedge() async throws {
+        let transport = HedgeTransport(.primaryWins)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
+                                            prompt: "", hedgeAfterMs: 50)
+        engine.submit(chunk(0, tag: 1000))
+        let result = await engine.finish()
+        #expect(result.text == "primary")
+        #expect(result.hedges == 1)
+        #expect(result.hedgeWins == 0)
+        #expect(result.calls.first?.winningRequest == 1)
+        try await transport.waitForCancellation(2)
+    }
+
+    @Test(arguments: [false, true])
+    func hedgeWaitsForFirstSuccess(primaryFails: Bool) async {
+        let transport = HedgeTransport(primaryFails ? .primaryFails : .duplicateFails)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
+                                            prompt: "", hedgeAfterMs: 50)
+        engine.submit(chunk(0, tag: 1000))
+        let result = await engine.finish()
+        #expect(result.text == (primaryFails ? "duplicate" : "primary"))
+        #expect(result.hedges == 1)
+        #expect(result.hedgeWins == (primaryFails ? 1 : 0))
+        #expect(result.failedCount == 0)
+        #expect(await transport.requests.count == 2)
+    }
+
+    @Test func transcriberFinalSplitUploadsBothConcurrently() async throws {
+        let transport = ChunkTransport()
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "",
+            firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+        let pcm = [Int16](repeating: 1000, count: 100_800) +
+            [Int16](repeating: 400, count: 2_400) + [Int16](repeating: 2000, count: 40_800)
+        engine.append(pcm)
+        let finish = Task { await engine.finish() }
+        await transport.wait(tag: 1000)
+        await transport.wait(tag: 400) // Both start before either response.
+        try await transport.respond(tag: 400, text: "Tail")
+        try await transport.respond(tag: 1000, text: "Prefix")
+        let result = await finish.value
+        #expect(result.chunks == 2)
+        #expect(result.text == "Prefix Tail")
+        #expect(result.failedCount == 0)
+        #expect(result.hedges == 0)
+    }
+
+    @Test func finalSplitUploadsEvenAShortPrefix() async {
+        let transport = HedgeTransport(.fast)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "")
+        engine.append([Int16](repeating: 1000, count: 1_200) +
+                      [Int16](repeating: 400, count: 2_400) + [Int16](repeating: 2000, count: 45_600))
+        let result = await engine.finish()
+        #expect(result.chunks == 2)
+        #expect(await transport.requests.count == 2)
+        #expect(result.failedCount == 0)
+    }
+
+    @Test func transcriberFinalSplitDisabledByNil() async throws {
+        let transport = ChunkTransport()
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "",
+            firstMinimumSeconds: 7, firstMaximumSeconds: 8, finalSplitSeconds: nil)
+        engine.append([Int16](repeating: 1000, count: 144_000))
+        let finish = Task { await engine.finish() }
+        await transport.wait(tag: 1000)
+        try await transport.respond(tag: 1000)
+        let result = await finish.value
+        #expect(result.chunks == 1)
+        #expect(result.failedCount == 0)
     }
 
     @Test func joinsOutOfOrderAndDoesNotWaitForPreviousTail() async throws {
