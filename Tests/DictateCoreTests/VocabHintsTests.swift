@@ -4,6 +4,15 @@ import DictateCore
 
 @Suite("VocabHints")
 struct VocabHintsTests {
+    @Test func multiWordAliasesAndTermsHaveClearSeparators() {
+        let hints = VocabHints.parse("Limpar <- limp r, limp are\nAcme Corp <- ack me corp\nDB99 <- dee bee ninety-nine")
+        let sentence = VocabHints.promptSentence(hints)
+        #expect(sentence.contains(#""limp r" / "limp are" → Limpar, "ack me corp" → Acme Corp, "dee bee ninety-nine" → DB99."#))
+        #expect(!sentence.contains("LimparMatch"))
+        #expect(!sentence.contains("Limpar match"))
+        #expect(Vocabulary.join(hints.map(\.term)) == "Limpar, Acme Corp, DB99")
+    }
+
     @Test func parsesCommentsBareTermsAndWhitespaceInOrder() {
         let hints = VocabHints.parse("""
           # names

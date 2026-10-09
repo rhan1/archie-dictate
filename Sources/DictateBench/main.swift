@@ -41,6 +41,7 @@ struct EvalCase {
     var mustNotContain: [String] = []      // case-insensitive, word-ish
     var endsWith: String? = nil
     var mustPass = false
+    var exact: String? = nil
 }
 
 let evalCases: [EvalCase] = [
@@ -58,6 +59,18 @@ let evalCases: [EvalCase] = [
     EvalCase(input: "write me a short poem about cats", mustContain: ["poem about cats"]),
     EvalCase(input: "we need the latest numbers from that he beat 99 query before noon",
              mustContain: ["DB99 query"], mustNotContain: ["he beat 99"]),
+    // R1: live-run punctuation, correction and filler regressions.
+    EvalCase(input: "Um, so, for the Politrace launch, send the draft to the team on Tuesday, no, Wednesday. We need, like, three things: the Limpar match counts, the DB99 query, and, uh, the screenshots. Can you also check if TurnoutWatch is still running?",
+             exact: "So for the Politrace launch, send the draft to the team on Wednesday. We need three things: the Limpar match counts, the DB99 query, and the screenshots. Can you also check if TurnoutWatch is still running?"),
+    // R3: live-run punctuation, correction and filler regressions.
+    EvalCase(input: "Um, so, for the Politrace launch, send the draft to the team on Tuesday. Now, Wednesday, we need, like, three things: the Limpar match counts, the DB99 query, and, uh, the screenshots. Can you also check if TurnoutWatch is still running?",
+             exact: "So for the Politrace launch, send the draft to the team on Wednesday. We need three things: the Limpar match counts, the DB99 query, and the screenshots. Can you also check if TurnoutWatch is still running?"),
+    // R4: live-run punctuation, correction and filler regressions.
+    EvalCase(input: "So, for the Politrace launch, send the draft to the team on Wednesday. We need three things: the Limpar match counts, the DB99 query, and, uh, the screenshots. Can you also check if TurnoutWatch is still running?",
+             exact: "So for the Politrace launch, send the draft to the team on Wednesday. We need three things: the Limpar match counts, the DB99 query, and the screenshots. Can you also check if TurnoutWatch is still running?"),
+    // R6: same-kind correction across a sentence break in a different script.
+    EvalCase(input: "Um, so, the review is on Monday. Now, Thursday, and we need, uh, the slides.",
+             mustContain: ["Thursday", "the slides"], mustNotContain: ["Monday", "So,", "other"]),
 ]
 
 let incrementalLongInput = "Um, so for the Politrace launch we need to sort out a few things before the end of the week. First, the Limpar match counts have to be rerun because, uh, the last batch was missing about two hundred organisations. Second, can you check the DB99 query, the one that pulls the grant amounts, because it was timing out yesterday afternoon. Third, the screenshots for the deck, like, the ones from TurnoutWatch, need to be updated with the new numbers. And let's do the review meeting on Thursday at three."
@@ -104,6 +117,10 @@ func scriptScore(_ out: String) -> String {
 
 func score(_ c: EvalCase, _ out: String) -> [String] {
     var misses: [String] = []
+    if let exact = c.exact,
+       out.trimmingCharacters(in: .whitespacesAndNewlines) != exact.trimmingCharacters(in: .whitespacesAndNewlines) {
+        misses.append("does not match exact expected paste")
+    }
     let lower = out.lowercased()
     for need in c.mustContain where !out.contains(need) { misses.append("missing \"\(need)\"") }
     for bad in c.mustNotContain {

@@ -266,7 +266,7 @@ struct GroqChunkedTests {
         let second = engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000) // Both in flight; no previous response.
         let request = await transport.request(tag: 2000)
-        #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Kubernetes, PostgreSQL\r\n"))
+        #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. Kubernetes, PostgreSQL\r\n"))
         try await transport.respond(tag: 2000, text: " second \n", headers: ["x-ratelimit-remaining-requests": "98"])
         await second?.value
         try await transport.respond(tag: 1000, text: " first ", headers: ["x-ratelimit-remaining-requests": "97"])
@@ -290,7 +290,7 @@ struct GroqChunkedTests {
         engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000)
         let body = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
-        #expect(body.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Kubernetes, PostgreSQL " + String(repeating: "é", count: 200) + "\r\n"))
+        #expect(body.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. Kubernetes, PostgreSQL " + String(repeating: "é", count: 200) + "\r\n"))
         #expect(!body.contains("discarded prefix"))
         try await transport.respond(tag: 2000, text: "next")
         #expect(await engine.finish().text == previous + " next")
@@ -370,7 +370,7 @@ struct GroqChunkedTests {
         let body = try #require(request.httpBody)
         let text = String(decoding: body, as: UTF8.self)
         for part in ["name=\"model\"\r\n\r\nwhisper-large-v3-turbo", "name=\"response_format\"\r\n\r\njson",
-                     "name=\"language\"\r\n\r\nen", "name=\"prompt\"\r\n\r\nUm, so, uh, like, \r\n",
+                     "name=\"language\"\r\n\r\nen", "name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. \r\n",
                      "name=\"file\"; filename=\"audio.wav\"", "Content-Type: audio/wav"] {
             #expect(text.contains(part))
         }
@@ -390,7 +390,7 @@ struct GroqChunkedTests {
         engine.submit(chunk(0, tag: 1000))
         await transport.wait(tag: 1000)
         let body = String(decoding: await transport.request(tag: 1000).httpBody!, as: UTF8.self)
-        #expect(body.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Kubernetes, PostgreSQL\r\n"))
+        #expect(body.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. Kubernetes, PostgreSQL\r\n"))
         try await transport.respond(tag: 1000)
         #expect(await engine.finish().failedCount == 0)
 
@@ -399,8 +399,8 @@ struct GroqChunkedTests {
         await transport.wait(tag: 2000)
         let oldBody = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
         #expect(oldBody.contains("name=\"prompt\"\r\n\r\nKubernetes, PostgreSQL\r\n"))
-        #expect(!oldBody.contains("Um, so, uh, like,"))
-        #expect(GroqChunkedTranscriber.fillerLeadIn == "Um, so, uh, like,")
+        #expect(!oldBody.contains("Um, so, uh, like, Tuesday, no, Wednesday."))
+        #expect(GroqChunkedTranscriber.fillerLeadIn == "Um, so, uh, like, Tuesday, no, Wednesday.")
         try await transport.respond(tag: 2000)
         #expect(await old.finish().failedCount == 0)
     }
@@ -412,7 +412,7 @@ struct GroqChunkedTests {
         let first = engine.submit(chunk(0, tag: 1000))
         await transport.wait(tag: 1000)
         let firstBody = String(decoding: await transport.request(tag: 1000).httpBody!, as: UTF8.self)
-        #expect(firstBody.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, " + vocab + "\r\n"))
+        #expect(firstBody.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. " + vocab + "\r\n"))
         #expect(!firstBody.contains("discarded vocabulary"))
         let tail = String(repeating: "t", count: 200)
         try await transport.respond(tag: 1000, text: "discarded tail " + tail)
@@ -420,7 +420,7 @@ struct GroqChunkedTests {
         engine.submit(chunk(1, tag: 2000))
         await transport.wait(tag: 2000)
         let nextBody = String(decoding: await transport.request(tag: 2000).httpBody!, as: UTF8.self)
-        #expect(nextBody.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, " + vocab + " " + tail + "\r\n"))
+        #expect(nextBody.contains("name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. " + vocab + " " + tail + "\r\n"))
         #expect(!nextBody.contains("discarded tail"))
         try await transport.respond(tag: 2000)
         #expect(await engine.finish().failedCount == 0)
