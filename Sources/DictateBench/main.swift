@@ -94,8 +94,33 @@ func benchCleanUp(_ raw: String, groq: TranscriptCleaner) async -> (text: String
         endpoint: TranscriptCleaner.ollamaEndpoint, model: TranscriptCleaner.localModel,
         vocabulary: groq.vocabulary, apiKey: { "ollama" })
     local.reloadVocabularyFromHints = groq.reloadVocabularyFromHints
+    local.includeExamples = groq.includeExamples
     local.timeoutInterval = deadline
     return ((try? await local.clean(raw)) ?? raw, 2)
+}
+
+/// JSON string escaping keeps raw chunk text and string knobs on ONE stdout line.
+func benchQuoted(_ value: String) -> String {
+    String(decoding: try! JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), as: UTF8.self)
+}
+
+/// Hook responses can arrive out of order; print the original raw text in index
+/// order after finish. All offsets come from the exact PCM submitted by bench.
+final class BenchChunkTexts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var texts: [Int: String] = [:]
+    func append(index: Int, text: String) { lock.withLock { texts[index] = text } }
+    var snapshot: [Int: String] { lock.withLock { texts } }
+}
+
+func benchChunkLines(_ chunks: [PauseChunker.Chunk], texts: [Int: String]) -> [String] {
+    var cursor = 0
+    return chunks.map { chunk in
+        let start = cursor
+        cursor += chunk.samples.count
+        // Finish chunks already carry V4b's trimmed length, not the amount fed.
+        return "chunk \(chunk.index) start_ms=\(Double(start) / 24) end_ms=\(Double(cursor) / 24) dur_ms=\(Double(chunk.samples.count) / 24) cut=\(chunk.cutKind.rawValue) text=\(benchQuoted(texts[chunk.index] ?? ""))"
+    }
 }
 
 /// The expected paste for Fable's standard live-test script.
@@ -389,7 +414,15 @@ case "stt-groq-chunked":
     let finalSplitSeconds: Double? = ProcessInfo.processInfo.environment["BENCH_FINAL_SPLIT"] == "0" ? nil : 2.0
     let firstMinimumSeconds = useV3 ? 3.0 : 2.0
     let firstMaximumSeconds = useV3 ? 4.0 : 3.0
-    print("variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) lead_in=\(useV3 ? "on" : "off") final_split=\(finalSplitSeconds == nil ? "off" : "on")")
+    let env = ProcessInfo.processInfo.environment
+    let showChunks = env["BENCH_SHOW_CHUNKS"] == "1"
+    let leadIn = env["BENCH_LEAD_IN"]
+    let promptExtra = env["BENCH_PROMPT_EXTRA"]
+    let benchPrompt = prompt + (promptExtra.map { " " + $0 } ?? "")
+    let finalModel = env["BENCH_FINAL_MODEL"]
+    let rejoinGuard = env["BENCH_REJOIN_GUARD"] == "1"
+    let shortPrompt = env["BENCH_FINAL_SHORT_PROMPT"] == "1"
+    print("probe show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" || rejoinGuard ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let transport = URLSessionTransport(timeout: 30)
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
@@ -399,15 +432,26 @@ case "stt-groq-chunked":
     }
     let cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5),
                                     endpoint: TranscriptCleaner.groqEndpoint, model: TranscriptCleaner.defaultModel,
-                                    vocabulary: prompt, apiKey: { try environmentKey("GROQ_API_KEY") })
-    let useIncremental = endToEnd && ProcessInfo.processInfo.environment["BENCH_INCREMENTAL"] != "0"
+                                    vocabulary: benchPrompt, apiKey: { try environmentKey("GROQ_API_KEY") })
+    let singleCleaner: TranscriptCleaner = {
+        var copy = cleaner
+        copy.includeExamples = !shortPrompt
+        return copy
+    }()
+    let useIncremental = endToEnd && !rejoinGuard && ProcessInfo.processInfo.environment["BENCH_INCREMENTAL"] != "0"
     for run in 1...runs {
         var chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
-        let incremental = useIncremental ? IncrementalCleaner(cleaner: cleaner) : nil
-        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt,
-                                           fillerLeadIn: useV3, firstMinimumSeconds: firstMinimumSeconds,
+        let incremental = useIncremental ? IncrementalCleaner(cleaner: cleaner, finalIncludeExamples: !shortPrompt) : nil
+        let rawChunkTexts = BenchChunkTexts()
+        var submittedChunks: [PauseChunker.Chunk] = []
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: benchPrompt,
+                                           fillerLeadIn: useV3, leadIn: leadIn, firstMinimumSeconds: firstMinimumSeconds,
                                            firstMaximumSeconds: firstMaximumSeconds, finalSplitSeconds: finalSplitSeconds,
-                                           onChunkText: { index, text in incremental?.append(index: index, text: text) })
+                                           finalModel: finalModel, rejoinGuard: rejoinGuard,
+                                           onChunkText: { index, text in
+                                               if showChunks { rawChunkTexts.append(index: index, text: text) }
+                                               incremental?.append(index: index, text: text)
+                                           })
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
@@ -415,7 +459,10 @@ case "stt-groq-chunked":
             let deadline = started + UInt64(Double(fed) / 24_000 * 1_000_000_000)
             let now = DispatchTime.now().uptimeNanoseconds
             if deadline > now { try await Task.sleep(nanoseconds: deadline - now) }
-            for chunk in chunker.append(samples) { engine.submit(chunk) }
+            for chunk in chunker.append(samples) {
+                if showChunks { submittedChunks.append(chunk) }
+                engine.submit(chunk)
+            }
         }
         for offset in stride(from: 0, to: pcm.count, by: 2_400) {
             try await feed(Array(pcm[offset..<min(pcm.count, offset + 2_400)]))
@@ -427,9 +474,18 @@ case "stt-groq-chunked":
         let finish = DispatchTime.now()
         incremental?.seal()
         let final = chunker.finish(splitOver: finalSplitSeconds)
-        for chunk in final where final.count > 1 || chunk.samples.count >= 7_200 { engine.submit(chunk) }
+        for chunk in final where final.count > 1 || chunk.samples.count >= 7_200 {
+            if showChunks { submittedChunks.append(chunk) }
+            engine.submit(chunk, isFinal: true)
+        }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)
+        if showChunks {
+            for line in benchChunkLines(submittedChunks, texts: rawChunkTexts.snapshot) { print(line) }
+        }
+        let finalCalls = joined.calls.filter { $0.isFinal }
+        let probeMetrics = " rejoins=\(joined.rejoins) final_model=\(benchQuoted(finalCalls.first?.model ?? "-")) final_chunk_ms=" +
+            (finalCalls.isEmpty ? "-" : finalCalls.map { "\($0.index):\($0.milliseconds)" }.joined(separator: ","))
         if joined.failedCount == 0, !joined.text.isEmpty {
             if endToEnd {
                 var cleaned = joined.text
@@ -442,7 +498,7 @@ case "stt-groq-chunked":
                         single: { fullRaw in
                             // Match the app's Groq → local → raw fallback, and
                             // stop before local if the incremental path wins.
-                            if let (text, stats) = try? await cleaner.cleanWithStats(fullRaw) {
+                            if let (text, stats) = try? await singleCleaner.cleanWithStats(fullRaw) {
                                 return .init(text: text, label: "ok", model: cleaner.model, stats: stats, calls: 1)
                             }
                             if Task.isCancelled {
@@ -453,6 +509,7 @@ case "stt-groq-chunked":
                                 endpoint: TranscriptCleaner.ollamaEndpoint, model: TranscriptCleaner.localModel,
                                 vocabulary: cleaner.vocabulary, apiKey: { "ollama" })
                             local.reloadVocabularyFromHints = cleaner.reloadVocabularyFromHints
+                            local.includeExamples = !shortPrompt
                             local.timeoutInterval = deadline
                             if let (text, stats) = try? await local.cleanWithStats(fullRaw) {
                                 return .init(text: text, label: "fallback_local", model: local.model, stats: stats, calls: 2)
@@ -465,7 +522,7 @@ case "stt-groq-chunked":
                     skipped = output?.skippedReason ?? (incremental == nil ? "disabled" : "none_cleanable_before_finish")
                     if let text = output?.text { cleaned = text }
                     else {
-                        let fallback = await benchCleanUp(joined.text, groq: cleaner)
+                        let fallback = await benchCleanUp(joined.text, groq: singleCleaner)
                         cleaned = fallback.text
                         calls += fallback.calls
                     }
@@ -474,18 +531,18 @@ case "stt-groq-chunked":
                 let pasteMs = ms(since: finish)
                 results.append(pasteMs)
                 lastText = cleaned
-                print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : ""))
+                print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : ""))
                 if showText { print("   raw: \(joined.text)\n   out: \(cleaned)") }
             } else {
                 results.append(elapsed)
                 lastText = joined.text
-                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+                print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
                 if showText { print("   raw: \(joined.text)") }
             }
         } else {
             incremental?.cancel()
             let mode = incremental == nil ? "single" : "incremental_fallback"
-            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)" + (endToEnd ? " cleanup_mode=\(mode) cleanup_calls=\(incremental?.callCount ?? 0)" + (mode == "single" ? " incremental_skipped=disabled" : "") : ""))
+            print("run \(run)" + probeMetrics + " chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)" + (endToEnd ? " cleanup_mode=\(mode) cleanup_calls=\(incremental?.callCount ?? 0)" + (mode == "single" ? " incremental_skipped=disabled" : "") : ""))
         }
     }
 case "stt-apple":

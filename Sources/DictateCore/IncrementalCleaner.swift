@@ -27,6 +27,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private let lock = NSLock()
     private let cleaner: TranscriptCleaner
     private let raceAfterMs: Int
+    private let finalIncludeExamples: Bool
     private var chunks: [Int: String] = [:]
     private var contiguous = 0
     private var covered = 0
@@ -42,8 +43,9 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private var pending: Task<Void, Never>?
     private var finalTask: Task<Result, Never>?
 
-    public init(cleaner: TranscriptCleaner, raceAfterMs: Int = 600) {
+    public init(cleaner: TranscriptCleaner, raceAfterMs: Int = 600, finalIncludeExamples: Bool = true) {
         self.cleaner = cleaner
+        self.finalIncludeExamples = finalIncludeExamples
         self.raceAfterMs = max(0, raceAfterMs)
     }
     public var needsFallback: Bool { lock.withLock { failed } }
@@ -229,7 +231,9 @@ public final class IncrementalCleaner: @unchecked Sendable {
             return snapshot(text: nil, stats: nil, skipped: "none_cleanable_before_finish")
         }
         do {
-            let output = try await cleaner.cleanIncrementalWithStats(text, context: context, final: true)
+            var finalCleaner = cleaner
+            finalCleaner.includeExamples = finalIncludeExamples
+            let output = try await finalCleaner.cleanIncrementalWithStats(text, context: context, final: true)
             return snapshot(text: lock.withLock { cancelled } ? nil : Self.join(prefix: context, tail: output.text), stats: output.stats)
         } catch {
             lock.withLock {
