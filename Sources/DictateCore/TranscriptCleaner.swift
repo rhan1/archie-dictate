@@ -37,9 +37,9 @@ public struct TranscriptCleaner: Sendable {
 
     /// Chat messages for one cleanup: system, few-shot pairs, then the dictation
     /// wrapped in tags so it reads as text to edit, never as a request.
-    public static func messages(system: String, text: String) -> [[String: String]] {
+    public static func messages(system: String, text: String, includeExamples: Bool = true) -> [[String: String]] {
         var messages = [["role": "system", "content": system]]
-        for (input, output) in examples {
+        for (input, output) in includeExamples ? examples : [] {
             messages.append(["role": "user", "content": input])
             messages.append(["role": "assistant", "content": output])
         }
@@ -59,6 +59,7 @@ public struct TranscriptCleaner: Sendable {
     public let endpoint: URL
     public let model: String
     public let vocabulary: String
+    public var includeExamples: Bool
     public let apiKey: @Sendable () throws -> String
     /// nil reloads the editable file for each cleanup; a value supplies fixture hints.
     public var hintsSentence: String?
@@ -74,11 +75,12 @@ public struct TranscriptCleaner: Sendable {
     public static let groqEndpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
 
     public init(transport: HTTPTransport, endpoint: URL = TranscriptCleaner.endpoint, model: String = TranscriptCleaner.defaultModel,
-                vocabulary: String, apiKey: @escaping @Sendable () throws -> String) {
+                vocabulary: String, includeExamples: Bool = true, apiKey: @escaping @Sendable () throws -> String) {
         self.transport = transport
         self.endpoint = endpoint
         self.model = model
         self.vocabulary = vocabulary
+        self.includeExamples = includeExamples
         self.apiKey = apiKey
     }
 
@@ -107,7 +109,7 @@ public struct TranscriptCleaner: Sendable {
         var body: [String: Any] = [
             "model": model,
             "temperature": 0,
-            "messages": Self.messages(system: systemPrompt(), text: text),
+            "messages": Self.messages(system: systemPrompt(), text: text, includeExamples: includeExamples),
         ]
         if !isLocal, let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
         if !isLocal { body["max_completion_tokens"] = min(1024, 2 * (text.count / 4) + 64) }
@@ -126,7 +128,7 @@ public struct TranscriptCleaner: Sendable {
         let phase = final ? """
         The start of <dictation> is already cleaned; keep it unless the rest of the dictation corrects, retracts, continues or completes it (e.g. it is a question, or "no, Friday" replaces a word).
         """ : "This is an intermediate call. Never revise <context>; output only the cleaned dictation. If the dictation ends mid-sentence, do not add final punctuation to that unfinished fragment."
-        var messages = Self.messages(system: systemPrompt() + "\n" + instruction + "\n" + phase, text: text)
+        var messages = Self.messages(system: systemPrompt() + "\n" + instruction + "\n" + phase, text: text, includeExamples: includeExamples)
         messages[messages.count - 1]["content"] = "<context>\(String(context.suffix(600)))</context>\n<dictation>\(text)</dictation>"
         body["messages"] = messages
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])

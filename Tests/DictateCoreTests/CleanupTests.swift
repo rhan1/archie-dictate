@@ -260,3 +260,65 @@ struct LocalCleanupTests {
         #expect(transport.last == nil)
     }
 }
+
+@Suite("F3 short cleanup prompt")
+struct F3ShortPromptTests {
+    @Test(arguments: [true, false]) func examplePairsToggle(include: Bool) throws {
+        var cleaner = TranscriptCleaner(transport: CannedTransport(), vocabulary: "DB99", includeExamples: include, apiKey: { "k" })
+        cleaner.hintsSentence = ""
+        let requests = [cleaner.makeRequest(text: "hello", apiKey: "k"),
+                        cleaner.makeIncrementalRequest(text: "hello", context: "Earlier.", final: true, apiKey: "k")]
+        for request in requests {
+            let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            let messages = body["messages"] as! [[String: String]]
+            #expect(messages.count == (include ? 10 : 2))
+            #expect(messages.first?["content"]?.contains(TranscriptCleaner.instructions) == true)
+            #expect(messages.first?["content"]?.contains("Vocabulary: DB99") == true)
+            #expect(messages.filter { $0["role"] == "assistant" }.count == (include ? 4 : 0))
+        }
+    }
+}
+
+@Suite("F3 bench chunk map")
+struct F3BenchMapTests {
+    @Test func benchChunkMapAndEscapingControls() throws {
+        // Compile the bench's actual formatting functions with a minimal input
+        // type. No bench entry point, transport, audio, or fixture files execute.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/DictateBench/main.swift"), encoding: .utf8)
+        let start = try #require(source.range(of: "func benchQuoted("))
+        let end = try #require(source.range(of: "/// The expected paste", range: start.upperBound..<source.endIndex))
+        let controls = #"""
+        struct PauseChunker {
+            enum CutKind: String { case pause, forced, final }
+            struct Chunk { let index: Int; let samples: [Int16]; let cutKind: CutKind }
+        }
+        """# + "\n" + String(source[start.lowerBound..<end.lowerBound]) + "\n" + #"""
+        let chunks = [PauseChunker.Chunk(index: 0, samples: Array(repeating: 0, count: 72000), cutKind: .pause),
+                      PauseChunker.Chunk(index: 1, samples: Array(repeating: 0, count: 24000), cutKind: .forced),
+                      PauseChunker.Chunk(index: 2, samples: Array(repeating: 0, count: 6000), cutKind: .final)]
+        let lines = benchChunkLines(chunks, texts: [0: "raw", 1: "two", 2: "tail"])
+        guard lines == ["chunk 0 start_ms=0.0 end_ms=3000.0 dur_ms=3000.0 cut=pause text=\"raw\"",
+                        "chunk 1 start_ms=3000.0 end_ms=4000.0 dur_ms=1000.0 cut=forced text=\"two\"",
+                        "chunk 2 start_ms=4000.0 end_ms=4250.0 dur_ms=250.0 cut=final text=\"tail\""],
+              lines.last != "chunk 2 start_ms=4000.0 end_ms=5500.0 dur_ms=1500.0 cut=final text=\"tail\"",
+              benchQuoted("quoted \"word\"\nline") == "\"quoted \\\"word\\\"\\nline\"",
+              benchChunkLines([], texts: [:]).isEmpty
+        else { exit(1) }
+        print("CHUNK MAP RED/GREEN controls passed")
+        """#
+        let process = Process()
+        process.executableURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift")
+        process.arguments = ["-e", "import Foundation\n" + controls]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let result = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0, "\(result)")
+        #expect(result.contains("CHUNK MAP RED/GREEN controls passed"))
+    }
+}
