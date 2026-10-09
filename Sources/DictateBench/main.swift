@@ -377,6 +377,8 @@ guard args.count >= 4 else {
 }
 let runs = Int(args[3]) ?? 5
 guard runs > 0 else { print("runs must be positive"); exit(2) }
+/// BENCH_SHOW_TEXT=1 prints fixture transcripts to the terminal (bench only; the app never logs text).
+let showText = ProcessInfo.processInfo.environment["BENCH_SHOW_TEXT"] == "1"
 let endToEnd = args[1] == "stt-groq-chunked" && ProcessInfo.processInfo.environment["BENCH_E2E"] == "1"
 var results: [Int] = []
 var lastText: String?
@@ -473,10 +475,12 @@ case "stt-groq-chunked":
                 results.append(pasteMs)
                 lastText = cleaned
                 print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : ""))
+                if showText { print("   raw: \(joined.text)\n   out: \(cleaned)") }
             } else {
                 results.append(elapsed)
                 lastText = joined.text
                 print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+                if showText { print("   raw: \(joined.text)") }
             }
         } else {
             incremental?.cancel()
