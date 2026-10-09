@@ -52,6 +52,17 @@ struct LogLineTests {
         #expect(entry.formatted().hasSuffix("cleanup_mode=incremental_fallback"))
         #expect(!entry.formatted().contains("text="))
     }
+    @Test func latencyFieldsAreCountsAndLabelsOnly() {
+        var entry = entry()
+        entry.cleanupMode = "single"
+        entry.incrementalSkipped = "none_cleanable_before_finish"
+        entry.hedges = 2
+        entry.hedgeWins = 1
+        #expect(entry.formatted().hasSuffix("cleanup_mode=single incremental_skipped=none_cleanable_before_finish hedges=2 hedge_wins=1"))
+        #expect(!entry.formatted().contains("text="))
+        #expect(!entry.formatted().contains("transcript"))
+    }
+
     @Test func appendFailureReturnsFalse() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

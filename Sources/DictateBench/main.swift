@@ -384,9 +384,10 @@ var lastText: String?
 switch args[1] {
 case "stt-groq-chunked":
     let useV3 = ProcessInfo.processInfo.environment["BENCH_V3"] != "0"
+    let finalSplitSeconds: Double? = ProcessInfo.processInfo.environment["BENCH_FINAL_SPLIT"] == "0" ? nil : 2.0
     let firstMinimumSeconds = useV3 ? 3.0 : 2.0
     let firstMaximumSeconds = useV3 ? 4.0 : 3.0
-    print("variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) lead_in=\(useV3 ? "on" : "off")")
+    print("variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) lead_in=\(useV3 ? "on" : "off") final_split=\(finalSplitSeconds == nil ? "off" : "on")")
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let transport = URLSessionTransport(timeout: 30)
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
@@ -403,7 +404,7 @@ case "stt-groq-chunked":
         let incremental = useIncremental ? IncrementalCleaner(cleaner: cleaner) : nil
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: prompt,
                                            fillerLeadIn: useV3, firstMinimumSeconds: firstMinimumSeconds,
-                                           firstMaximumSeconds: firstMaximumSeconds,
+                                           firstMaximumSeconds: firstMaximumSeconds, finalSplitSeconds: finalSplitSeconds,
                                            onChunkText: { index, text in incremental?.append(index: index, text: text) })
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
@@ -423,7 +424,8 @@ case "stt-groq-chunked":
         }
         let finish = DispatchTime.now()
         incremental?.seal()
-        for chunk in chunker.finish() where chunk.samples.count >= 7_200 { engine.submit(chunk) }
+        let final = chunker.finish(splitOver: finalSplitSeconds)
+        for chunk in final where final.count > 1 || chunk.samples.count >= 7_200 { engine.submit(chunk) }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)
         if joined.failedCount == 0, !joined.text.isEmpty {
@@ -431,12 +433,34 @@ case "stt-groq-chunked":
                 var cleaned = joined.text
                 var mode = incremental?.needsFallback == true ? "incremental_fallback" : "single"
                 var calls = incremental?.callCount ?? 0
-                var reason = "-"
+                var reason = incremental?.fallbackReason ?? "-"
+                var skipped = incremental == nil ? "disabled" : joined.chunks <= 2 ? "short" : "short_text"
                 if TranscriptCleaner.shouldClean(joined.text) {
-                    let output = await incremental?.finish(totalChunks: joined.chunks)
+                    let output = await incremental?.finish(totalChunks: joined.chunks, rawText: joined.text,
+                        single: { fullRaw in
+                            // Match the app's Groq → local → raw fallback, and
+                            // stop before local if the incremental path wins.
+                            if let (text, stats) = try? await cleaner.cleanWithStats(fullRaw) {
+                                return .init(text: text, label: "ok", model: cleaner.model, stats: stats, calls: 1)
+                            }
+                            if Task.isCancelled {
+                                return .init(text: fullRaw, label: "skipped:cancelled", model: cleaner.model, stats: nil, calls: 1)
+                            }
+                            let deadline = max(2.5, 0.8 + Double(fullRaw.count) / 4 / 45)
+                            var local = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline),
+                                endpoint: TranscriptCleaner.ollamaEndpoint, model: TranscriptCleaner.localModel,
+                                vocabulary: cleaner.vocabulary, apiKey: { "ollama" })
+                            local.reloadVocabularyFromHints = cleaner.reloadVocabularyFromHints
+                            local.timeoutInterval = deadline
+                            if let (text, stats) = try? await local.cleanWithStats(fullRaw) {
+                                return .init(text: text, label: "fallback_local", model: local.model, stats: stats, calls: 2)
+                            }
+                            return .init(text: fullRaw, label: "skipped:error", model: local.model, stats: nil, calls: 2)
+                        })
                     mode = output?.mode ?? "single"
                     reason = output?.fallbackReason ?? "-"
                     calls = output?.calls ?? 0
+                    skipped = output?.skippedReason ?? (incremental == nil ? "disabled" : "none_cleanable_before_finish")
                     if let text = output?.text { cleaned = text }
                     else {
                         let fallback = await benchCleanUp(joined.text, groq: cleaner)
@@ -448,16 +472,16 @@ case "stt-groq-chunked":
                 let pasteMs = ms(since: finish)
                 results.append(pasteMs)
                 lastText = cleaned
-                print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason)")
+                print("run \(run) finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : ""))
             } else {
                 results.append(elapsed)
                 lastText = joined.text
-                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
+                print("run \(run) finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
             }
         } else {
             incremental?.cancel()
             let mode = incremental == nil ? "single" : "incremental_fallback"
-            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)" + (endToEnd ? " cleanup_mode=\(mode) cleanup_calls=\(incremental?.callCount ?? 0)" : ""))
+            print("run \(run) chunk_fallback=\(joined.failedCount) chunks=\(joined.chunks)" + (endToEnd ? " cleanup_mode=\(mode) cleanup_calls=\(incremental?.callCount ?? 0)" + (mode == "single" ? " incremental_skipped=disabled" : "") : ""))
         }
     }
 case "stt-apple":
