@@ -701,3 +701,126 @@ struct GroqChunkedTests {
         #expect(!entry.formatted().contains("text="))
     }
 }
+
+@Suite("F3 probe")
+struct F3ProbeTests {
+    @Test func cutKindsAndQuietRun() throws {
+        var paused = PauseChunker()
+        let input = Array(repeating: Int16(0), count: 2400) + Array(repeating: Int16(12000), count: 69600)
+        #expect(paused.append(input).isEmpty)
+        let pause = try #require(paused.append(Array(repeating: 0, count: 3600)).first)
+        #expect(pause.cutKind == .pause)
+        #expect(pause.quietRunMs == 150)
+        var forced = PauseChunker()
+        let hard = try #require(forced.append(input + Array(repeating: 12000, count: 24000)).first)
+        #expect(hard.cutKind == .forced)
+        #expect(hard.quietRunMs == nil)
+        var final = PauseChunker()
+        _ = final.append(Array(repeating: 12000, count: 36000) + Array(repeating: 0, count: 24000))
+        let tail = try #require(final.finish().first)
+        #expect(tail.cutKind == .final)
+        #expect(tail.samples.count == 42000) // V4b trailing trim.
+        var split = PauseChunker(firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+        _ = split.append(Array(repeating: 12000, count: 96000))
+        #expect(split.finish(splitOver: 2).map(\.cutKind) == [.forced, .final])
+    }
+
+    @Test(arguments: ["custom hesitation", "", "DEFAULT", "BOOL_OFF"])
+    func leadInMultipart(value: String) async throws {
+        let transport = ChunkTransport()
+        let override: String? = ["DEFAULT", "BOOL_OFF"].contains(value) ? nil : value
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "k" }, prompt: "DB99",
+            fillerLeadIn: value != "BOOL_OFF", leadIn: override, hedgeAfterMs: 60000)
+        engine.submit(.init(index: 0, samples: Array(repeating: 1000, count: 2400)))
+        await transport.wait(tag: 1000)
+        let body = String(decoding: await transport.request(tag: 1000).httpBody!, as: UTF8.self)
+        let expected = value == "DEFAULT" ? GroqChunkedTranscriber.fillerLeadIn : value == "BOOL_OFF" ? "" : value
+        #expect(body.contains("name=\"prompt\"\r\n\r\n" + (expected.isEmpty ? "" : expected + " ") + "DB99\r\n"))
+        try await transport.respond(tag: 1000)
+        _ = await engine.finish()
+    }
+
+    @Test func finalModelOnlyFinishChunks() async throws {
+        let transport = ChunkTransport()
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "k" }, prompt: "",
+            hedgeAfterMs: 60000, finalModel: "whisper-large-v3")
+        engine.submit(.init(index: 0, samples: Array(repeating: 1000, count: 2400), cutKind: .forced))
+        await transport.wait(tag: 1000)
+        try await transport.respond(tag: 1000)
+        engine.submit(.init(index: 1, samples: Array(repeating: 2000, count: 2400), cutKind: .forced), isFinal: true)
+        engine.submit(.init(index: 2, samples: Array(repeating: 2000, count: 2400)), isFinal: true)
+        let finish = Task { await engine.finish() }
+        await transport.wait(tag: 2000, count: 2)
+        let live = String(decoding: await transport.request(tag: 1000).httpBody!, as: UTF8.self)
+        #expect(live.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"))
+        for attempt in 0..<2 {
+            let body = String(decoding: await transport.request(tag: 2000, attempt: attempt).httpBody!, as: UTF8.self)
+            #expect(body.contains("name=\"model\"\r\n\r\nwhisper-large-v3\r\n"))
+            try await transport.respond(tag: 2000)
+        }
+        let result = await finish.value
+        #expect(result.calls.filter { $0.isFinal }.count == 2)
+        #expect(result.calls.filter { $0.isFinal }.allSatisfy { $0.model == "whisper-large-v3" && $0.milliseconds >= 0 })
+        #expect(result.calls.first?.model == "whisper-large-v3-turbo")
+        #expect(result.rejoins == 0)
+        // Internal finish() must apply the model to BOTH split pieces too.
+        let internalEngine = GroqChunkedTranscriber(transport: transport, apiKey: { "k" }, prompt: "",
+            hedgeAfterMs: 60000, finalSplitSeconds: 2.0, finalModel: "whisper-large-v3")
+        internalEngine.append(Array(repeating: 3000, count: 60000))
+        let internalFinish = Task { await internalEngine.finish() }
+        await transport.wait(tag: 3000, count: 2)
+        for attempt in 0..<2 {
+            let body = String(decoding: await transport.request(tag: 3000, attempt: attempt).httpBody!, as: UTF8.self)
+            #expect(body.contains("name=\"model\"\r\n\r\nwhisper-large-v3\r\n"))
+            try await transport.respond(tag: 3000)
+        }
+        let internalResult = await internalFinish.value
+        #expect(internalResult.calls.count == 2)
+        #expect(internalResult.calls.allSatisfy { $0.isFinal && $0.model == "whisper-large-v3" })
+    }
+
+    @Test func rejoinTriggerControls() {
+        for text in ["other screenshots here", "  IT? TurnoutWatch is still running", "this still running", "the other screenshots"] {
+            #expect(GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: text, cutKind: .pause, quietRunMs: 150))
+            #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "Done.", current: text, cutKind: .forced, quietRunMs: nil))
+        }
+        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: "the screenshots here", cutKind: .pause, quietRunMs: 150))
+        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "Done.", current: "Other teams work", cutKind: .pause, quietRunMs: 150))
+        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: "other screenshots", cutKind: .pause, quietRunMs: 400))
+        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: "other screenshots", cutKind: .final, quietRunMs: 150))
+        #expect(GroqChunkedTranscriber.shouldRejoin(previous: "check it", current: "TurnoutWatch", cutKind: .forced, quietRunMs: nil))
+        #expect(GroqChunkedTranscriber.shouldRejoin(previous: "the DB99", current: "", cutKind: .pause, quietRunMs: 250))
+        #expect(GroqChunkedTranscriber.rejoinTriggers.contains("other "))
+    }
+
+    @Test(arguments: ["disabled", "success", "failure"]) func guardRequestAndReplacement(mode: String) async throws {
+        let enabled = mode != "disabled"
+        let transport = ChunkTransport()
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "k" }, prompt: "",
+            hedgeAfterMs: 60000, rejoinGuard: enabled)
+        engine.submit(.init(index: 0, samples: Array(repeating: 1000, count: 2400), cutKind: .pause, quietRunMs: 150))
+        await transport.wait(tag: 1000)
+        try await transport.respond(tag: 1000, text: "and uh")
+        engine.submit(.init(index: 1, samples: Array(repeating: 2000, count: 2400)), isFinal: true)
+        await transport.wait(tag: 2000)
+        try await transport.respond(tag: 2000, text: "other screenshots")
+        let finish = Task { await engine.finish() }
+        if enabled {
+            await transport.wait(tag: 1000, count: 2)
+            let body = await transport.request(tag: 1000, attempt: 1).httpBody!
+            let riff = try #require(body.range(of: Data("RIFF".utf8)))
+            // 4800 samples at 24 kHz -> 3200 at 16 kHz, 44-byte WAV header.
+            let lengthOffset = riff.lowerBound + 40
+            let length = (0..<4).reduce(UInt32(0)) { $0 | UInt32(body[lengthOffset + $1]) << (8 * $1) }
+            #expect(length == 6400)
+            try await transport.respond(tag: 1000, status: mode == "failure" ? 500 : 200, text: "and the screenshots")
+        }
+        let result = await finish.value
+        #expect(result.text == (mode == "success" ? "and the screenshots" : "and uh other screenshots"))
+        #expect(result.rejoins == (enabled ? 1 : 0))
+        #expect(result.calls.count == (enabled ? 3 : 2))
+        #expect(result.chunks == 2)
+        #expect(await engine.finish().rejoins == result.rejoins)
+        #expect(await transport.count(tag: 1000) == (enabled ? 2 : 1))
+    }
+}

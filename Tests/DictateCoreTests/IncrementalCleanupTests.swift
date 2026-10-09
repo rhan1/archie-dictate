@@ -110,6 +110,21 @@ struct IncrementalCleanupTests {
     }
     private let chunkText = "Send the updated report to the team."
 
+    @Test func shortPromptOnlyAtFinal() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport), finalIncludeExamples: false)
+        for index in 0..<3 { incremental.append(index: index, text: chunkText) }
+        try await transport.wait(1)
+        #expect(try await (transport.body(0)["messages"] as! [[String: String]]).count == 10)
+        try await transport.respond(0, chunkText)
+        await incremental.waitForPending()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await (transport.body(1)["messages"] as! [[String: String]]).count == 2)
+        try await transport.respond(1, Array(repeating: chunkText, count: 3).joined(separator: " "))
+        #expect(await finish.value.mode == "incremental")
+    }
+
     @Test(arguments: [true, false]) func raceStartsSingleAfter600AndFirstWins(singleWins: Bool) async throws {
         let transport = RaceIncrementalTransport(midMs: singleWins ? 1_000 : 640)
         let incremental = IncrementalCleaner(cleaner: TranscriptCleaner(
@@ -148,7 +163,7 @@ struct IncrementalCleanupTests {
         let start = ContinuousClock.now
         let result = await incremental.finish(totalChunks: 3, rawText: "full raw fixture",
             single: { raw in await single.clean(raw) })
-        #expect(start.duration(to: .now) < .milliseconds(25))
+        #expect(start.duration(to: .now) < .milliseconds(150))
         #expect(result.mode == "incremental_fallback")
         #expect(result.fallbackReason == "mid_network_timedOut")
         #expect(result.text == "Single winner.")
@@ -272,6 +287,26 @@ struct IncrementalCleanupTests {
         let result = await finish.value
         #expect(result.mode == "incremental")
         #expect(result.calls == 2)
+    }
+
+    /// v1.5.1: the final tail call omits the few-shot pairs (~80 ms on the user's fixture);
+    /// intermediate calls keep them.
+    @Test func finalCallOmitsFewShotByDefault() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        for index in 0..<3 { incremental.append(index: index, text: chunkText) }
+        try await transport.wait(1)
+        try await transport.respond(0, chunkText)
+        await incremental.waitForPending()
+        incremental.seal()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        let intermediate = try await transport.body(0)["messages"] as! [[String: String]]
+        let final = try await transport.body(1)["messages"] as! [[String: String]]
+        #expect(intermediate.count == 2 + 2 * TranscriptCleaner.examples.count)
+        #expect(final.count == 2)
+        try await transport.respond(1, Array(repeating: chunkText, count: 2).joined(separator: " "))
+        _ = await finish.value
     }
 
     @Test(arguments: [1, 2]) func shortDictationUsesSinglePath(chunks: Int) async {

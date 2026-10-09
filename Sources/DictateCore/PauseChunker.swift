@@ -3,12 +3,21 @@ import Foundation
 /// Pure 24 kHz mono PCM chunking. Quiet runs use 50 ms windows; forced
 /// cuts choose the quietest complete 100 ms window in the last second.
 public struct PauseChunker: Sendable {
+    /// Describes the boundary AFTER this chunk. Final split opening pieces
+    /// are forced cuts; only the last piece has a final boundary.
+    public enum CutKind: String, Sendable { case pause, forced, final }
+
     public struct Chunk: Sendable, Equatable {
         public let index: Int
         public let samples: [Int16]
-        public init(index: Int, samples: [Int16]) {
+        public let cutKind: CutKind
+        /// Observed quiet run at a pause cut, including any quiet before the minimum.
+        public let quietRunMs: Int?
+        public init(index: Int, samples: [Int16], cutKind: CutKind = .final, quietRunMs: Int? = nil) {
             self.index = index
             self.samples = samples
+            self.cutKind = cutKind
+            self.quietRunMs = quietRunMs
         }
     }
 
@@ -62,7 +71,7 @@ public struct PauseChunker: Sendable {
                 // required quiet run AFTER that minimum boundary.
                 let pause = max(quietStart, minimum)
                 if samples.count - pause >= quietSamples {
-                    emitted.append(cut(at: pause))
+                    emitted.append(cut(at: pause, kind: .pause, quietRunMs: (samples.count - quietStart) * 1000 / Self.sampleRate))
                     continue
                 }
             }
@@ -77,14 +86,14 @@ public struct PauseChunker: Sendable {
                 for i in (first + 1)..<(windows.count - 1) where power(at: i) <= power(at: quietest) {
                     quietest = i
                 }
-                emitted.append(cut(at: quietest * Self.windowSamples))
+                emitted.append(cut(at: quietest * Self.windowSamples, kind: .forced))
             }
         }
         return emitted
     }
 
-    private mutating func cut(at count: Int) -> Chunk {
-        let chunk = Chunk(index: nextIndex, samples: Array(samples.prefix(count)))
+    private mutating func cut(at count: Int, kind: CutKind, quietRunMs: Int? = nil) -> Chunk {
+        let chunk = Chunk(index: nextIndex, samples: Array(samples.prefix(count)), cutKind: kind, quietRunMs: quietRunMs)
         nextIndex += 1
         samples.removeFirst(count)
         windows.removeFirst(count / Self.windowSamples)
@@ -146,7 +155,7 @@ public struct PauseChunker: Sendable {
                     }
                 }
                 let split = quietest * Self.windowSamples
-                return [Chunk(index: nextIndex, samples: Array(samples[..<split])),
+                return [Chunk(index: nextIndex, samples: Array(samples[..<split]), cutKind: .forced),
                         Chunk(index: nextIndex + 1, samples: Array(samples[split..<count]))]
             }
         }
