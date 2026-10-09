@@ -93,7 +93,7 @@ public struct PauseChunker: Sendable {
     }
 
     /// The caller decides whether a final partial is long enough to upload.
-    public mutating func finish() -> [Chunk] {
+    public mutating func finish(splitOver seconds: Double? = nil) -> [Chunk] {
         guard !finished else { return [] }
         finished = true
         guard !samples.isEmpty else { return [] }
@@ -127,6 +127,29 @@ public struct PauseChunker: Sendable {
         }
         guard speechEnd > 0 else { return [] }
         let count = min(samples.count, speechEnd + 6_000) // At most 250 ms of quiet.
+        if let seconds, seconds.isFinite, seconds >= 0.5,
+           Double(count) > seconds * Double(Self.sampleRate) {
+            let maximumTail = Int(min(seconds, 2.0) * Double(Self.sampleRate))
+            let minimumTail = Self.sampleRate / 2
+            // Boundaries align to 50 ms; each candidate measures a complete
+            // 100 ms window. The cut is at its start, as for forced cuts.
+            let first = max(1, (count - maximumTail + Self.windowSamples - 1) / Self.windowSamples)
+            let last = min((count - minimumTail) / Self.windowSamples, windows.count - 2)
+            if first <= last {
+                func power(_ index: Int) -> Double {
+                    pow(10, windows[index] / 10) + pow(10, windows[index + 1] / 10)
+                }
+                var quietest = first
+                if first < last {
+                    for index in (first + 1)...last where power(index) <= power(quietest) {
+                        quietest = index
+                    }
+                }
+                let split = quietest * Self.windowSamples
+                return [Chunk(index: nextIndex, samples: Array(samples[..<split])),
+                        Chunk(index: nextIndex + 1, samples: Array(samples[split..<count]))]
+            }
+        }
         let chunk = Chunk(index: nextIndex, samples: Array(samples.prefix(count)))
         return [chunk]
     }
