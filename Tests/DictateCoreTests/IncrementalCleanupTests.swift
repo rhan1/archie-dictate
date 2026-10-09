@@ -110,6 +110,21 @@ struct IncrementalCleanupTests {
     }
     private let chunkText = "Send the updated report to the team."
 
+    @Test func shortPromptOnlyAtFinal() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport), finalIncludeExamples: false)
+        for index in 0..<3 { incremental.append(index: index, text: chunkText) }
+        try await transport.wait(1)
+        #expect(try await (transport.body(0)["messages"] as! [[String: String]]).count == 10)
+        try await transport.respond(0, chunkText)
+        await incremental.waitForPending()
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await (transport.body(1)["messages"] as! [[String: String]]).count == 2)
+        try await transport.respond(1, Array(repeating: chunkText, count: 3).joined(separator: " "))
+        #expect(await finish.value.mode == "incremental")
+    }
+
     @Test(arguments: [true, false]) func raceStartsSingleAfter600AndFirstWins(singleWins: Bool) async throws {
         let transport = RaceIncrementalTransport(midMs: singleWins ? 1_000 : 640)
         let incremental = IncrementalCleaner(cleaner: TranscriptCleaner(
