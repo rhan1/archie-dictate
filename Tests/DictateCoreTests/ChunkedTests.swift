@@ -416,7 +416,7 @@ struct GroqChunkedTests {
     @Test func transcriberFinalSplitUploadsBothConcurrently() async throws {
         let transport = ChunkTransport()
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "",
-            firstMinimumSeconds: 7, firstMaximumSeconds: 8)
+            firstMinimumSeconds: 7, firstMaximumSeconds: 8, finalSplitSeconds: 2.0)
         let pcm = [Int16](repeating: 1000, count: 100_800) +
             [Int16](repeating: 400, count: 2_400) + [Int16](repeating: 2000, count: 40_800)
         engine.append(pcm)
@@ -432,9 +432,22 @@ struct GroqChunkedTests {
         #expect(result.hedges == 0)
     }
 
-    @Test func finalSplitUploadsEvenAShortPrefix() async {
+    /// v1.5.1 live + 22-run shifted-fixture bench: the final split cut "check if
+    /// TurnoutWatch is still running" apart 11/11 (0/11 without it). Off by default.
+    @Test func finalSplitOffByDefault() async {
         let transport = HedgeTransport(.fast)
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "")
+        engine.append([Int16](repeating: 1000, count: 1_200) +
+                      [Int16](repeating: 400, count: 2_400) + [Int16](repeating: 2000, count: 45_600))
+        let result = await engine.finish()
+        #expect(result.chunks == 1)
+        #expect(await transport.requests.count == 1)
+    }
+
+    @Test func finalSplitUploadsEvenAShortPrefix() async {
+        let transport = HedgeTransport(.fast)
+        let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "",
+                                            finalSplitSeconds: 2.0)
         engine.append([Int16](repeating: 1000, count: 1_200) +
                       [Int16](repeating: 400, count: 2_400) + [Int16](repeating: 2000, count: 45_600))
         let result = await engine.finish()
