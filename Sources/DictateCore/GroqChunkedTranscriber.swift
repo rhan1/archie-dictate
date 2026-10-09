@@ -64,7 +64,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
                 fillerLeadIn: Bool = true, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
-                hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = 2.0,
+                hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = nil,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint

@@ -386,7 +386,7 @@ var lastText: String?
 switch args[1] {
 case "stt-groq-chunked":
     let useV3 = ProcessInfo.processInfo.environment["BENCH_V3"] != "0"
-    let finalSplitSeconds: Double? = ProcessInfo.processInfo.environment["BENCH_FINAL_SPLIT"] == "0" ? nil : 2.0
+    let finalSplitSeconds: Double? = ProcessInfo.processInfo.environment["BENCH_FINAL_SPLIT"] == "1" ? 2.0 : nil
     let firstMinimumSeconds = useV3 ? 3.0 : 2.0
     let firstMaximumSeconds = useV3 ? 4.0 : 3.0
     print("variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) lead_in=\(useV3 ? "on" : "off") final_split=\(finalSplitSeconds == nil ? "off" : "on")")
