@@ -522,18 +522,32 @@ public final class AppController {
                 if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
                     incrementalSession?.cancel()
                     pipeline.cleanup = "skipped:short"
+                    timeline.incrementalSkipped = pipeline.path != "groq-chunked" ? "not_chunked" :
+                        (pipeline.chunks ?? 0) <= 2 ? "short" : "short_text"
                 } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
-                    if pipeline.path != "groq-chunked" { incrementalSession?.cancel() }
-                    let incremental = await incrementalSession?.finish(totalChunks: pipeline.chunks ?? 0)
+                    let incremental: IncrementalCleaner.Result?
+                    if pipeline.path == "groq-chunked", let incrementalSession {
+                        incremental = await incrementalSession.finish(totalChunks: pipeline.chunks ?? 0, rawText: raw,
+                            single: { fullRaw in
+                                let outcome = await Self.cleanUp(fullRaw, groq: groqCleaner, local: localCleaner)
+                                return .init(text: outcome.text, label: outcome.label, model: outcome.model,
+                                             stats: outcome.stats, calls: outcome.calls)
+                            })
+                    } else {
+                        incrementalSession?.cancel()
+                        incremental = nil
+                    }
                     guard await MainActor.run(body: { myGeneration === self.generation && self.machine.state == .transcribing }) else { return }
                     pipeline.cleanupMode = incremental?.mode ?? "single"
                     timeline.cleanupCalls = incremental?.calls ?? 0
                     timeline.cleanupFallbackReason = incremental?.fallbackReason
-                    if let text = incremental?.text, pipeline.path == "groq-chunked" {
+                    timeline.incrementalSkipped = incremental?.skippedReason ??
+                        (pipeline.path != "groq-chunked" ? "not_chunked" : nil)
+                    if let text = incremental?.text {
                         pipeline.text = text
-                        pipeline.cleanup = "ok"
-                        pipeline.cleanupModel = groqCleaner.model
+                        pipeline.cleanup = incremental?.single?.label ?? "ok"
+                        pipeline.cleanupModel = incremental?.single?.model ?? groqCleaner.model
                         timeline.cleanup = incremental?.stats
                     } else {
                         let outcome = await Self.cleanUp(raw, groq: groqCleaner, local: localCleaner)
@@ -546,6 +560,11 @@ public final class AppController {
                     pipeline.cleanupMs = Int(Date().timeIntervalSince(cleanStart) * 1000)
                 }
                 timeline.cleanupMode = pipeline.cleanupMode
+            }
+            if fake != nil { timeline.incrementalSkipped = "disabled_fake" }
+            timeline.cleanupMode = pipeline.cleanupMode
+            if pipeline.cleanupMode == "single", timeline.incrementalSkipped == nil {
+                timeline.incrementalSkipped = pipeline.path == "groq-chunked" ? "none_cleanable_before_finish" : "not_chunked"
             }
             if let shadow, case .success(let raw) = result {
                 let pastedNames = ShadowScore.nameCount(pipeline.text ?? raw)
@@ -567,6 +586,9 @@ public final class AppController {
                 let entry = { (chars: Int, app: String, outcome: DictationOutcome) -> DictationLogEntry in
                     var e = DictationLogEntry(time: Date(), durationSeconds: duration, audioBytes: bytes, latencyMs: latency,
                                               chars: chars, frontmostBundleID: app, outcome: outcome)
+                    e.incrementalSkipped = report.cleanupMode == "single" ? finalTimeline.incrementalSkipped : nil
+                    e.hedges = finalTimeline.chunked?.hedges
+                    e.hedgeWins = finalTimeline.chunked?.hedgeWins
                     if fake == nil {
                         e.path = report.path
                         e.sttMs = report.sttMs
@@ -585,7 +607,8 @@ public final class AppController {
                     let text = report.text ?? raw
                     if fake == nil, ShadowScore.overlap(raw) >= 0.60 {
                         Self.note(ShadowScore.namesLine(rawNames: ShadowScore.nameCount(raw),
-                                                       pastedNames: ShadowScore.nameCount(text), path: report.path))
+                                                       pastedNames: ShadowScore.nameCount(text), path: report.path,
+                                                       pastedText: text))
                     }
                     let start = self.recordingTarget
                     self.inserter.insert(text, shouldInsert: {
@@ -640,6 +663,7 @@ public final class AppController {
         if let (text, stats) = try? await groq.cleanWithStats(raw) {
             return (text, "ok", groq.model, stats, 1)
         }
+        if Task.isCancelled { return (raw, "skipped:cancelled", groq.model, nil, 1) }
         let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
         var timedLocal = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline), endpoint: local.endpoint,
                                            model: local.model, vocabulary: local.vocabulary, apiKey: local.apiKey)
@@ -676,6 +700,7 @@ public final class AppController {
         var cleanupMode = "single"
         var cleanupCalls = 0
         var cleanupFallbackReason: String?
+        var incrementalSkipped: String?
 
         func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
@@ -690,12 +715,14 @@ public final class AppController {
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
                 "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)",
             ]
-            if cleanupMode == "incremental_fallback" {
-                fields.append("fallback_reason=\(cleanupFallbackReason ?? "unknown")")
+            if let cleanupFallbackReason { fields.append("fallback_reason=\(cleanupFallbackReason)") }
+            if cleanupMode == "single", let incrementalSkipped {
+                fields.append("incremental_skipped=\(incrementalSkipped)")
             }
             if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
+                           "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
                            "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
                 for call in chunked.calls {

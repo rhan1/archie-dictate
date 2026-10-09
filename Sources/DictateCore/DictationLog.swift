@@ -31,6 +31,9 @@ public struct DictationLogEntry: Equatable, Sendable {
     public var cleanupModel: String?
     public var cleanup: String?
     public var cleanupMode: String?
+    public var incrementalSkipped: String?
+    public var hedges: Int?
+    public var hedgeWins: Int?
     public var chunks: Int?
     public var lastChunkMs: Int?
     public var chunkFallback: Int?
@@ -62,6 +65,9 @@ public struct DictationLogEntry: Equatable, Sendable {
         if let cleanupModel { line += " model=\(cleanupModel)" }
         if let cleanup { line += " cleanup=\(cleanup)" }
         if let cleanupMode { line += " cleanup_mode=\(cleanupMode)" }
+        if let incrementalSkipped { line += " incremental_skipped=\(incrementalSkipped)" }
+        if let hedges { line += " hedges=\(hedges)" }
+        if let hedgeWins { line += " hedge_wins=\(hedgeWins)" }
         return line
     }
 }
