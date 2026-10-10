@@ -75,7 +75,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
                            (UInt32(data[chunkStart + 6]) << 16) |
                            (UInt32(data[chunkStart + 7]) << 24)
                 let bits = UInt16(data[chunkStart + 14]) | (UInt16(data[chunkStart + 15]) << 8)
-                guard format == 1, channels == 1, rate == 24_000, bits == 16 else {
+                // WAVE_FORMAT_EXTENSIBLE (0xFFFE, what afconvert writes) counts as PCM when its
+                // subformat GUID is KSDATAFORMAT_SUBTYPE_PCM (00000001-0000-0010-8000-00aa00389b71).
+                let pcmGUID: [UInt8] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]
+                let isPCM = format == 1 || (format == 0xFFFE && size >= 40 && chunkEnd - chunkStart >= 40
+                    && Array(data[(chunkStart + 24)..<(chunkStart + 40)]) == pcmGUID)
+                guard isPCM, channels == 1, rate == 24_000, bits == 16 else {
                     throw AudioRecorder.RecorderError.noInput
                 }
                 foundFmt = true
@@ -97,12 +102,13 @@ public final class WAVInjectedRecorder: EngineRecorder {
     }
 
     public func start(device: MicChoice = .default) throws {
+        // Parse before taking the lock: a throw must never leave it held (isRunning is read next).
+        let parsed = try Self.parseWAV(at: url)
         lock.lock()
         if timer != nil {
             lock.unlock()
             return
         }
-        let parsed = try Self.parseWAV(at: url)
         wavSamples = parsed
         sampleCursor = 0
         firstBufferFired = false
