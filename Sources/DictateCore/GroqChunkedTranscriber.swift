@@ -5,20 +5,30 @@ import Foundation
 public final class GroqChunkedTranscriber: @unchecked Sendable {
     public static let fillerLeadIn = "Um, so, uh, like, Tuesday, no, Wednesday."
 
-    /// Prefix triggers followed by the two split-fragment suffix triggers.
+    /// A chunk that starts like this is probably the tail of a split "uh, the X".
     /// Keep this small list public so probe runs can tune it in one place.
-    public static let rejoinTriggers = ["other ", "it?", "this ", "the other ", "check it", "the db99"]
+    public static let rejoinTriggers = ["other ", "it?"]
+    /// The previous chunk ending like this is the other half of the R5 "check it? TurnoutWatch this" split.
+    static let rejoinSuffixes = ["check it", "check it?"]
+    /// Bounded cost: at most this many pair requests per dictation (one per boundary).
+    public static let maxRejoins = 2
+
+    /// DICTATE_REJOIN_GUARD=0 turns the guard off; anything else (or unset) leaves it on.
+    public static func rejoinGuardEnabled(environment: [String: String]) -> Bool {
+        environment["DICTATE_REJOIN_GUARD"] != "0"
+    }
 
     public static func shouldRejoin(previous: String, current: String,
                                     cutKind: PauseChunker.CutKind, quietRunMs: Int?) -> Bool {
         guard cutKind == .forced || (cutKind == .pause && quietRunMs.map { $0 < 400 } == true) else { return false }
         let before = previous.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let after = current.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !before.isEmpty, !before.hasSuffix("."), !before.hasSuffix("?"), !before.hasSuffix("!") else { return false }
-        if rejoinTriggers.prefix(4).contains(where: { after.hasPrefix($0) }) { return true }
-        // Exact word boundaries avoid triggering on e.g. "doublecheck it".
-        func ends(_ suffix: String) -> Bool { before == suffix || before.hasSuffix(" " + suffix) }
-        return ends(rejoinTriggers[4]) || (ends(rejoinTriggers[5]) && after.isEmpty)
+        let after = String(current.lowercased().drop { $0.isWhitespace || $0.isPunctuation })
+        guard !before.isEmpty else { return false }
+        // Exact word boundaries avoid triggering on e.g. "doublecheck it". Checked before the
+        // sentence-end guard because the fragment itself ends in "?".
+        if rejoinSuffixes.contains(where: { before == $0 || before.hasSuffix(" " + $0) }) { return true }
+        guard !before.hasSuffix("."), !before.hasSuffix("?"), !before.hasSuffix("!") else { return false }
+        return rejoinTriggers.contains { after.hasPrefix($0) }
     }
 
     public struct RateLimits: Sendable, Equatable {
@@ -293,15 +303,17 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             return tasks
         }
         for task in pending { await task.value }
-        if rejoinGuard {
-            let guardTask = lock.withLock {
-                if let rejoinTask { return rejoinTask }
-                let task = Task.detached { [self] in await rejoinBoundaries() }
-                rejoinTask = task
-                return task
-            }
-            await guardTask.value
+        // No candidate boundary -> no task and no extra await on the hot path.
+        let guardTask: Task<Void, Never>? = lock.withLock {
+            if let rejoinTask { return rejoinTask }
+            guard rejoinGuard, !cancelled else { return nil }
+            let plan = plannedRejoins()
+            guard !plan.isEmpty else { originalChunks.removeAll(); return nil }
+            let task = Task.detached { [self] in await rejoinBoundaries(plan) }
+            rejoinTask = task
+            return task
         }
+        await guardTask?.value
         return lock.withLock {
             let start = finishAt!
             let lastMs = lastResponse.map { $0 > start ? Int(($0 - start) / 1_000_000) : 0 } ?? 0
@@ -313,21 +325,32 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         }
     }
 
-    /// Operate on adjacent ORIGINAL chunks only; don't reuse PCM or text from
-    /// a successful pair in an overlapping pair. A failure leaves both intact.
-    private func rejoinBoundaries() async {
-        let snapshot = lock.withLock { (originalChunks, texts, failures) }
-        guard !lock.withLock({ cancelled }) else { return }
+    /// Boundary indices (the current chunk of each pair) worth one pair request. Adjacent ORIGINAL
+    /// chunks only: a chunk in one planned pair is never reused in another. Called with the lock held.
+    private func plannedRejoins() -> [Int] {
         var consumed: Set<Int> = []
-        for index in snapshot.0.keys.sorted() where index >= 1 {
-            guard !Task.isCancelled, !lock.withLock({ cancelled }),
-                  !consumed.contains(index - 1), !consumed.contains(index),
-                  !snapshot.2.contains(index - 1), !snapshot.2.contains(index),
-                  let previous = snapshot.0[index - 1], let current = snapshot.0[index],
-                  let before = snapshot.1[index - 1], let after = snapshot.1[index],
+        var plan: [Int] = []
+        for index in originalChunks.keys.sorted() where index >= 1 && plan.count < Self.maxRejoins {
+            guard !consumed.contains(index - 1), !consumed.contains(index),
+                  !failures.contains(index - 1), !failures.contains(index),
+                  let previous = originalChunks[index - 1], let current = originalChunks[index],
+                  let before = texts[index - 1], let after = texts[index],
                   Self.shouldRejoin(previous: before, current: after,
                                     cutKind: previous.cutKind, quietRunMs: previous.quietRunMs) else { continue }
             consumed.formUnion([index - 1, index])
+            plan.append(index)
+        }
+        return plan
+    }
+
+    /// One request per planned boundary, no hedge or retry. A failure leaves both chunks intact; a
+    /// success replaces them (joined text on index-1, "" on index) and re-emits both through
+    /// onChunkText so the incremental cleaner can drop anything it already cleaned from them.
+    private func rejoinBoundaries(_ plan: [Int]) async {
+        let snapshot = lock.withLock { (originalChunks, texts) }
+        for index in plan {
+            guard !Task.isCancelled, !lock.withLock({ cancelled }),
+                  let previous = snapshot.0[index - 1], let current = snapshot.0[index] else { continue }
             let start = DispatchTime.now().uptimeNanoseconds
             let model = client.modelName
             let response: Response
@@ -342,17 +365,21 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 response = await send(request) // Exactly one request, no hedge or retry.
             } catch { response = Response(text: nil, http: nil) }
             guard !Task.isCancelled else { return }
-            lock.withLock {
+            let joined: String? = lock.withLock {
                 rejoins += 1
                 calls.append(Call(index: index, attempt: 1, model: model, isFinal: false, isRejoin: true,
                                   milliseconds: Self.ms(from: start), status: response.http?.statusCode,
                                   hedgeFired: false, winningRequest: response.text == nil ? nil : 1))
                 if let http = response.http { limits = RateLimits(response: http) }
                 lastResponse = DispatchTime.now().uptimeNanoseconds
-                if let text = response.text, !text.isEmpty {
-                    texts[index - 1] = text
-                    texts[index] = ""
-                }
+                guard let text = response.text, !text.isEmpty else { return nil }
+                texts[index - 1] = text
+                texts[index] = ""
+                return text
+            }
+            if let joined {
+                onChunkText?(index - 1, joined)
+                onChunkText?(index, "")
             }
         }
         lock.withLock { originalChunks.removeAll() }
