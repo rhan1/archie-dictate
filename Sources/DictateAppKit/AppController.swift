@@ -16,6 +16,11 @@ public final class AppController {
     var engineOnState: ((DictateAppKit.DictationState) -> Void)?
     var engineOnTranscript: ((String, DictationTimeline) -> Void)?
     private let rateLimitRelay = EngineRateLimitRelay()
+    /// One STT session for the app's life: every recording's chunks and the keep-warm ping share its connection.
+    private let sttTransport: HTTPTransport
+    private var keepWarm: GroqKeepWarm?
+    var keepWarmScheduled: Bool { keepWarm != nil }
+    var keepWarmPings: Int { keepWarm?.pings ?? 0 }
     var engineOnGroqRateLimit: ((GroqRateLimit) -> Void)? {
         get { MainActor.assumeIsolated { rateLimitRelay.callback } }
         set { MainActor.assumeIsolated { rateLimitRelay.callback = newValue } }
@@ -104,7 +109,8 @@ public final class AppController {
         groq.reasoningEffort = "none"
         groq.reloadVocabularyFromHints = true
         groqCleaner = groq
-        let shadowTransport = EngineGroqTransport(transport: dependencies?.sttTransport ?? URLSessionTransport(timeout: 30),
+        sttTransport = dependencies?.sttTransport ?? URLSessionTransport(timeout: 30)
+        let shadowTransport = EngineGroqTransport(transport: sttTransport,
             observer: { [rateLimitRelay] in rateLimitRelay.observe($0) })
         var whisper = TranscriptionClient(transport: shadowTransport, apiKey: groqKey)
         whisper.endpointURL = TranscriptionClient.groqEndpoint
@@ -118,6 +124,10 @@ public final class AppController {
             let hints = VocabHints.promptSentence(VocabHints.load(fileURL: paths.vocabularyURL))
             localCleaner.hintsSentence = hints
             groqCleaner.hintsSentence = hints
+        }
+        // Real network pings only in production wiring: injected fakes and fake transcripts never schedule any.
+        if dependencies == nil, fakeTranscript == nil, GroqKeepWarm.isEnabled() {
+            keepWarm = GroqKeepWarm(ping: { [weak self] in await self?.keepWarmPing() })
         }
     }
 
@@ -149,6 +159,7 @@ public final class AppController {
             retryTapUntilGranted()
         }
         if !trusted { watchAccessibilityGrant() }
+        AppController.note(keepWarm == nil ? "keepwarm=off" : "keepwarm=on interval_s=\(Int(GroqKeepWarm.interval)) idle_cap_s=\(Int(GroqKeepWarm.idleCap))")
         if fakeTranscript == nil {
             warmLocalModel()
             Task { await AppleTranscriber.ensureAssets() }
@@ -170,7 +181,9 @@ public final class AppController {
         configureCapture()
         pill.onCancel = { [weak self] in self?.cancel() }
         pill.onFinish = { [weak self] in self?.finishButton() }
+        keepWarm?.activity()   // idle from launch: ping every 4 min for the first 2 h
         pill.onMode = { [weak self] mode in
+            self?.keepWarmMode(mode)
             switch mode {
             case .warming: self?.engineOnState?(.warming)
             case .recording: self?.engineOnState?(.recording(level: 0))
@@ -257,10 +270,40 @@ public final class AppController {
             if fakeTranscript == nil, engineMode == .dictate {
                 if forceFallback == nil { Task { [groqCleaner] in await groqCleaner.warmUp() } }
                 warmLocalModel()
+                keepWarmTap()
             }
             prewarmEngine()
         }
         perform(machine.handle(signal))
+    }
+
+    /// Activity restarts the idle clock; a dictation in flight is never pinged (its own requests warm the connection).
+    private func keepWarmMode(_ mode: PillPanel.Mode) {
+        guard let keepWarm else { return }
+        keepWarm.setBusy(mode == .warming || mode == .recording || mode == .transcribing)
+        keepWarm.activity()
+    }
+
+    /// First tap: also warm the STT session (the cleanup session is warmed above); the first chunk is the latency that matters.
+    private func keepWarmTap() {
+        guard let keepWarm, forceFallback != .quota else { return }
+        keepWarm.activity()
+        Task { await warmSTTSession() }
+    }
+
+    private func warmSTTSession() async {
+        guard let key = keyStore.key(for: "groq-api"), !key.isEmpty else { return }
+        if let (_, response) = try? await sttTransport.send(TranscriptCleaner.makeGroqWarmRequest(key: key)) {
+            rateLimitRelay.observe(GroqRateLimit(response: response, endpoint: .stt))
+        }
+    }
+
+    /// One keep-warm tick: GET /models on both Groq sessions (STT, and cleanup in dictate mode).
+    private func keepWarmPing() async {
+        let plan = await MainActor.run { (forceFallback != .quota, engineMode == .dictate) }
+        guard plan.0 else { return }
+        await warmSTTSession()
+        if plan.1 { await groqCleaner.warmUp() }
     }
 
     private func warmLocalModel() {
@@ -497,7 +540,7 @@ public final class AppController {
                 let keys = keyStore
                 let incremental = sessionPolicy.usesCleanup ? IncrementalCleaner(cleaner: groqCleaner) : nil
                 incrementalCleaner = incremental
-                let streaming = GroqChunkedTranscriber(transport: dependencies?.sttTransport ?? URLSessionTransport(timeout: 30), apiKey: {
+                let streaming = GroqChunkedTranscriber(transport: sttTransport, apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
                     return key
                 }, prompt: prompt, onChunkText: { index, text in incremental?.append(index: index, text: text) },
@@ -570,6 +613,7 @@ public final class AppController {
         var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn, btStart: btStart,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
+        timeline.keepWarmPings = keepWarmPings
         Task {
             var pipeline = PipelineReport()
             var shadow: Task<(appleNames: Int, groqNames: Int, milliseconds: Int)?, Never>?
@@ -803,6 +847,7 @@ public final class AppController {
         var cleanupCalls = 0
         var cleanupFallbackReason: String?
         var incrementalSkipped: String?
+        var keepWarmPings = 0
 
         func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
@@ -816,7 +861,7 @@ public final class AppController {
                 "path=\(path)", "stt_ms=\(sttMs.map(String.init) ?? "-")",
                 "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
-                "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)",
+                "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)", "keepwarm_pings=\(keepWarmPings)",
             ]
             if let cleanupFallbackReason { fields.append("fallback_reason=\(cleanupFallbackReason)") }
             if cleanupMode == "single", let incrementalSkipped {

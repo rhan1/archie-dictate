@@ -192,6 +192,14 @@ public struct TranscriptCleaner: Sendable {
         return request
     }
 
+    /// GET /models: cheap, and it holds the keep-alive connection of whichever session sends it.
+    public static func makeGroqWarmRequest(key: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/models")!)
+        request.timeoutInterval = 2
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
     /// Call in an unawaited task so loading or TLS never delays dictation.
     public func warmUp() async {
         if isLocal {
@@ -199,10 +207,7 @@ public struct TranscriptCleaner: Sendable {
             return
         }
         guard let key = try? apiKey(), !key.isEmpty else { return }
-        var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/models")!)
-        request.timeoutInterval = 2
-        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        if let (_, response) = try? await transport.send(request) {
+        if let (_, response) = try? await transport.send(Self.makeGroqWarmRequest(key: key)) {
             onGroqRateLimit?(GroqRateLimit(response: response, endpoint: .cleanup))
         }
     }
