@@ -232,7 +232,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         buffer.removeAll()
         firstBufferFired = false
         var remainder: [Int16] = []
-        if scenario == .headsetZeros {
+        if scenario == .headsetZeros, feed.bridge.state != .off {
             stats.bridgeSource = feed.bridge.bridgeSource
             stats.bridgeReason = feed.bridge.reason
             stats.headsetRestart = feed.bridge.restart?.result

@@ -34,6 +34,9 @@ public struct CaptureBridge {
     public static let fallbackAfter: TimeInterval = 1.5
     public static let switchbackAfter: TimeInterval = 0.5
     public static let restartAfter: TimeInterval = 0.7
+    /// No headset buffer at all for this long while it carries (IO stopped, not zeros):
+    /// longer than `switchbackAfter` because Bluetooth timestamps trail the built-in's.
+    public static let headsetStaleAfter: TimeInterval = 1.0
     private static let rate = 24_000.0
 
     public private(set) var state: State = .off
@@ -53,7 +56,11 @@ public struct CaptureBridge {
     private var fedThrough: TimeInterval?
     /// The built-in engine is still running and can carry the dictation again.
     private var builtinAlive = false
+    /// The default input is a Bluetooth headset: its digital silence is watched (H1/H2).
+    private var bluetooth = false
+    private var fallbackReason = "headset_digital_silence"
     private var firstHeadsetTime: TimeInterval?
+    private var lastHeadsetEnd: TimeInterval?
     private var headsetSignalFrames = 0
     private var headsetSilentFrames = 0
     public init() {}
@@ -61,7 +68,7 @@ public struct CaptureBridge {
     /// Timeline reason: a skip, a fallback, or a bridge whose built-in engine delivered no audio.
     public var reason: String? {
         if let skipReason { return skipReason }
-        if bridgeSource == "builtin_fallback" { return "headset_digital_silence" }
+        if bridgeSource == "builtin_fallback" { return fallbackReason }
         return bridgeSource == "builtin" && builtinFrames == 0 ? "builtin_no_audio" : nil
     }
 
@@ -72,6 +79,7 @@ public struct CaptureBridge {
         if defaultInput == .builtin { skipReason = "default_builtin" }
         else if defaultInput != .bluetooth { skipReason = "not_bluetooth" }
         else if !hasBuiltin { skipReason = "no_builtin" }
+        bluetooth = defaultInput == .bluetooth
         if skipReason == nil { state = .builtinOnly; bridgeSource = "builtin"; builtinAlive = true }
         else { state = .switched }
     }
@@ -95,11 +103,16 @@ public struct CaptureBridge {
         if let token, token !== epoch { return Decision() }
         guard state != .off, frames > 0 else { return Decision() }
         var result = Decision()
-        if source == .headset, bridgeSource != "none" { arbitrate(&result, at: time, frames: frames,
-                                                                  arrivedAt: arrivedAt, peak: peak) }
-        if source == .builtin, state == .builtinOnly, let first = firstHeadsetTime,
-           time + Double(frames) / Self.rate - first >= Self.fallbackAfter {
+        if source == .headset, bluetooth { arbitrate(&result, at: time, frames: frames,
+                                                     arrivedAt: arrivedAt, peak: peak) }
+        let end = time + Double(frames) / Self.rate
+        if source == .builtin, state == .builtinOnly, let first = firstHeadsetTime, end - first >= Self.fallbackAfter {
             fallBack(&result)
+        }
+        // A headset that stops delivering buffers altogether (IO stopped, not zeros).
+        if source == .builtin, canSwitchBack, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
+            switchBack(&result)
+            return result    // the owner replays this buffer from standby, after the frames it missed
         }
         let feeds = (source == .builtin && (state == .builtinOnly || state == .fallback)) ||
                     (source == .headset && state == .switched)
@@ -127,6 +140,7 @@ public struct CaptureBridge {
     private mutating func arbitrate(_ result: inout Decision, at time: TimeInterval, frames: Int,
                                     arrivedAt: TimeInterval?, peak: Float) {
         if firstHeadsetTime == nil { firstHeadsetTime = time }
+        lastHeadsetEnd = time + Double(frames) / Self.rate
         if peak >= Self.silencePeak {
             headsetSignalFrames += frames
             headsetSilentFrames = 0
@@ -138,7 +152,7 @@ public struct CaptureBridge {
         let silent = Double(headsetSilentFrames) / Self.rate
         if signal >= Self.takeoverSignal, restart?.restarted == true { restart?.signalAfter = true }
         switch state {
-        case .builtinOnly:
+        case .builtinOnly where bridgeSource != "none":
             if signal >= Self.takeoverSignal {
                 state = .switched
                 result.releaseBuiltin = true
@@ -150,12 +164,11 @@ public struct CaptureBridge {
                 fallBack(&result)
             }
         case .switched where builtinAlive && silent > Self.switchbackAfter:
-            state = .fallback
-            switchbacks += 1
-            result.event = .switchback
+            switchBack(&result)
         default: break
         }
-        if silent >= Self.restartAfter, builtinAlive, state != .switched, restart == nil {
+        // The one restart runs while the built-in carries, or when nothing else could.
+        if silent >= Self.restartAfter, restart == nil, !builtinAlive || state != .switched {
             restart = HeadsetRestartState()
             result.restartHeadset = true
         }
@@ -165,6 +178,28 @@ public struct CaptureBridge {
         state = .fallback
         bridgeSource = "builtin_fallback"
         result.event = .fallback
+    }
+
+    private mutating func switchBack(_ result: inout Decision) {
+        state = .fallback
+        switchbacks += 1
+        result.event = .switchback
+    }
+
+    /// The headset engine failed for good. Returns the event when the built-in carries on
+    /// (nil: nothing else can carry the dictation).
+    public mutating func headsetFailed() -> Event? {
+        guard builtinAlive else { return nil }
+        var result = Decision()
+        switch state {
+        case .builtinOnly:
+            fallbackReason = "headset_engine_failed"
+            fallBack(&result)
+        case .switched: switchBack(&result)
+        case .fallback: return .fallback
+        case .off: return nil
+        }
+        return result.event
     }
 
     /// The headset carries and the built-in could take over again.
@@ -179,8 +214,9 @@ public struct CaptureBridge {
     }
 
     /// The owner restarted the headset engine (H2); later signal marks the retry a success.
-    public mutating func headsetRestarted() {
-        restart?.restarted = true
+    public mutating func headsetRestarted(started: Bool = true) {
+        restart?.restarted = started
+        restart?.failed = !started
         headsetSignalFrames = 0
     }
 
@@ -193,6 +229,8 @@ public struct CaptureBridge {
         tapTime = nil
         fedThrough = nil
         builtinAlive = false
+        restart = nil
+        switchbacks = 0
         return release
     }
 
@@ -216,6 +254,7 @@ public struct CaptureBridge {
 /// H2: at most one clean headset restart per dictation; `result` is the timeline value.
 public struct HeadsetRestartState: Equatable, Sendable {
     public var restarted = false
+    public var failed = false
     public var signalAfter = false
-    public var result: String { signalAfter ? "signal" : "still_silent" }
+    public var result: String { failed ? "failed" : signalAfter ? "signal" : "still_silent" }
 }

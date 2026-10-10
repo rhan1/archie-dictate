@@ -343,7 +343,8 @@ struct CaptureBridgeTests {
         #expect(restarts == 1)
     }
 
-    @Test func noRestartWhenTheHeadsetIsTheOnlySource() {
+    @Test func headsetAsTheOnlySourceStillGetsItsOneRestart() {
+        // No built-in to carry: zeros are all there is, so the one restart is free (review #4).
         var feed = CaptureFeed()
         feed.start(defaultInput: .bluetooth, hasBuiltin: false)
         _ = feed.recordingStarted(at: 10, preRoll: 0)
@@ -353,7 +354,70 @@ struct CaptureBridgeTests {
             if h.restartHeadset { restarts += 1 }
             fed += h.frames.count
         }
-        #expect(restarts == 0 && fed == 20 * 2400)
+        #expect(restarts == 1 && fed == 20 * 2400)
+        var usb = CaptureFeed()
+        usb.start(defaultInput: .other, hasBuiltin: true)                   // not Bluetooth: never
+        _ = usb.recordingStarted(at: 10, preRoll: 0)
+        #expect((0..<20).allSatisfy { !usb.accept(zeros, source: .headset, at: 10 + Double($0) * 0.1).restartHeadset })
+    }
+
+    @Test func failedRestartIsReportedAsFailed() {
+        var feed = feedStarted()
+        for i in 0..<8 {
+            let t = 10 + Double(i) * 0.1
+            _ = feed.accept(tone(0.05), source: .builtin, at: t)
+            if feed.accept(zeros, source: .headset, at: t).restartHeadset { feed.headsetRestarted(started: false) }
+        }
+        #expect(feed.bridge.restart?.result == "failed")
+        feed.cancel()
+        #expect(feed.bridge.restart == nil && feed.bridge.switchbacks == 0) // a second stop logs nothing
+    }
+
+    // MARK: v1.7 review fixes — the headset engine fails or stops delivering
+
+    @Test func headsetEngineFailureWhileTheBuiltinBridgesFallsBack() {
+        var feed = feedStarted()
+        _ = feed.accept(tone(0.05), source: .builtin, at: 10)
+        let failed = feed.headsetFailed()
+        #expect(failed.event == .fallback && failed.frames.isEmpty)
+        #expect(feed.bridge.bridgeSource == "builtin_fallback" && feed.bridge.reason == "headset_engine_failed")
+        #expect(feed.accept(tone(0.05), source: .builtin, at: 10.1).frames.count == 2400)
+    }
+
+    @Test func headsetEngineFailureAfterTakeoverResumesTheBuiltinWithoutAGap() {
+        var feed = feedStarted()
+        var total = 0
+        for i in 0..<5 {                                                    // headset carries from 10.1
+            let t = 10 + Double(i) * 0.1
+            total += feed.accept(tone(0.05), source: .builtin, at: t).frames.count
+            total += feed.accept(tone(0.05), source: .headset, at: t + 0.03).frames.count
+        }
+        _ = feed.accept(tone(0.05), source: .builtin, at: 10.5)             // into standby
+        let failed = feed.headsetFailed()
+        #expect(failed.event == .switchback)
+        total += failed.frames.count
+        total += feed.accept(tone(0.05), source: .builtin, at: 10.6).frames.count
+        #expect(total == Int(0.7 * 24_000))                                // 10.0 → 10.7 contiguous
+        var none = CaptureFeed()
+        none.start(defaultInput: .bluetooth, hasBuiltin: false)
+        #expect(none.headsetFailed().event == nil)                          // nothing carries: the owner fails
+    }
+
+    @Test func headsetThatStopsDeliveringHandsBackOnBuiltinBuffers() {
+        var feed = feedStarted()
+        var timeline: [Int] = [], events: [CaptureBridge.Event] = []
+        for i in 0..<20 {
+            let t = 10 + Double(i) * 0.1
+            let b = feed.accept(tone(0.05), source: .builtin, at: t)
+            timeline.append(b.frames.count)
+            events += [b.event].compactMap { $0 }
+            if i < 5 {                                                      // headset IO stops at 10.53 (> 1 s → 11.6)
+                let h = feed.accept(tone(0.05), source: .headset, at: t + 0.03)
+                timeline.append(h.frames.count)
+            }
+        }
+        #expect(events == [.switchback] && feed.bridge.switchbacks == 1)
+        #expect(timeline.reduce(0, +) == 2 * 24_000)                       // 10.0 → 12.0 contiguous
     }
 
     // MARK: D-a — built-in selection keeps the headset's client format
