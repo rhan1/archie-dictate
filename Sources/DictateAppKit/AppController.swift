@@ -887,7 +887,7 @@ public final class AppController {
                 retryGroq.timeoutInterval = groq.timeoutInterval
                 calls += 1
                 if let (text, stats) = try? await retryGroq.cleanWithStats(raw) {
-                    return (text, "cleanup_model_fallback=\(TranscriptCleaner.retryModel)", TranscriptCleaner.retryModel, stats, calls)
+                    return (text, "cleanup_model_fallback=\(TranscriptCleaner.retryModelLogName)", TranscriptCleaner.retryModel, stats, calls)
                 }
             } catch {}
         }
