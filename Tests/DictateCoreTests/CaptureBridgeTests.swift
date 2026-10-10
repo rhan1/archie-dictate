@@ -158,4 +158,105 @@ struct CaptureBridgeTests {
         #expect(next.dropFrames == 0 && next.framesToFeed == 1024)
     }
 
+    // MARK: D0b — pre-roll from the first tap
+
+    @Test func preBoundaryFramesGoToTheRingDedupedAcrossSources() {
+        var b = CaptureBridge()
+        b.start(defaultInput: .bluetooth, hasBuiltin: true)
+        let first = b.buffer(source: .builtin, at: 9.0, frames: 2400)
+        #expect(first.framesToFeed == 0 && first.framesToRing == 2400)
+        // Headset already flowing before the second tap: overlap trimmed, rest ringed.
+        let headset = b.buffer(source: .headset, at: 9.05, frames: 2400)
+        #expect(headset.releaseBuiltin && headset.dropFrames == 1200 && headset.framesToRing == 1200)
+        #expect(b.buffer(source: .builtin, at: 9.1, frames: 2400).framesToRing == 0)
+        #expect(b.builtinFrames == 2400)
+    }
+
+    @Test func preRollMovesTheKeepPointBack150ms() {
+        var b = CaptureBridge()
+        b.start(defaultInput: .bluetooth, hasBuiltin: true)
+        b.recordingStarted(at: 10, preRoll: 0.15)
+        let straddling = b.buffer(source: .builtin, at: 9.8, frames: 2400) // 9.80 ..< 9.90
+        #expect(straddling.dropFrames == 1200 && straddling.framesToFeed == 1200)
+        // bridge_ms still counts from the second tap, not from the pre-roll point.
+        _ = b.buffer(source: .headset, at: 9.9, frames: 2400, arrivedAt: 11.2)
+        #expect(b.bridgeMs == 1200)
+    }
+
+    @Test func ringContinuityCarriesAcrossTheBoundary() {
+        var b = CaptureBridge()
+        b.start(defaultInput: .bluetooth, hasBuiltin: true)
+        _ = b.buffer(source: .builtin, at: 9.9, frames: 2400) // ringed through 10.0
+        b.recordingStarted(at: 9.95, preRoll: 0.15, keptFrames: 2400)
+        #expect(b.firstKeptMs == 0)
+        // An overlapping live headset buffer is trimmed against the ring's end, not the keep point.
+        let headset = b.buffer(source: .headset, at: 9.95, frames: 2400)
+        #expect(headset.dropFrames == 1200 && headset.framesToFeed == 1200)
+    }
+
+    @Test func bridgeWithoutBuiltinAudioSaysSo() {
+        var silent = bridge()
+        _ = silent.buffer(source: .headset, at: 10.1, frames: 2400)
+        #expect(silent.bridgeSource == "builtin" && silent.reason == "builtin_no_audio")
+        var real = bridge()
+        _ = real.buffer(source: .builtin, at: 10, frames: 2400)
+        _ = real.buffer(source: .headset, at: 10.1, frames: 2400)
+        #expect(real.reason == nil && real.builtinFrames == 2400)
+        #expect(bridge(.builtin).reason == "default_builtin")
+    }
+
+    // MARK: D-a — built-in selection keeps the headset's client format
+
+    /// AUHAL after kAudioOutputUnitProperty_CurrentDevice: hardware follows the
+    /// built-in mic (48 kHz) but the client format keeps the previous default
+    /// (44.1 kHz headset). A rebuild re-creates the same stale pair.
+    private final class StaleInputNode {
+        var hardware = TapFormatPlan.Format(sampleRate: 48_000, channels: 1)
+        var output = TapFormatPlan.Format(sampleRate: 44_100, channels: 1)
+        var aligns = 0, rebuilds = 0
+        var alignWorks = true
+        func formats() -> (hardware: TapFormatPlan.Format, output: TapFormatPlan.Format) { (hardware, output) }
+        func align() { aligns += 1; if alignWorks { output = hardware } }
+        func rebuild() { rebuilds += 1; output = TapFormatPlan.Format(sampleRate: 44_100, channels: 1) }
+    }
+
+    @Test func builtinSelectionAlignsTheClientFormatInsteadOfFailing() throws {
+        let node = StaleInputNode()
+        let outcome = try TapFormatPlan.run(device: .builtIn, formats: node.formats,
+                                            align: node.align, rebuild: node.rebuild)
+        #expect(outcome == .ready(aligned: true, rebuilt: false))
+        #expect(node.aligns == 1 && node.rebuilds == 0)
+    }
+
+    @Test func unalignableBuiltinFailsWithTheFormatPair() {
+        let node = StaleInputNode()
+        node.alignWorks = false
+        var caught: TapFormatPlan.Mismatch?
+        do { _ = try TapFormatPlan.run(device: .builtIn, formats: node.formats, align: node.align, rebuild: node.rebuild) }
+        catch { caught = error as? TapFormatPlan.Mismatch }
+        #expect(caught?.description == "format_mismatch hw=48000Hz/1ch out=44100Hz/1ch")
+        #expect(node.aligns == 2 && node.rebuilds == 1) // bounded: align, rebuild, align, fail
+    }
+
+    @Test func defaultDeviceMismatchStillRebuildsOnceAndMatchingFormatsAreReady() throws {
+        let node = StaleInputNode()
+        node.output = node.hardware
+        #expect(try TapFormatPlan.run(device: .default, formats: node.formats, align: node.align,
+                                      rebuild: node.rebuild) == .ready(aligned: false, rebuilt: false))
+        let stale = StaleInputNode()
+        stale.output = TapFormatPlan.Format(sampleRate: 16_000, channels: 1)
+        #expect(throws: TapFormatPlan.Mismatch.self) {
+            try TapFormatPlan.run(device: .default, formats: stale.formats, align: stale.align, rebuild: stale.rebuild)
+        }
+        #expect(stale.aligns == 0 && stale.rebuilds == 1)
+    }
+
+    @Test func invalidHardwareFormatRebuildsThenFails() {
+        let node = StaleInputNode()
+        node.hardware = TapFormatPlan.Format(sampleRate: 0, channels: 0)
+        #expect(throws: TapFormatPlan.Mismatch.self) {
+            try TapFormatPlan.run(device: .builtIn, formats: node.formats, align: node.align, rebuild: node.rebuild)
+        }
+        #expect(node.aligns == 0 && node.rebuilds == 1)
+    }
 }
