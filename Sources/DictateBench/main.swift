@@ -407,6 +407,7 @@ let showText = ProcessInfo.processInfo.environment["BENCH_SHOW_TEXT"] == "1"
 let endToEnd = args[1] == "stt-groq-chunked" && ProcessInfo.processInfo.environment["BENCH_E2E"] == "1"
 var results: [Int] = []
 var lastText: String?
+var firstChunkMs: Int?   // STT ms of run 1's first chunk: what a cold connection inflates
 
 switch args[1] {
 case "stt-groq-chunked":
@@ -422,9 +423,35 @@ case "stt-groq-chunked":
     let finalModel = env["BENCH_FINAL_MODEL"]
     let rejoinGuard = env["BENCH_REJOIN_GUARD"] == "1"
     let shortPrompt = env["BENCH_FINAL_SHORT_PROMPT"] == "1"
-    print("probe show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" || rejoinGuard ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
-    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
+    // BENCH_IDLE_S=<s> sleeps before the first STT request; BENCH_KEEPWARM=1 pings /models every 240 s
+    // through the SAME transport the STT chunks use. Network only when the manager runs it.
     let transport = URLSessionTransport(timeout: 30)
+    guard let idleSeconds = Int(env["BENCH_IDLE_S"] ?? "0"), (0...86_400).contains(idleSeconds) else {
+        print("BENCH_IDLE_S must be an integer from 0 to 86400")
+        exit(2)
+    }
+    let keepWarmOn = env["BENCH_KEEPWARM"] == "1"
+    var keepWarmPings = 0
+    if idleSeconds > 0 {
+        let idleStart = DispatchTime.now().uptimeNanoseconds
+        let interval = Int(GroqKeepWarm.interval)
+        var next = interval
+        while next <= idleSeconds, keepWarmOn {
+            let due = idleStart + UInt64(next) * 1_000_000_000
+            let now = DispatchTime.now().uptimeNanoseconds
+            if due > now { try await Task.sleep(nanoseconds: due - now) }
+            if let key = try? environmentKey("GROQ_API_KEY") {
+                _ = try? await transport.send(TranscriptCleaner.makeGroqWarmRequest(key: key))
+            }
+            keepWarmPings += 1
+            next += interval
+        }
+        let end = idleStart + UInt64(idleSeconds) * 1_000_000_000
+        let now = DispatchTime.now().uptimeNanoseconds
+        if end > now { try await Task.sleep(nanoseconds: end - now) }
+    }
+    print("probe keepwarm=\(keepWarmOn ? "on" : "off") idle_s=\(idleSeconds) pings=\(keepWarmPings) show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" || rejoinGuard ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
+    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
     guard let tailMs = Int(tailValue), (0...60_000).contains(tailMs) else {
         print("BENCH_TAIL_MS must be an integer from 0 to 60000")
@@ -483,6 +510,7 @@ case "stt-groq-chunked":
         if showChunks {
             for line in benchChunkLines(submittedChunks, texts: rawChunkTexts.snapshot) { print(line) }
         }
+        if firstChunkMs == nil { firstChunkMs = joined.calls.first { $0.index == 0 && !$0.isFinal && $0.status != nil }?.milliseconds }
         let finalCalls = joined.calls.filter { $0.isFinal }
         let probeMetrics = " rejoins=\(joined.rejoins) final_model=\(benchQuoted(finalCalls.first?.model ?? "-")) final_chunk_ms=" +
             (finalCalls.isEmpty ? "-" : finalCalls.map { "\($0.index):\($0.milliseconds)" }.joined(separator: ","))
@@ -674,6 +702,6 @@ if !results.isEmpty {
         print("SCORE \(scriptScore(cleaned))")
     }
     let pasteMetric = endToEnd ? " finish_to_paste_ms=\(p50(results))" : ""
-    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") n=\(results.count) p50_ms=\(p50(results))\(pasteMetric) min_ms=\(results.min()!) max_ms=\(results.max()!)")
+    print("RESULT \(args[1]) \(args[2].split(separator: "/").last ?? "") n=\(results.count) p50_ms=\(p50(results))\(pasteMetric) min_ms=\(results.min()!) max_ms=\(results.max()!)" + (firstChunkMs.map { " first_chunk_ms=\($0)" } ?? ""))
 }
 if endToEnd, results.count != runs { exit(1) }
