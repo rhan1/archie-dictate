@@ -40,14 +40,19 @@ struct CleanupTests {
             #expect(cleaner.systemPrompt().contains(phrase))
         }
         #expect(TranscriptCleaner.examples.count == 4)
-        for final in [false, true] {
-            let request = cleaner.makeIncrementalRequest(text: "no, Thursday", context: "Meet Monday.", final: final, apiKey: "k")
-            let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
-            let messages = try #require(body["messages"] as? [[String: String]])
-            let system = try #require(messages.first?["content"])
-            for phrase in phrases { #expect(system.contains(phrase)) }
-            #expect(messages.count == 10)
-        }
+        // Final incremental call retains the full rule set and few-shot pairs.
+        let finalRequest = cleaner.makeIncrementalRequest(text: "no, Thursday", context: "Meet Monday.", final: true, apiKey: "k")
+        let finalBody = try #require(try JSONSerialization.jsonObject(with: finalRequest.httpBody!) as? [String: Any])
+        let finalMessages = try #require(finalBody["messages"] as? [[String: String]])
+        let finalSystem = try #require(finalMessages.first?["content"])
+        for phrase in phrases { #expect(finalSystem.contains(phrase)) }
+        #expect(finalMessages.count == 10)
+
+        // Mid incremental call uses compressed rules without few-shot (<= 400 tokens).
+        let midRequest = cleaner.makeIncrementalRequest(text: "no, Thursday", context: "Meet Monday.", final: false, apiKey: "k")
+        let midBody = try #require(try JSONSerialization.jsonObject(with: midRequest.httpBody!) as? [String: Any])
+        let midMessages = try #require(midBody["messages"] as? [[String: String]])
+        #expect(midMessages.count == 2)
     }
 
     @Test func fillerLeadInHasCorrectionCue() {

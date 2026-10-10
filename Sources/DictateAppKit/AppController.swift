@@ -739,6 +739,9 @@ public final class AppController {
                         pipeline.cleanup = incremental?.single?.label ?? "ok"
                         pipeline.cleanupModel = incremental?.single?.model ?? groqCleaner.model
                         timeline.cleanup = incremental?.stats
+                        if let label = pipeline.cleanup, label.hasPrefix("cleanup_model_fallback=") {
+                            timeline.cleanupModelFallback = String(label.dropFirst("cleanup_model_fallback=".count))
+                        }
                     } else {
                         let outcome = await policy.clean(raw, groq: groqCleaner, local: localCleaner)
                         pipeline.text = outcome.text
@@ -746,6 +749,9 @@ public final class AppController {
                         pipeline.cleanupModel = outcome.model
                         timeline.cleanup = outcome.stats
                         timeline.cleanupCalls += outcome.calls
+                        if outcome.label.hasPrefix("cleanup_model_fallback=") {
+                            timeline.cleanupModelFallback = String(outcome.label.dropFirst("cleanup_model_fallback=".count))
+                        }
                     }
                     pipeline.cleanupMs = Int(Date().timeIntervalSince(cleanStart) * 1000)
                 }
@@ -860,10 +866,32 @@ public final class AppController {
     /// The log says which one produced the text.
     static func cleanUp(_ raw: String, groq: TranscriptCleaner, local: TranscriptCleaner, forceLocal: Bool = false) async
         -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?, calls: Int) {
-        if !forceLocal, let (text, stats) = try? await groq.cleanWithStats(raw) {
-            return (text, "ok", groq.model, stats, 1)
+        var calls = 0
+        if !forceLocal {
+            do {
+                calls += 1
+                let (text, stats) = try await groq.cleanWithStats(raw)
+                return (text, "ok", groq.model, stats, calls)
+            } catch TranscriptionError.client(429) {
+                var retryGroq = TranscriptCleaner(
+                    transport: groq.transport,
+                    endpoint: groq.endpoint,
+                    model: TranscriptCleaner.retryModel,
+                    vocabulary: groq.vocabulary,
+                    includeExamples: groq.includeExamples,
+                    apiKey: groq.apiKey,
+                    onGroqRateLimit: groq.onGroqRateLimit
+                )
+                retryGroq.hintsSentence = groq.hintsSentence
+                retryGroq.reloadVocabularyFromHints = groq.reloadVocabularyFromHints
+                retryGroq.timeoutInterval = groq.timeoutInterval
+                calls += 1
+                if let (text, stats) = try? await retryGroq.cleanWithStats(raw) {
+                    return (text, "cleanup_model_fallback=\(TranscriptCleaner.retryModel)", TranscriptCleaner.retryModel, stats, calls)
+                }
+            } catch {}
         }
-        if Task.isCancelled { return (raw, "skipped:cancelled", groq.model, nil, 1) }
+        if Task.isCancelled { return (raw, "skipped:cancelled", groq.model, nil, max(1, calls)) }
         let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
         let localTransport: HTTPTransport = local.transport is URLSessionTransport ? URLSessionTransport(timeout: deadline) : local.transport
         var timedLocal = TranscriptCleaner(transport: localTransport, endpoint: local.endpoint,
@@ -873,11 +901,11 @@ public final class AppController {
         timedLocal.timeoutInterval = deadline
         do {
             let (text, stats) = try await timedLocal.cleanWithStats(raw)
-            return (text, "fallback_local", local.model, stats, forceLocal ? 1 : 2)
+            return (text, "fallback_local", local.model, stats, forceLocal ? 1 : calls + 1)
         } catch TranscriptionError.rejected(let reason) {
-            return (raw, "rejected:\(reason)", local.model, nil, forceLocal ? 1 : 2)
+            return (raw, "rejected:\(reason)", local.model, nil, forceLocal ? 1 : calls + 1)
         } catch {
-            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil, forceLocal ? 1 : 2)
+            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil, forceLocal ? 1 : calls + 1)
         }
     }
 
@@ -895,6 +923,7 @@ public final class AppController {
         var cleanupMode = "single"
         var cleanupCalls = 0
         var cleanupFallbackReason: String?
+        var cleanupModelFallback: String?
         var incrementalSkipped: String?
         var keepWarmPings = 0
 
@@ -914,6 +943,7 @@ public final class AppController {
                 "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)", "keepwarm_pings=\(keepWarmPings)",
             ]
             if let cleanupFallbackReason { fields.append("fallback_reason=\(cleanupFallbackReason)") }
+            if let cleanupModelFallback { fields.append("cleanup_model_fallback=\(cleanupModelFallback)") }
             if cleanupMode == "single", let incrementalSkipped {
                 fields.append("incremental_skipped=\(incrementalSkipped)")
             }

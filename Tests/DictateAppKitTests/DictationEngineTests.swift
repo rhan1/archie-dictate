@@ -355,4 +355,118 @@ struct DictationEngineTests {
         let file = try String(contentsOf: quotaFile, encoding: .utf8)
         #expect(!file.contains("gsk_") && !file.contains("Bearer") && !file.contains(raw))
     }
+
+    @Test func cleanup429RetriesOnSecondGroqModelBeforeLocal() async throws {
+        let groqPayload = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["finish_reason": "stop", "message": ["role": "assistant", "content": "Groq retry winner."]]]
+        ])
+        let groqTransport = TestSequenceTransport(responses: [
+            (status: 429, body: "{\"error\":{\"message\":\"Rate limit exceeded\"}}"),
+            (status: 200, body: String(decoding: groqPayload, as: UTF8.self))
+        ])
+        let localPayload = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["finish_reason": "stop", "message": ["role": "assistant", "content": "Local winner."]]]
+        ])
+        let localTransport = TestSequenceTransport(responses: [
+            (status: 200, body: String(decoding: localPayload, as: UTF8.self))
+        ])
+
+        let groq = TranscriptCleaner(transport: groqTransport, endpoint: TranscriptCleaner.groqEndpoint,
+                                     model: "qwen/qwen3.8-27b", vocabulary: "", apiKey: { "k" })
+        let local = TranscriptCleaner(transport: localTransport, endpoint: TranscriptCleaner.ollamaEndpoint,
+                                      model: "llama3.2:3b", vocabulary: "", apiKey: { "k" })
+
+        let result = await AppController.cleanUp("raw text to clean", groq: groq, local: local)
+
+        #expect(result.text == "Groq retry winner.")
+        #expect(result.label == "cleanup_model_fallback=\(TranscriptCleaner.retryModel)")
+        #expect(result.model == TranscriptCleaner.retryModel)
+        #expect(result.calls == 2)
+
+        let groqRequests = await groqTransport.requests
+        #expect(groqRequests.count == 2)
+        let body0 = try JSONSerialization.jsonObject(with: groqRequests[0].httpBody!) as! [String: Any]
+        let body1 = try JSONSerialization.jsonObject(with: groqRequests[1].httpBody!) as! [String: Any]
+        #expect(body0["model"] as? String == "qwen/qwen3.8-27b")
+        #expect(body1["model"] as? String == TranscriptCleaner.retryModel)
+
+        let localRequests = await localTransport.requests
+        #expect(localRequests.count == 0)
+    }
+
+    @Test func cleanup429BothGroqFailFallsBackToLocal() async throws {
+        let groqTransport = TestSequenceTransport(responses: [
+            (status: 429, body: "{\"error\":{\"message\":\"Rate limit exceeded\"}}"),
+            (status: 429, body: "{\"error\":{\"message\":\"Rate limit exceeded\"}}")
+        ])
+        let localPayload = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["finish_reason": "stop", "message": ["role": "assistant", "content": "Local winner."]]]
+        ])
+        let localTransport = TestSequenceTransport(responses: [
+            (status: 200, body: String(decoding: localPayload, as: UTF8.self))
+        ])
+
+        let groq = TranscriptCleaner(transport: groqTransport, endpoint: TranscriptCleaner.groqEndpoint,
+                                     model: "qwen/qwen3.8-27b", vocabulary: "", apiKey: { "k" })
+        let local = TranscriptCleaner(transport: localTransport, endpoint: TranscriptCleaner.ollamaEndpoint,
+                                      model: "llama3.2:3b", vocabulary: "", apiKey: { "k" })
+
+        let result = await AppController.cleanUp("raw text to clean", groq: groq, local: local)
+
+        #expect(result.text == "Local winner.")
+        #expect(result.label == "fallback_local")
+        #expect(result.model == "llama3.2:3b")
+        #expect(result.calls == 3)
+
+        let groqRequests = await groqTransport.requests
+        #expect(groqRequests.count == 2)
+        let localRequests = await localTransport.requests
+        #expect(localRequests.count == 1)
+    }
+
+    @Test func cleanupNon429ErrorDoesNotRetryGroqBeforeLocal() async throws {
+        let groqTransport = TestSequenceTransport(responses: [
+            (status: 500, body: "{\"error\":{\"message\":\"Internal server error\"}}")
+        ])
+        let localPayload = try! JSONSerialization.data(withJSONObject: [
+            "choices": [["finish_reason": "stop", "message": ["role": "assistant", "content": "Local winner."]]]
+        ])
+        let localTransport = TestSequenceTransport(responses: [
+            (status: 200, body: String(decoding: localPayload, as: UTF8.self))
+        ])
+
+        let groq = TranscriptCleaner(transport: groqTransport, endpoint: TranscriptCleaner.groqEndpoint,
+                                     model: "qwen/qwen3.8-27b", vocabulary: "", apiKey: { "k" })
+        let local = TranscriptCleaner(transport: localTransport, endpoint: TranscriptCleaner.ollamaEndpoint,
+                                      model: "llama3.2:3b", vocabulary: "", apiKey: { "k" })
+
+        let result = await AppController.cleanUp("raw text to clean", groq: groq, local: local)
+
+        #expect(result.text == "Local winner.")
+        #expect(result.label == "fallback_local")
+        #expect(result.model == "llama3.2:3b")
+        #expect(result.calls == 2)
+
+        let groqRequests = await groqTransport.requests
+        #expect(groqRequests.count == 1)
+        let localRequests = await localTransport.requests
+        #expect(localRequests.count == 1)
+    }
 }
+
+private actor TestSequenceTransport: HTTPTransport {
+    private var responses: [(status: Int, body: String)]
+    private(set) var requests: [URLRequest] = []
+    init(responses: [(status: Int, body: String)]) {
+        self.responses = responses
+    }
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        requests.append(request)
+        guard !responses.isEmpty else {
+            throw URLError(.timedOut)
+        }
+        let next = responses.removeFirst()
+        return (Data(next.body.utf8), HTTPURLResponse(url: request.url!, statusCode: next.status, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
