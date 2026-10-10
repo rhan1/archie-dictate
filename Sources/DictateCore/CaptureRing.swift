@@ -101,8 +101,8 @@ public struct CaptureFeed {
     public private(set) var ring: CaptureRing
     /// While the headset carries, the built-in's latest frames wait here so a switchback
     /// resumes exactly where the headset stopped (the buffer that crossed the switch
-    /// arrived before the decision).
-    private var standby = CaptureRing(capacity: 12_000)
+    /// arrived before the decision). 1.5 s covers the stale-headset wait (1.0 s) plus one buffer.
+    private var standby = CaptureRing(capacity: 36_000)
 
     public init(ringCapacity: Int = CaptureRing.defaultCapacity) {
         ring = CaptureRing(capacity: ringCapacity)
@@ -129,18 +129,31 @@ public struct CaptureFeed {
                         at: time + Double(decision.dropFrames) / CaptureRing.sampleRate)
         }
         output.frames = Array(trimmed.prefix(decision.framesToFeed))
-        if source == .builtin, bridge.canSwitchBack { standby.append(frames, at: time) }
-        if decision.event == .switchback {
-            let end = standby.newestEnd
-            let resumed = standby.drain(from: bridge.fedThroughTime ?? 0)
-            if let end, !resumed.isEmpty {
-                bridge.resumedBuiltin(frames: resumed.count, through: end)
-                if bridge.isRecording { output.frames += resumed }
-                else { ring.append(resumed, at: end - Double(resumed.count) / CaptureRing.sampleRate) }
-            }
+        if source == .builtin, bridge.canSwitchBack || decision.event == .switchback {
+            standby.append(frames, at: time)
         }
+        if decision.event == .switchback { output.frames += resumeBuiltin() }
         output.firstKept = !hadKept && bridge.firstKeptMs != nil
         return output
+    }
+
+    /// The standby built-in frames from where the headset stopped (into the ring before the second tap).
+    private mutating func resumeBuiltin() -> [Float] {
+        let end = standby.newestEnd
+        let resumed = standby.drain(from: bridge.fedThroughTime ?? 0)
+        guard let end, !resumed.isEmpty else { return [] }
+        bridge.resumedBuiltin(frames: resumed.count, through: end)
+        if bridge.isRecording { return resumed }
+        ring.append(resumed, at: end - Double(resumed.count) / CaptureRing.sampleRate)
+        return []
+    }
+
+    /// The headset engine failed for good: the built-in carries on from where the headset
+    /// stopped. Returns the event (nil: nothing carries) and the frames to append.
+    public mutating func headsetFailed() -> (event: CaptureBridge.Event?, frames: [Float]) {
+        let switching = bridge.state == .switched
+        let event = bridge.headsetFailed()
+        return (event, switching && event == .switchback ? resumeBuiltin() : [])
     }
 
     /// The second tap: keeps ring audio from `time − preRoll` and returns it.
@@ -160,5 +173,5 @@ public struct CaptureFeed {
     }
 
     public mutating func builtinFailed() { bridge.builtinFailed() }
-    public mutating func headsetRestarted() { bridge.headsetRestarted() }
+    public mutating func headsetRestarted(started: Bool = true) { bridge.headsetRestarted(started: started) }
 }

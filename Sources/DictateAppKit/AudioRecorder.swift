@@ -43,7 +43,8 @@ public final class AudioRecorder: CaptureEngine {
     public var onFirstBuffer: (() -> Void)?
     public var onCaptureFailure: (() -> Void)?
     public var isRunning: Bool {
-        let state = lock.withLock { (captureRunning, engine) }
+        let state = lock.withLock { (captureRunning, engine, restarting) }
+        if state.2 { return true }    // H2: the one headset restart is in flight
         return state.0 && ((try? captureObjC { state.1?.isRunning ?? false }) ?? false)
     }
     public var isAllocated: Bool { lock.withLock { engine != nil || builtin?.isAllocated == true } }
@@ -83,8 +84,11 @@ public final class AudioRecorder: CaptureEngine {
     /// profile switch (D-b); a stuck setup never delays the headset longer.
     static let builtinSetupWait: TimeInterval = 0.25
     private var captureBoundary: TimeInterval?
-    /// H4: executor-only, reset per start.
+    /// H4: executor-only, reset per start and per headset restart (a deferred recovery
+    /// from an earlier generation never runs).
     private var recoveryThrottle = RecoveryThrottle()
+    private var throttleGeneration = 0
+    private var restarting = false
     // Internal converted-buffer handoff avoids independent chunkers/remainders.
     private var onConvertedBuffer: (([Float], TimeInterval) -> Void)?
 
@@ -143,7 +147,19 @@ public final class AudioRecorder: CaptureEngine {
         }
         guard let starting = failed else { return }
         // After the headset took over (or a fallback) the built-in can no longer carry the dictation.
-        guard starting else { AppController.note("bridge_builtin_lost=1 state=\(lock.withLock { feed.bridge.state })"); return }
+        guard starting else {
+            let headsetCapturing = lock.withLock { captureRunning || restarting }
+            AppController.note("bridge_builtin_lost=1 state=\(lock.withLock { feed.bridge.state }) headset_capturing=\(headsetCapturing ? 1 : 0)")
+            if !headsetCapturing {
+                // Nothing carries the dictation any more: fail it rather than record silence.
+                let callback = onCaptureFailure
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
+                    callback?()
+                }
+            }
+            return
+        }
         var line = "bridge_src=none reason=builtin_start_failed"
         if let mismatch = error as? TapFormatPlan.Mismatch { line += " builtin_error=\(mismatch)" }
         else if let error = error as NSError? { line += " builtin_error=\(error.domain):\(error.code)" }
@@ -191,7 +207,7 @@ public final class AudioRecorder: CaptureEngine {
             stats = CaptureStats()
             meter.clearBatch()
         }
-        recoveryThrottle = RecoveryThrottle()
+        resetRecoveryThrottle()
         startedAt = DispatchTime.now()
         stats.device = device == .builtIn ? "built-in" : (AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown")
         if device == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) } }
@@ -200,7 +216,7 @@ public final class AudioRecorder: CaptureEngine {
         // H3: AVAudioEngine binds a new input node to the system default (the headset
         // aggregate) before `selectBuiltIn` can run; it offers no way to pick the device
         // first, so the bind is checked and corrected after every start instead.
-        if device == .builtIn, case .drift? = checkBuiltinPin(), isBridgeChild { throw RecorderError.builtinDrift }
+        if device == .builtIn, isBridgeChild, case .drift? = checkBuiltinPin() { throw RecorderError.builtinDrift }
         stats.engineStartMs = elapsedMs()
         let activated = lock.withLock {
             guard engineEpoch === startEpoch else { return false }
@@ -272,14 +288,14 @@ public final class AudioRecorder: CaptureEngine {
             guard let self else { return }
             let epoch = self.lock.withLock { self.engineEpoch }
             self.onExecutor { [weak self] in
-                self?.configurationChanged(identity: identity, epoch: epoch, deferred: false)
+                self?.configurationChanged(identity: identity, epoch: epoch, deferred: nil)
             }
         }
     }
 
     /// Runs on the executor. The headset engine is throttled after a failed start (H4);
     /// the built-in child re-selects its device before any restart (H3).
-    private func configurationChanged(identity: CaptureEpoch, epoch: CaptureEpoch, deferred: Bool) {
+    private func configurationChanged(identity: CaptureEpoch, epoch: CaptureEpoch, deferred: Int?) {
         let current = { self.recording && self.lock.withLock {
             self.engineIdentity === identity &&
             self.captureRunning && self.engineEpoch === epoch
@@ -287,16 +303,19 @@ public final class AudioRecorder: CaptureEngine {
         let builtinChild = selectedDevice == .builtIn
         if !builtinChild {
             let now = ProcessInfo.processInfo.systemUptime
-            if deferred { recoveryThrottle.deferredFired(at: now) }
-            else if current() {
+            if let generation = deferred {
+                guard generation == throttleGeneration, lock.withLock({ engineEpoch === epoch }) else { return }
+                recoveryThrottle.deferredFired(at: now)
+            } else if current() {
                 switch recoveryThrottle.request(at: now) {
                 case .now: break
                 case .coalesced: return
                 case .after(let wait):
                     AppController.note("config_recovery_backoff_ms=\(Int((wait * 1000).rounded()))")
+                    let generation = throttleGeneration
                     engineQueue.asyncAfter(deadline: .now() + wait) { [weak self] in
                         self?.onExecutor { [weak self] in
-                            self?.configurationChanged(identity: identity, epoch: epoch, deferred: true)
+                            self?.configurationChanged(identity: identity, epoch: epoch, deferred: generation)
                         }
                     }
                     return
@@ -327,7 +346,7 @@ public final class AudioRecorder: CaptureEngine {
             AppController.note("config_retap_error=\($0 as NSError)")
             if !builtinChild { self.recoveryThrottle.startFailed(at: ProcessInfo.processInfo.systemUptime) }
         })
-        if builtinChild, result == .retapped || result == .rebuilt, case .drift? = checkBuiltinPin(), isBridgeChild {
+        if builtinChild, isBridgeChild, result == .retapped || result == .rebuilt, case .drift? = checkBuiltinPin() {
             // Never let the bridge child float onto the headset aggregate: release it instead.
             teardownEngine()
             result = .failed
@@ -341,6 +360,19 @@ public final class AudioRecorder: CaptureEngine {
             if activated { self.recording = true }
             else { self.teardownEngine() }
         }
+        if result == .failed, !builtinChild {
+            // v1.7: a headset that cannot recover is not a failed dictation while the built-in carries it.
+            let carried: CaptureBridge.Event? = lock.withLock {
+                guard engineEpoch === epoch else { return nil }
+                let out = feed.headsetFailed()
+                deliverLocked(out.frames)
+                return out.event
+            }
+            if let carried {
+                AppController.note("headset_engine_failed=1 builtin_carries=\(carried == .switchback ? "switchback" : "fallback")")
+                return
+            }
+        }
         if result == .failed {
             let callback = self.onCaptureFailure
             DispatchQueue.main.async { [weak self] in
@@ -350,14 +382,27 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
+    private func resetRecoveryThrottle() {
+        recoveryThrottle = RecoveryThrottle()
+        throttleGeneration += 1
+    }
+
     /// The built-in bridge engine (it has no bridge of its own).
     private var isBridgeChild: Bool { lock.withLock { builtin == nil } }
 
     /// H3: read back the child's AUHAL device; move it back to the built-in once if it drifted.
     @discardableResult private func checkBuiltinPin() -> BuiltinPin.Check? {
         guard let unit = engine?.inputNode.audioUnit, let expected = try? AudioDevices.builtInInput() else { return nil }
-        let check = BuiltinPin.enforce(expected: expected, read: { try AudioDevices.currentDevice(of: unit) },
-                                       write: { try AudioDevices.setCurrentDevice($0, on: unit) })
+        // Correction = the full stopped-engine selection (selection on a running unit would
+        // keep the previous device's client format, D-a), then read back again.
+        let check = BuiltinPin.enforce(expected: expected, read: {
+            try AudioDevices.currentDevice(of: self.requireEngine().inputNode.audioUnit ?? unit)
+        }, write: { _ in
+            try self.removeTap()
+            try captureObjC { self.engine?.stop() }
+            try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
+            try self.installTapAndStart()
+        })
         AppController.note(check.note)
         return check
     }
@@ -367,6 +412,9 @@ public final class AudioRecorder: CaptureEngine {
     private func restartHeadset(epoch: CaptureEpoch) {
         onExecutor { [self] in
             guard lock.withLock({ engineEpoch === epoch && captureRunning }), engine != nil else { return }
+            lock.withLock { restarting = true }
+            defer { lock.withLock { restarting = false } }
+            resetRecoveryThrottle()
             // Same shape as a cold start: a fresh engine, never the stopped one (its input
             // format reads 0 Hz while the headset is back on A2DP).
             let outcome = HeadsetRestart.perform(stop: { self.teardownEngine() },
@@ -386,7 +434,21 @@ public final class AudioRecorder: CaptureEngine {
                 self.teardownEngine()
                 AppController.note("headset_restart_error=\(error as NSError)")
             })
-            lock.withLock { if engineEpoch === epoch { feed.headsetRestarted() } }
+            let nothingCarries: Bool = lock.withLock {
+                guard engineEpoch === epoch else { return false }
+                feed.headsetRestarted(started: outcome.started)
+                guard !outcome.started else { return false }
+                let out = feed.headsetFailed()
+                deliverLocked(out.frames)
+                return out.event == nil
+            }
+            if nothingCarries {
+                let callback = onCaptureFailure
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
+                    callback?()
+                }
+            }
             AppController.note("headset_restart=1 idle=\(outcome.deviceIdle ? 1 : 0) waited_ms=\(outcome.waitedMs) started=\(outcome.started ? 1 : 0)")
         }
     }
@@ -488,9 +550,13 @@ public final class AudioRecorder: CaptureEngine {
         stats.bridgeSource = feed.bridge.bridgeSource
         stats.bridgeReason = feed.bridge.reason
         stats.tap2ToFirstKeptMs = feed.bridge.firstKeptMs
-        stats.bridgeSwitchback = feed.bridge.switchbacks
-        stats.headsetRestart = feed.bridge.restart?.result
-        let restartResult = feed.bridge.restart?.result
+        // A second stop (idle-guard release) must not erase the first one's results.
+        let live = feed.bridge.state != .off
+        if live {
+            stats.bridgeSwitchback = feed.bridge.switchbacks
+            stats.headsetRestart = feed.bridge.restart?.result
+        }
+        let restartResult = live ? feed.bridge.restart?.result : nil
         feed.cancel() // a lone tap's ring is discarded here
         bridgeConfigured = false
         captureBoundary = nil
@@ -572,7 +638,28 @@ public final class AudioRecorder: CaptureEngine {
         guard engineEpoch === epoch, tap == nil || tapEpoch === tap else { lock.unlock(); return }
         let decision = feed.accept(converted, source: source, at: time,
                                    arrivedAt: ProcessInfo.processInfo.systemUptime, epoch: epoch)
-        let chunk = decision.frames
+        deliverLocked(decision.frames)
+        let bridgeMs = feed.bridge.bridgeMs, builtinFrames = feed.bridge.builtinFrames
+        let firstKeptMs = decision.firstKept ? feed.bridge.firstKeptMs : nil
+        // v1.7: the built-in keeps running after the headset takes over (it is the
+        // switchback source) and is released when the dictation stops.
+        lock.unlock()
+        if decision.restartHeadset { restartHeadset(epoch: epoch) }
+        switch decision.event {
+        case .fallback?: AppController.note("bridge_src=builtin_fallback reason=headset_digital_silence")
+        case .switchback?: AppController.note("bridge_switchback=1")
+        case nil: break
+        }
+        if let firstKeptMs {
+            AppController.note("tap2_to_first_kept_buffer_ms=\(firstKeptMs) kept_src=\(source == .builtin ? "builtin" : "headset")")
+        }
+        if decision.releaseBuiltin {
+            if let bridgeMs { AppController.note("bridge_ms=\(bridgeMs) bridge_src=builtin builtin_frames=\(builtinFrames)") }
+        }
+    }
+
+    /// Accumulation, PCM delivery and meter updates for frames the feed kept. Caller holds `lock`.
+    private func deliverLocked(_ chunk: [Float]) {
         samples.append(contentsOf: chunk)
         // Accumulate even before the transcriber attaches; nothing after the
         // recording boundary is discarded during asynchronous hardware startup.
@@ -593,23 +680,6 @@ public final class AudioRecorder: CaptureEngine {
                 levelTimer = timer
                 timer.resume()
             }
-        }
-        let bridgeMs = feed.bridge.bridgeMs, builtinFrames = feed.bridge.builtinFrames
-        let firstKeptMs = decision.firstKept ? feed.bridge.firstKeptMs : nil
-        // v1.7: the built-in keeps running after the headset takes over (it is the
-        // switchback source) and is released when the dictation stops.
-        lock.unlock()
-        if decision.restartHeadset { restartHeadset(epoch: epoch) }
-        switch decision.event {
-        case .fallback?: AppController.note("bridge_src=builtin_fallback reason=headset_digital_silence")
-        case .switchback?: AppController.note("bridge_switchback=1")
-        case nil: break
-        }
-        if let firstKeptMs {
-            AppController.note("tap2_to_first_kept_buffer_ms=\(firstKeptMs) kept_src=\(source == .builtin ? "builtin" : "headset")")
-        }
-        if decision.releaseBuiltin {
-            if let bridgeMs { AppController.note("bridge_ms=\(bridgeMs) bridge_src=builtin builtin_frames=\(builtinFrames)") }
         }
     }
 
