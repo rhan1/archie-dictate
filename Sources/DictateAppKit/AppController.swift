@@ -15,7 +15,8 @@ public final class AppController {
     private let paths: AppPaths
     var engineOnState: ((DictateAppKit.DictationState) -> Void)?
     var engineOnTranscript: ((String, DictationTimeline) -> Void)?
-    private let rateLimitRelay = EngineRateLimitRelay()
+    let quotaStore: GroqQuotaStore
+    private let rateLimitRelay: EngineRateLimitRelay
     var engineOnGroqRateLimit: ((GroqRateLimit) -> Void)? {
         get { MainActor.assumeIsolated { rateLimitRelay.callback } }
         set { MainActor.assumeIsolated { rateLimitRelay.callback = newValue } }
@@ -40,7 +41,7 @@ public final class AppController {
     public static let defaultSTTEngine = "groq-chunked"
     private let sttEngine = ProcessInfo.processInfo.environment["DICTATE_STT"] == "apple"
         ? "apple" : AppController.defaultSTTEngine
-    private var chunkedEnabled: Bool { (sttEngine == "groq-chunked" || sessionPolicy.mode == .captureOnly) && sessionPolicy.usesGroq }
+    private var chunkedEnabled: Bool { (sttEngine == "groq-chunked" || sessionPolicy.mode == .captureOnly) && sessionPolicy.usesGroqSTT }
     private var chunked: EngineChunkSession?
     private var incrementalCleaner: IncrementalCleaner?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
@@ -82,8 +83,12 @@ public final class AppController {
     }
 
     init(keyStore: KeyStore, paths: AppPaths, surface: Surface, mode: DictationEngine.Mode,
-         dependencies: EngineDependencies? = nil) {
+         dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil) {
         self.dependencies = dependencies
+        // The default location shares GroqQuota.current; a host's relocated file gets its own store.
+        let quotaFile = quotaFileURL ?? GroqQuotaStore.defaultFileURL(for: paths)
+        quotaStore = quotaFile == GroqQuotaStore.shared.fileURL ? .shared : GroqQuotaStore(fileURL: quotaFile)
+        rateLimitRelay = EngineRateLimitRelay(store: quotaStore)
         recorder = dependencies?.recorder ?? AudioRecorder()
         inserter = dependencies?.inserter ?? TextInserter()
         self.keyStore = keyStore
@@ -474,7 +479,7 @@ public final class AppController {
     private func beginRecording() {
         clearOutcome()
         logKeyStates()
-        sessionPolicy = EnginePolicy(mode: engineMode, fallback: forceFallback)
+        sessionPolicy = EnginePolicy(mode: engineMode, fallback: forceFallback, quota: quotaStore.current, now: Date())
         if let dependencies { recordingTarget = dependencies.frontmostTarget() }
         else { recordingTarget = Self.frontmostTarget() }
         generation = CaptureEpoch()
@@ -514,7 +519,7 @@ public final class AppController {
             apple = engine
             if chunkedEnabled {
                 let keys = keyStore
-                let incremental = sessionPolicy.usesCleanup ? IncrementalCleaner(cleaner: groqCleaner) : nil
+                let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner) : nil
                 incrementalCleaner = incremental
                 let streaming = GroqChunkedTranscriber(transport: dependencies?.sttTransport ?? URLSessionTransport(timeout: 30), apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
@@ -530,7 +535,7 @@ public final class AppController {
                 recorder.onPCMChunk = { pcm in engine.append(pcm) }
             }
             Task { try? await engine.start() }
-            if sessionPolicy.usesCleanup, sessionPolicy.usesGroq {
+            if sessionPolicy.usesCleanup, sessionPolicy.usesGroqCleanup {
                 Task { [groqCleaner] in await groqCleaner.warmUp() }
             }
         } else {
@@ -584,7 +589,7 @@ public final class AppController {
         let groqCleaner = self.groqCleaner
         let groqSTT = self.groqSTT
         let policy = sessionPolicy
-        let shadowEnabled = self.shadowEnabled && policy.usesGroq
+        let shadowEnabled = self.shadowEnabled && policy.usesGroqSTT
         let vocabularyPrompt = self.prompt
         var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn, btStart: btStart,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
@@ -743,39 +748,39 @@ public final class AppController {
                                     self.showOutcome(.ok)
                                 }
                                 self.traceFocus("pasting")
-                                self.appendLog(entry(text.count, app, .ok), fallback: policy.fallbackLabel)
+                                self.appendLog(entry(text.count, app, .ok), fallback: policy.fallbackFields)
                                 return true
                             case .hold:
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(text, forType: .string)
                                 self.rememberHeldDictation(text)
                                 self.showOutcome(.held("focus_changed"), text: text)
-                                self.appendLog(entry(text.count, app, .held("focus_changed")), fallback: policy.fallbackLabel)
+                                self.appendLog(entry(text.count, app, .held("focus_changed")), fallback: policy.fallbackFields)
                                 return false
                             }
                         })
                     })
                     if !policy.usesPaste {
                         self.clearOutcome()
-                        self.appendLog(entry(text.count, AppController.frontmostBundleID(), .ok), fallback: policy.fallbackLabel)
+                        self.appendLog(entry(text.count, AppController.frontmostBundleID(), .ok), fallback: policy.fallbackFields)
                     }
                 case .success:
                     self.showOutcome(.held("no_stt"))
-                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackLabel)
+                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields)
                 case .failure(let error):
                     let reason = (error as? TranscriptionError)?.logReason ?? "unknown"
                     if reason == "rejected_no_stt" {
                         self.showOutcome(.held("no_stt"))
-                        self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackLabel)
+                        self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields)
                     } else {
                         self.showOutcome(.error(reason))
-                        self.appendLog(entry(0, AppController.frontmostBundleID(), .error(reason)), fallback: policy.fallbackLabel)
+                        self.appendLog(entry(0, AppController.frontmostBundleID(), .error(reason)), fallback: policy.fallbackFields)
                     }
                 }
                 if fake == nil {
                     AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path,
                                                           chunkFallback: report.chunkFallback,
-                                                          keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok") + (policy.fallbackLabel.map { " fallback=\($0)" } ?? ""))
+                                                          keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok") + (policy.fallbackFields.map { " fallback=\($0)" } ?? ""))
                 }
             }
         }
@@ -911,7 +916,7 @@ public final class AppController {
         appendLog(DictationLogEntry(
             time: Date(), durationSeconds: duration, audioBytes: bytes, latencyMs: latencyMs,
             chars: chars, frontmostBundleID: app, outcome: outcome
-        ), fallback: sessionPolicy.fallbackLabel)
+        ), fallback: sessionPolicy.fallbackFields)
     }
 
     func appendLog(_ entry: DictationLogEntry, fallback: String?) {
