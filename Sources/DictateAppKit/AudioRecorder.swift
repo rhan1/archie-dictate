@@ -31,14 +31,16 @@ public final class AudioRecorder: CaptureEngine {
     public var onCaptureFailure: (() -> Void)?
     public var isRunning: Bool {
         let state = lock.withLock { (captureRunning, engine) }
-        return state.0 && ((try? captureObjC { state.1.isRunning }) ?? false)
+        return state.0 && ((try? captureObjC { state.1?.isRunning ?? false }) ?? false)
     }
+    public var isAllocated: Bool { lock.withLock { engine != nil } }
     private var captureRunning = false
     private var startedAt = DispatchTime.now()
     private var recording = false
     private var configObserver: NSObjectProtocol?
 
-    private var engine = AVAudioEngine()
+    private var engine: AVAudioEngine?
+    private var engineIdentity = CaptureEpoch()
     private var tapInstalled = false
     private var selectedDevice: MicChoice = .default
     private let engineQueue = DispatchQueue(label: "dictate.capture.engine")
@@ -70,7 +72,7 @@ public final class AudioRecorder: CaptureEngine {
     public func start(device: MicChoice = .default) throws {
         if isRunning, selectedDevice == device { return }
         let startEpoch = lock.withLock { engineEpoch }
-        if selectedDevice != device || tapInstalled { try rebuild() }
+        if !isAllocated || selectedDevice != device || tapInstalled { try rebuild() }
         selectedDevice = device
         lock.withLock {
             samples.removeAll(keepingCapacity: true)
@@ -80,7 +82,7 @@ public final class AudioRecorder: CaptureEngine {
         }
         startedAt = DispatchTime.now()
         stats.device = device == .builtIn ? "built-in" : (AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown")
-        if device == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: engine.inputNode) } }
+        if device == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) } }
         registerConfigurationObserver()
         try installTapAndStart()
         stats.engineStartMs = elapsedMs()
@@ -132,21 +134,25 @@ public final class AudioRecorder: CaptureEngine {
     public func rebuild() throws {
         teardownEngine()
         let fresh = try captureObjC { AVAudioEngine() }
-        lock.withLock { engine = fresh }
+        lock.withLock { engine = fresh; engineIdentity = CaptureEpoch() }
         registerConfigurationObserver() // always observes the replacement, never the old engine
     }
 
     private func registerConfigurationObserver() {
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
-        let observedEngine = engine
+        guard let observedEngine = engine else { return }
+        let identity = lock.withLock { engineIdentity }
         configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+            forName: .AVAudioEngineConfigurationChange, object: observedEngine, queue: nil
         ) { [weak self] _ in
             guard let self else { return }
             let epoch = self.lock.withLock { self.engineEpoch }
-            self.engineQueue.async {
-                let current = { self.recording && self.engine === observedEngine &&
-                    self.lock.withLock { self.captureRunning && self.engineEpoch === epoch } }
+            self.engineQueue.async { [weak self] in
+                guard let self else { return }
+                let current = { self.recording && self.lock.withLock {
+                    self.engineIdentity === identity &&
+                    self.captureRunning && self.engineEpoch === epoch
+                } }
                 guard current() else { return }
                 self.stats.configChanges += 1
                 // The observer identity was checked before entry. Our own rebuild
@@ -160,7 +166,7 @@ public final class AudioRecorder: CaptureEngine {
                     let device = self.selectedDevice
                     try self.rebuild()
                     if device == .builtIn {
-                        try AudioDevices.selectBuiltIn(on: self.engine.inputNode)
+                        try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
                     }
                     try self.installTapAndStart()
                 }, teardown: { self.teardownEngine() }, note: {
@@ -186,16 +192,21 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
+    private func requireEngine() throws -> AVAudioEngine {
+        guard let engine else { throw RecorderError.noInput }
+        return engine
+    }
+
     private func installTapAndStart(allowRebuild: Bool = true) throws {
         try captureObjC {
-            let input = engine.inputNode
+            let input = try requireEngine().inputNode
             let hardware = input.inputFormat(forBus: 0)
             let output = input.outputFormat(forBus: 0)
             guard hardware.sampleRate > 0, hardware.channelCount > 0,
                   hardware.sampleRate == output.sampleRate, hardware.channelCount == output.channelCount else {
                 if allowRebuild {
                     try rebuild()
-                    if selectedDevice == .builtIn { try AudioDevices.selectBuiltIn(on: engine.inputNode) }
+                    if selectedDevice == .builtIn { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) }
                     try installTapAndStart(allowRebuild: false)
                     return
                 }
@@ -211,15 +222,15 @@ public final class AudioRecorder: CaptureEngine {
             input.installTap(onBus: 0, bufferSize: 1024, format: hardware) { [weak self] buffer, _ in
                 self?.consume(buffer, epoch: token)
             }
-            engine.prepare()
-            try engine.start()
+            try requireEngine().prepare()
+            try requireEngine().start()
         }
     }
 
     private func removeTap() throws {
         guard tapInstalled else { return }
         defer { tapInstalled = false; lock.withLock { tapEpoch = CaptureEpoch() } }
-        try captureObjC { engine.inputNode.removeTap(onBus: 0) }
+        try captureObjC { try requireEngine().inputNode.removeTap(onBus: 0) }
     }
 
     /// Continue cleanup after any individual exception, including a partial tap install.
@@ -228,20 +239,20 @@ public final class AudioRecorder: CaptureEngine {
         lock.withLock { captureRunning = false; converter = nil; tapEpoch = CaptureEpoch() }
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
+        // Drop even a poisoned engine; replacing it here would allocate while idle.
+        defer { lock.withLock { engine = nil; engineIdentity = CaptureEpoch() } }
         let calls: [() throws -> Void] = [
             { try self.removeTap() },
-            { try captureObjC { self.engine.stop() } },
-            { try captureObjC { self.engine.reset() } }
+            { try captureObjC { self.engine?.stop() } },
+            { try captureObjC { self.engine?.reset() } }
         ]
-        let clean = CaptureConfigurationRecovery.teardown(calls) {
+        CaptureConfigurationRecovery.teardown(calls) {
             AppController.note("mic_teardown_error=\($0 as NSError)")
         }
-        if !clean {
-            // Never reuse an engine whose stop or tap removal raised.
-            do { let fresh = try captureObjC { AVAudioEngine() }; lock.withLock { engine = fresh } }
-            catch { AppController.note("mic_teardown_error=\(error as NSError)") }
-        }
     }
+
+    /// Uses the same serial teardown as stop; also invalidates in-flight starts.
+    public func release() { _ = stop() }
 
     private func elapsedMs() -> Int {
         Int((DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds) / 1_000_000)

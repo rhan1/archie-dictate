@@ -5,6 +5,7 @@ import Testing
 @Suite("LifecycleRedTeam", .serialized)
 struct LifecycleRedTeamTests {
     func idle(_ engine: RedTeamEngine, _ lifecycle: CaptureLifecycle) {
+        #expect(!engine.isAllocated)
         #expect(!engine.isRunning)
         #expect(engine.taps == 0)
         #expect(lifecycle.warmup.phase == .off)
@@ -320,6 +321,7 @@ struct LifecycleRedTeamTests {
         #expect(rebuilds == (mode == 1 || mode == 2 ? 1 : 0))
         #expect(errors == (mode == 2 ? 2 : mode == 1 ? 1 : 0))
         #expect(failures == (mode == 2 ? 1 : 0))
+        if mode == 4 { clock.advance(lifecycle.idleReleaseSeconds) } // stray idle rebuild
         if mode == 2 || mode == 4 { idle(engine, lifecycle) }
         else { #expect(engine.isRunning && engine.taps == 1); lifecycle.end(.cancel) }
         next(engine, lifecycle, clock)
@@ -395,7 +397,10 @@ struct LifecycleRedTeamTests {
         lifecycle.end(.cancel)
         retry.action()
         #expect(engine.attempts == [.default])
-        #expect(clock.jobs.allSatisfy { $0.cancelled })
+        // Capture/recovery deadlines are cancelled; only the idle guard remains.
+        let pending = clock.jobs.filter { !$0.cancelled }
+        #expect(pending.count == 1 && pending.first?.due == clock.now + lifecycle.idleReleaseSeconds)
+        #expect(clock.jobs.filter { $0.due <= clock.now }.allSatisfy { $0.cancelled })
         idle(engine, lifecycle)
         next(engine, lifecycle, clock)
     }
