@@ -24,10 +24,14 @@ public final class IncrementalCleaner: @unchecked Sendable {
         public let single: SingleResult?
     }
 
+    public static let estimatedMidTokens = 400
+    public static let estimatedFinalTokens = 900
+
     private let lock = NSLock()
     private let cleaner: TranscriptCleaner
     private let raceAfterMs: Int
     private let finalIncludeExamples: Bool
+    private let quotaProvider: @Sendable () -> GroqQuota
     private var chunks: [Int: String] = [:]
     private var contiguous = 0
     private var covered = 0
@@ -36,6 +40,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private var singleCalls = 0
     private var failed = false
     private var failure: String?
+    private var tpmSkipped = false
     private var closed = false
     private var sealed = false
     private var sealedAt: ContinuousClock.Instant?
@@ -49,10 +54,12 @@ public final class IncrementalCleaner: @unchecked Sendable {
 
     /// The final tail call omits the few-shot pairs by default (v1.5.1: ~80 ms faster on the
     /// user's fixture); the single-call path keeps them.
-    public init(cleaner: TranscriptCleaner, raceAfterMs: Int = 600, finalIncludeExamples: Bool = false) {
+    public init(cleaner: TranscriptCleaner, raceAfterMs: Int = 600, finalIncludeExamples: Bool = false,
+                quotaProvider: (@Sendable () -> GroqQuota)? = nil) {
         self.cleaner = cleaner
         self.finalIncludeExamples = finalIncludeExamples
         self.raceAfterMs = max(0, raceAfterMs)
+        self.quotaProvider = quotaProvider ?? { GroqQuota.current }
     }
     public var needsFallback: Bool { lock.withLock { failed } }
     public var callCount: Int { lock.withLock { calls + singleCalls } }
@@ -89,6 +96,11 @@ public final class IncrementalCleaner: @unchecked Sendable {
         let end = max(0, contiguous - 1)
         guard !closed, !sealed, !failed, !invalidated, pending == nil,
               end - covered >= (covered == 0 ? 1 : 2) else { return }
+        if let remaining = quotaProvider().freshRemainingTokens(.cleanup),
+           remaining < (Self.estimatedMidTokens + Self.estimatedFinalTokens) {
+            tpmSkipped = true
+            return
+        }
         let text = raw(from: covered, to: end)
         let context = prefix
         calls += 1
@@ -168,6 +180,24 @@ public final class IncrementalCleaner: @unchecked Sendable {
             inFlight?.cancel()
             return await singleOrSnapshot(rawText: rawText, single: single, mode: "single", skipped: "short")
         }
+        if lock.withLock({ tpmSkipped }) {
+            lock.withLock { cancelled = true }
+            inFlight?.cancel()
+            let fullText = rawText ?? raw(from: 0, to: totalChunks)
+            guard !fullText.isEmpty else { return snapshot(text: nil, stats: nil, mode: "single", skipped: "tpm") }
+            do {
+                var finalCleaner = cleaner
+                finalCleaner.includeExamples = false
+                lock.withLock { calls += 1 }
+                let (text, stats) = try await finalCleaner.cleanWithStats(fullText)
+                return snapshot(text: text, stats: stats, mode: "single", skipped: "tpm")
+            } catch {
+                if let single {
+                    return await singleOrSnapshot(rawText: rawText, single: single, mode: "single", skipped: "tpm")
+                }
+                return snapshot(text: nil, stats: nil, mode: "single", skipped: "tpm")
+            }
+        }
         guard let rawText, let single else {
             return await finishIncremental(totalChunks: totalChunks, inFlight: inFlight)
         }
@@ -246,6 +276,19 @@ public final class IncrementalCleaner: @unchecked Sendable {
         if lock.withLock({ invalidated && !cancelled && !failed }) {
             return snapshot(text: nil, stats: nil, skipped: "rejoin_replaced")
         }
+        if lock.withLock({ tpmSkipped }) {
+            let fullText = raw(from: 0, to: totalChunks)
+            guard !fullText.isEmpty else { return snapshot(text: nil, stats: nil, mode: "single", skipped: "tpm") }
+            do {
+                var finalCleaner = cleaner
+                finalCleaner.includeExamples = false
+                lock.withLock { calls += 1 }
+                let (text, stats) = try await finalCleaner.cleanWithStats(fullText)
+                return snapshot(text: text, stats: stats, mode: "single", skipped: "tpm")
+            } catch {
+                return snapshot(text: nil, stats: nil, mode: "single", skipped: "tpm")
+            }
+        }
         let tail: (String, String)? = lock.withLock {
             guard !failed, !cancelled, contiguous == totalChunks, !prefix.isEmpty else {
                 if !cancelled, contiguous != totalChunks { failed = true; failure = failure ?? "gap_\(contiguous)of\(totalChunks)" }
@@ -278,6 +321,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private func snapshot(text: String?, stats: TranscriptCleaner.Stats?, mode: String? = nil,
                           skipped: String? = nil, single: SingleResult? = nil) -> Result {
         lock.withLock {
+            let skipped = skipped ?? (tpmSkipped ? "tpm" : nil)
             let mode = mode ?? (failed ? "incremental_fallback" : text == nil ? "single" : "incremental")
             return Result(text: text, mode: mode, calls: calls + singleCalls, stats: stats,
                           fallbackReason: failure, skippedReason: mode == "single" ? skipped : nil, single: single)
