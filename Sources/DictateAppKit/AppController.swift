@@ -88,13 +88,18 @@ public final class AppController {
     }
 
     init(keyStore: KeyStore, paths: AppPaths, surface: Surface, mode: DictationEngine.Mode,
-         dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil) {
+         dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil) {
         self.dependencies = dependencies
         // The default location shares GroqQuota.current; a host's relocated file gets its own store.
         let quotaFile = quotaFileURL ?? GroqQuotaStore.defaultFileURL(for: paths)
         quotaStore = quotaFile == GroqQuotaStore.shared.fileURL ? .shared : GroqQuotaStore(fileURL: quotaFile)
         rateLimitRelay = EngineRateLimitRelay(store: quotaStore)
-        recorder = dependencies?.recorder ?? AudioRecorder()
+        let injectURL = injectedAudioURL ?? {
+            guard let env = ProcessInfo.processInfo.environment["DICTATE_INJECT_WAV"], !env.isEmpty else { return nil }
+            return URL(fileURLWithPath: env)
+        }()
+        if let injectURL { AppController.note("inject_wav=\(injectURL.lastPathComponent)") }
+        recorder = dependencies?.recorder ?? injectURL.map { WAVInjectedRecorder(url: $0) } ?? AudioRecorder()
         inserter = dependencies?.inserter ?? TextInserter()
         self.keyStore = keyStore
         self.paths = paths

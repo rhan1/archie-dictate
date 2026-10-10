@@ -72,3 +72,5 @@ On macOS, microphone access is needed for capture, Apple Speech assets must alre
 be installed for quota fallback, and Accessibility/Input Monitoring is needed for
 hotkeys and insertion. Engine construction performs no asset download. The existing
 standalone launch continues to prepare assets as before.
+
+`injectedAudioURL:` (or env `DICTATE_INJECT_WAV=<path>`) replaces the microphone with a 24 kHz mono 16-bit WAV, paced in real time, then silence until finish(); STT, cleanup and paste stay real — for unattended end-to-end checks.
