@@ -128,7 +128,8 @@ final class PreRollEngine: CaptureEngine {
     func deliver(_ source: CaptureBridge.Source, at time: TimeInterval, frames: [Float], arrivedAt: TimeInterval? = nil) {
         let out = feed.accept(frames, source: source, at: time, arrivedAt: arrivedAt)
         samples += out.frames
-        if out.releaseBuiltin { releaseBuiltin() }
+        // v1.7: like AudioRecorder, the built-in stays running after the headset takes
+        // over (the switchback source) and is released when the dictation stops.
     }
     func stop() -> [Float] {
         let captured = samples
