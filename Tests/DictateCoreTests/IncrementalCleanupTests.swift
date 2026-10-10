@@ -123,7 +123,7 @@ struct IncrementalCleanupTests {
         let incremental = IncrementalCleaner(cleaner: cleaner(transport), finalIncludeExamples: false)
         for index in 0..<3 { incremental.append(index: index, text: chunkText) }
         try await transport.wait(1)
-        #expect(try await (transport.body(0)["messages"] as! [[String: String]]).count == 10)
+        #expect(try await (transport.body(0)["messages"] as! [[String: String]]).count == 2)
         try await transport.respond(0, chunkText)
         await incremental.waitForPending()
         let finish = Task { await incremental.finish(totalChunks: 3) }
@@ -131,6 +131,19 @@ struct IncrementalCleanupTests {
         #expect(try await (transport.body(1)["messages"] as! [[String: String]]).count == 2)
         try await transport.respond(1, Array(repeating: chunkText, count: 3).joined(separator: " "))
         #expect(await finish.value.mode == "incremental")
+    }
+
+    @Test func midCallPromptUnder400TokensAndOmitsFewShot() throws {
+        let transport = IncrementalTransport()
+        let cl = TranscriptCleaner(transport: transport, vocabulary: "Kubernetes, PostgreSQL, Acme Corp", apiKey: { "hermetic-key" })
+        let sample200 = String(repeating: "a", count: 200)
+        let request = cl.makeIncrementalRequest(text: sample200, context: "Some preceding context.", final: false, apiKey: "key")
+        let body = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+        let messages = body["messages"] as! [[String: String]]
+        #expect(messages.count == 2)
+        let totalChars = messages.reduce(0) { $0 + ($1["content"]?.count ?? 0) }
+        let tokensDiv4 = Double(totalChars) / 4.0
+        #expect(tokensDiv4 <= 400.0)
     }
 
     @Test(arguments: [true, false]) func raceStartsSingleAfter600AndFirstWins(singleWins: Bool) async throws {
@@ -345,9 +358,8 @@ struct IncrementalCleanupTests {
         #expect(result.calls == 2)
     }
 
-    /// v1.5.1: the final tail call omits the few-shot pairs (~80 ms on the user's fixture);
-    /// intermediate calls keep them.
-    @Test func finalCallOmitsFewShotByDefault() async throws {
+    /// v1.6 D7: both intermediate and final calls omit few-shot pairs.
+    @Test func midAndFinalCallsOmitFewShotByDefault() async throws {
         let transport = IncrementalTransport()
         let incremental = IncrementalCleaner(cleaner: cleaner(transport))
         for index in 0..<3 { incremental.append(index: index, text: chunkText) }
@@ -359,7 +371,7 @@ struct IncrementalCleanupTests {
         try await transport.wait(2)
         let intermediate = try await transport.body(0)["messages"] as! [[String: String]]
         let final = try await transport.body(1)["messages"] as! [[String: String]]
-        #expect(intermediate.count == 2 + 2 * TranscriptCleaner.examples.count)
+        #expect(intermediate.count == 2)
         #expect(final.count == 2)
         try await transport.respond(1, Array(repeating: chunkText, count: 2).joined(separator: " "))
         _ = await finish.value
