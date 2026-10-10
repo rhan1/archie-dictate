@@ -82,6 +82,7 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 - **Groq quota awareness:** The `x-ratelimit-*` counts from every Groq response are kept in `groq-quota.json` (counts only). When fewer than 10 % of an endpoint's daily requests remain, new dictations switch on their own: speech-to-text to Apple on-device, cleanup to local Ollama. The log shows `fallback=quota quota_low=stt|cleanup|both`. The switch ends when Groq's reset time passes.
 - **Warm connection:** While Dictate is idle (up to 2 h after the last dictation) it sends an unmetered `GET /models` every 4 min so the first chunk of the next dictation skips the TLS handshake. Set `DICTATE_KEEPWARM=0` to disable.
 - **Chunk-boundary repair:** When a chunk boundary splits a phrase like "uh, the screenshots" and Whisper hears "other screenshots", the two chunks are re-transcribed together once (at most 2 extra requests per dictation). Set `DICTATE_REJOIN_GUARD=0` to disable.
+- **Fast start:** The first ⌥ tap starts the microphone; the recording keeps audio from 150 ms before the second tap, so the first words are not lost.
 - **Force Apple-Only STT:** To force Apple on-device recognition for the LaunchAgent, set `DICTATE_STT=apple`:
   ```bash
   /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" ~/Library/LaunchAgents/<label>.plist 2>/dev/null
@@ -93,11 +94,15 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 
 ## Bluetooth headsets
 
-A microphone that is open on a Bluetooth headset switches it to the hands-free profile (16 kHz, poor music quality). Dictate releases the audio engine within 2 s after every dictation, so music returns to full quality. While the headset's microphone starts (about a second), Dictate records from the built-in microphone so the first words are not lost. The timeline in `dictate.stderr.log` shows `bt_profile=a2dp|hfp`, `bridge_ms` and `bridge_src`. A `bt_hfp_foreign=1` note means another app is holding the headset microphone while Dictate is idle. `tools/probes/bt-probe.swift` prints the headset's live sample rate.
+A microphone that is open on a Bluetooth headset switches it to the hands-free profile (16 kHz, poor music quality). Dictate releases the audio engine within 2 s after every dictation, so music returns to full quality. While the headset's microphone starts (about a second), Dictate records from the built-in microphone so the first words are not lost. The timeline in `dictate.stderr.log` shows `bt_profile=a2dp|hfp`, `bridge_ms` and `bridge_src`. A `bt_hfp_foreign=1` note means another app is holding the headset microphone while Dictate is idle. `tools/probes/bt-probe.swift` prints the headset's live sample rate. To check it on your own headset, run `tools/bt-proof.sh` (about two minutes, two short dictations); it ends with `BT-PROOF: PASS` or the reason it failed.
 
 ## Embedding (DictateKit)
 
-The `DictateKit` library product exposes the same engine to another app (`DictationEngine`, no pill or menu required). See [docs/HOSTING.md](docs/HOSTING.md).
+The `DictateKit` library product exposes the same engine to another app (`DictationEngine`, no pill or menu required). See [docs/HOSTING.md](docs/HOSTING.md). Hosts should wire their single ⌥ tap to `engine.tap()` (it pre-starts the microphone) and tee `engine.onDiagnostic` into their own log.
+
+## Keychain
+
+Dictate reads the Groq API key from the login keychain item `groq-api` through `/usr/bin/security`, so rebuilding or re-signing the app never shows a keychain password dialog. If the key cannot be read, dictation still works with Apple on-device recognition and local cleanup (`fallback=no_key` in the log).
 
 ## Vocabulary hints
 
