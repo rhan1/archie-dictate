@@ -42,3 +42,45 @@ public struct MicStartChain {
         return fields
     }
 }
+
+/// Input-node format check before the tap is installed. After the built-in mic is
+/// selected on a fresh engine, AUHAL keeps the previous default device's client
+/// format (e.g. 44.1 kHz headset vs 48 kHz built-in) and its input element does
+/// no sample-rate conversion; a rebuild re-creates the same stale pair (D-a:
+/// `builtin_start_failed`, RecorderError.noInput). Align the client format to
+/// the hardware first; rebuild at most once.
+public enum TapFormatPlan {
+    public struct Format: Equatable, Sendable, CustomStringConvertible {
+        public var sampleRate: Double
+        public var channels: UInt32
+        public init(sampleRate: Double, channels: UInt32) { self.sampleRate = sampleRate; self.channels = channels }
+        public var isValid: Bool { sampleRate > 0 && channels > 0 }
+        public var description: String { "\(Int(sampleRate))Hz/\(channels)ch" }
+    }
+    public enum Outcome: Equatable, Sendable { case ready(aligned: Bool, rebuilt: Bool) }
+    public struct Mismatch: Error, Equatable, CustomStringConvertible, LocalizedError {
+        public let hardware: Format
+        public let output: Format
+        public var description: String { "format_mismatch hw=\(hardware) out=\(output)" }
+        public var errorDescription: String? { description }
+    }
+
+    public static func run(device: MicChoice, formats: () throws -> (hardware: Format, output: Format),
+                           align: () throws -> Void, rebuild: () throws -> Void) throws -> Outcome {
+        var aligned = false, rebuilt = false
+        while true {
+            let (hardware, output) = try formats()
+            if hardware.isValid, hardware == output { return .ready(aligned: aligned, rebuilt: rebuilt) }
+            if hardware.isValid, device == .builtIn, !aligned {
+                try align()
+                aligned = true
+            } else if !rebuilt {
+                try rebuild()
+                rebuilt = true
+                aligned = false
+            } else {
+                throw Mismatch(hardware: hardware, output: output)
+            }
+        }
+    }
+}
