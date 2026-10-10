@@ -43,6 +43,8 @@ public final class AppController {
     private let trace = ProcessInfo.processInfo.environment["DICTATE_TRACE"] == "1"
 
     private var recordingStarted: Date?
+    private var btStart = "none"
+    private var btEndNotePending = false
     private var recordingTarget: InsertionTarget?
     private var lastDictation: String?
     private var lastDictationTimer: Timer?
@@ -238,7 +240,16 @@ public final class AppController {
 
     private func configureCapture() {
         capture.note = { AppController.note($0) }
-        capture.dropHooks = { [weak self] in self?.recorder.onPCMChunk = nil }
+        capture.dropHooks = { [weak self] in
+            guard let self else { return }
+            self.recorder.onPCMChunk = nil
+            guard self.btEndNotePending else { return }
+            self.btEndNotePending = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self else { return }
+                Self.note("bt_after3s=\(BluetoothProfile.sample()) engine_allocated=\(self.recorder.isAllocated)")
+            }
+        }
         capture.onEpochChanged = { [weak self] token in
             self?.recorder.onFirstBuffer = { [weak self] in
                 self?.capture.bufferArrived(at: ProcessInfo.processInfo.systemUptime, epoch: token)
@@ -361,6 +372,8 @@ public final class AppController {
         recordingTarget = Self.frontmostTarget()
         generation = CaptureEpoch()
         let token = generation
+        btStart = BluetoothProfile.sample()
+        btEndNotePending = true
         recordingStarted = Date()
         micStarting = true
         pill.show(.warming)
@@ -459,7 +472,7 @@ public final class AppController {
         let groqSTT = self.groqSTT
         let shadowEnabled = self.shadowEnabled
         let vocabularyPrompt = self.prompt
-        var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn,
+        var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn, btStart: btStart,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         Task {
@@ -693,6 +706,7 @@ public final class AppController {
         var warmMs: Int?
         var capture: AudioRecorder.CaptureStats
         var micFallback = false
+        var btStart = "none"
         var capturedSeconds: Double
         var peakDBFS: Double
         var cleanup: TranscriptCleaner.Stats?
@@ -704,7 +718,7 @@ public final class AppController {
 
         func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
-                "timeline:", "keys=groq:\(keyState)",
+                "timeline:", "keys=groq:\(keyState)", "bt_start=\(btStart)",
                 "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)",
                 "conflict=\(AppController.conflictingDictationApps())", "fmt=\(capture.startFormat)",
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",

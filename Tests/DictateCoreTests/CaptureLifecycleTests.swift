@@ -7,6 +7,12 @@ private final class FakeAudioEngine: CaptureEngine {
     enum Action { case succeed, swiftError, raise }
     var actions: [Action] = []
     var raisesUntilRebuild = false
+    // Allocation identities make retention visible independently of running/tap state.
+    final class Allocation {}
+    private(set) var allocation: Allocation? = Allocation()
+    private(set) var allocations = 1
+    private(set) var releases = 0
+    var isAllocated: Bool { allocation != nil }
     var isRunning = false
     var tapInstalled = false
     var observerInstalled = false
@@ -15,6 +21,7 @@ private final class FakeAudioEngine: CaptureEngine {
     var rebuilds = 0
     var events: [String] = []
     func start(device: MicChoice) throws {
+        if allocation == nil { allocation = Allocation(); allocations += 1 }
         attempts.append(device)
         events.append(device == .default ? "default" : "builtin")
         tapInstalled = true
@@ -30,7 +37,13 @@ private final class FakeAudioEngine: CaptureEngine {
         isRunning = false; tapInstalled = false; observerInstalled = false; converterInstalled = false
         return []
     }
-    func rebuild() { events.append("rebuild"); _ = stop(); rebuilds += 1; raisesUntilRebuild = false }
+    func release() { _ = stop(); allocation = nil; releases += 1 }
+    func rebuild() {
+        events.append("rebuild")
+        release()
+        allocation = Allocation(); allocations += 1
+        rebuilds += 1; raisesUntilRebuild = false
+    }
 }
 
 /// Catch at the event-loop boundary, outside the Swift lifecycle call.
@@ -42,6 +55,103 @@ private func appKitEvent(_ operation: () -> Void) -> NSError? {
 
 @Suite("CaptureLifecycle")
 struct CaptureLifecycleTests {
+    @Test(arguments: [CaptureLifecycle.End.finished(.ok), .finished(.held), .finished(.noSTT), .finished(.error), .silence, .cancel, .fail, .prewarmExpired, .maxDuration])
+    func everyEndPathReleasesEngine(path: CaptureLifecycle.End) {
+        let engine = FakeAudioEngine(), clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
+        lifecycle.firstTap()
+        if case .prewarmExpired = path {} else { #expect(lifecycle.beginRecording(at: 0)) }
+        #expect(engine.isAllocated) // positive control: every path starts with an allocation
+        lifecycle.end(path)
+        #expect(engine.isAllocated == false)
+        #expect(engine.releases > 0)
+    }
+
+    @Test func idleGuardReleasesLeftoverEngine() {
+        let engine = FakeAudioEngine(), clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
+        var notes: [String] = []
+        lifecycle.note = { notes.append($0) }
+        #expect(engine.isAllocated && lifecycle.warmup.phase == .off)
+        clock.advance(1.99)
+        #expect(engine.isAllocated && engine.releases == 0 && notes.isEmpty)
+        clock.advance(0.01)
+        #expect(engine.isAllocated == false)
+        #expect(engine.releases == 1)
+        #expect(notes == ["engine_idle_release"])
+        // A later stray rebuild while still idle is guarded too.
+        engine.rebuild()
+        clock.advance(2)
+        #expect(engine.isAllocated == false)
+        #expect(notes == ["engine_idle_release", "engine_idle_release"])
+    }
+
+    @Test func prewarmExpiryReleases() {
+        let engine = FakeAudioEngine(), clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
+        lifecycle.firstTap()
+        clock.advance(0.69)
+        #expect(engine.isAllocated && lifecycle.hasPendingPrewarmExpiry)
+        clock.advance(0.01)
+        #expect(engine.isAllocated == false)
+        #expect(lifecycle.warmup.phase == .off && !lifecycle.hasPendingPrewarmExpiry)
+    }
+
+    @Test func nextStartAllocatesFresh() {
+        let engine = FakeAudioEngine()
+        let capture = CaptureLifecycle(engine: engine, scheduler: RedTeamClock())
+        #expect(capture.beginRecording(at: 0))
+        weak let old = engine.allocation
+        capture.end(.finished(.ok))
+        #expect(engine.isAllocated == false)
+        #expect(old == nil)
+        #expect(capture.beginRecording(at: 1))
+        #expect(engine.isAllocated && engine.allocations == 2)
+        #expect(engine.attempts == [.default, .default])
+        capture.end(.cancel)
+    }
+
+    @Test func rebuildReleasesOldEngine() {
+        let engine = FakeAudioEngine()
+        engine.actions = [.swiftError, .succeed]
+        weak let old = engine.allocation
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: RedTeamClock())
+        #expect(lifecycle.beginRecording(at: 0))
+        #expect(old == nil)
+        #expect(engine.isAllocated && engine.allocations == 2 && engine.releases == 1)
+        #expect(engine.rebuilds == 1 && engine.attempts == [.default, .default])
+        lifecycle.end(.cancel)
+        #expect(engine.isAllocated == false)
+    }
+
+    @Test func idleGuardPreservesRecordingAndPrewarm() throws {
+        let engine = FakeAudioEngine(), clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
+        let staleIdle = try #require(clock.jobs.first)
+        lifecycle.firstTap()
+        staleIdle.action() // cancelled, already delivered callback
+        clock.advance(0.69)
+        #expect(engine.isAllocated && engine.releases == 0)
+        #expect(lifecycle.beginRecording(at: clock.now))
+        lifecycle.bufferArrived(at: clock.now)
+        staleIdle.action()
+        clock.advance(2)
+        #expect(engine.isAllocated && engine.isRunning && engine.releases == 0)
+        lifecycle.end(.cancel)
+        clock.advance(2)
+        #expect(!engine.isAllocated && engine.releases == 1)
+    }
+
+    @Test func idleGuardUsesConfiguredDeadline() {
+        let engine = FakeAudioEngine(), clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock, idleReleaseSeconds: 0.5)
+        #expect(lifecycle.idleReleaseSeconds == 0.5)
+        clock.advance(0.49)
+        #expect(engine.isAllocated && engine.releases == 0)
+        clock.advance(0.01)
+        #expect(!engine.isAllocated && engine.releases == 1)
+    }
+
     @Test func heldEndThenNextStartRecords() {
         let engine = FakeAudioEngine(), lifecycle: CaptureLifecycle
         lifecycle = CaptureLifecycle(engine: engine)
