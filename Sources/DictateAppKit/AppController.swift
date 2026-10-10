@@ -500,7 +500,9 @@ public final class AppController {
                 let streaming = GroqChunkedTranscriber(transport: dependencies?.sttTransport ?? URLSessionTransport(timeout: 30), apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
                     return key
-                }, prompt: prompt, onChunkText: { index, text in incremental?.append(index: index, text: text) },
+                }, prompt: prompt,
+                   rejoinGuard: GroqChunkedTranscriber.rejoinGuardEnabled(environment: ProcessInfo.processInfo.environment),
+                   onChunkText: { index, text in incremental?.append(index: index, text: text) },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
                 recorder.onPCMChunk = { pcm in
@@ -826,7 +828,7 @@ public final class AppController {
             if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
-                           "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)",
+                           "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
                            "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
                 for call in chunked.calls {

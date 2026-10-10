@@ -780,17 +780,22 @@ struct F3ProbeTests {
     }
 
     @Test func rejoinTriggerControls() {
-        for text in ["other screenshots here", "  IT? TurnoutWatch is still running", "this still running", "the other screenshots"] {
+        // D5: only "other " / "it?" at the start of the current chunk (leading punctuation ignored).
+        for text in ["other screenshots here", "  IT? TurnoutWatch is still running", "...Other screenshots", "\"other screenshots"] {
             #expect(GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: text, cutKind: .pause, quietRunMs: 150))
             #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "Done.", current: text, cutKind: .forced, quietRunMs: nil))
         }
-        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: "the screenshots here", cutKind: .pause, quietRunMs: 150))
+        for text in ["this still running", "the other screenshots", "the screenshots here", "others did it"] {
+            #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: text, cutKind: .pause, quietRunMs: 150))
+        }
         #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "Done.", current: "Other teams work", cutKind: .pause, quietRunMs: 150))
         #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: "other screenshots", cutKind: .pause, quietRunMs: 400))
         #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "and uh", current: "other screenshots", cutKind: .final, quietRunMs: 150))
         #expect(GroqChunkedTranscriber.shouldRejoin(previous: "check it", current: "TurnoutWatch", cutKind: .forced, quietRunMs: nil))
-        #expect(GroqChunkedTranscriber.shouldRejoin(previous: "the DB99", current: "", cutKind: .pause, quietRunMs: 250))
-        #expect(GroqChunkedTranscriber.rejoinTriggers.contains("other "))
+        #expect(GroqChunkedTranscriber.shouldRejoin(previous: "can you also check it?", current: "TurnoutWatch this still", cutKind: .forced, quietRunMs: nil))
+        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "did you send it?", current: "TurnoutWatch", cutKind: .forced, quietRunMs: nil))
+        #expect(!GroqChunkedTranscriber.shouldRejoin(previous: "the DB99", current: "", cutKind: .pause, quietRunMs: 250))
+        #expect(GroqChunkedTranscriber.rejoinTriggers == ["other ", "it?"])
     }
 
     @Test(arguments: ["disabled", "success", "failure"]) func guardRequestAndReplacement(mode: String) async throws {

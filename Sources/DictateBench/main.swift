@@ -109,7 +109,8 @@ func benchQuoted(_ value: String) -> String {
 final class BenchChunkTexts: @unchecked Sendable {
     private let lock = NSLock()
     private var texts: [Int: String] = [:]
-    func append(index: Int, text: String) { lock.withLock { texts[index] = text } }
+    // First arrival wins: a rejoin re-emits joined text, but the chunk lines show what each chunk heard.
+    func append(index: Int, text: String) { lock.withLock { if texts[index] == nil { texts[index] = text } } }
     var snapshot: [Int: String] { lock.withLock { texts } }
 }
 
@@ -420,9 +421,9 @@ case "stt-groq-chunked":
     let promptExtra = env["BENCH_PROMPT_EXTRA"]
     let benchPrompt = prompt + (promptExtra.map { " " + $0 } ?? "")
     let finalModel = env["BENCH_FINAL_MODEL"]
-    let rejoinGuard = env["BENCH_REJOIN_GUARD"] == "1"
+    let rejoinGuard = env["BENCH_REJOIN_GUARD"] != "0"  // follows the app default (on)
     let shortPrompt = env["BENCH_FINAL_SHORT_PROMPT"] == "1"
-    print("probe show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" || rejoinGuard ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
+    print("probe show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let transport = URLSessionTransport(timeout: 30)
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
@@ -438,7 +439,7 @@ case "stt-groq-chunked":
         copy.includeExamples = !shortPrompt
         return copy
     }()
-    let useIncremental = endToEnd && !rejoinGuard && ProcessInfo.processInfo.environment["BENCH_INCREMENTAL"] != "0"
+    let useIncremental = endToEnd && ProcessInfo.processInfo.environment["BENCH_INCREMENTAL"] != "0"
     for run in 1...runs {
         var chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
         let incremental = useIncremental ? IncrementalCleaner(cleaner: cleaner, finalIncludeExamples: !shortPrompt) : nil
