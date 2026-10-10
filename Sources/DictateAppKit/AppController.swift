@@ -1023,7 +1023,14 @@ public final class AppController {
 
     /// Diagnostics go to stderr (the LaunchAgent routes it to dictate.stderr.log),
     /// never to dictate.log, and never contain transcript text or the key.
+    private static let noteLock = NSLock()
+    nonisolated(unsafe) private static var noteSink: (@Sendable (String) -> Void)?
+    /// A host's diagnostics sink (the process stderr is the host's, not dictate.stderr.log).
+    static func setNoteSink(_ sink: (@Sendable (String) -> Void)?) { noteLock.withLock { noteSink = sink } }
+
     static func note(_ message: String) {
-        FileHandle.standardError.write(Data("[\(ISO8601DateFormatter().string(from: Date()))] dictate: \(message)\n".utf8))
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] dictate: \(message)"
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+        noteLock.withLock { noteSink }?(line)
     }
 }

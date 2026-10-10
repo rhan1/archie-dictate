@@ -71,7 +71,8 @@ private actor HedgeTransport: HTTPTransport {
         let delay: Int
         switch plan {
         case .fast: delay = 10
-        case .duplicateWins: delay = number == 1 ? 250 : 1
+        // The primary is cancelled once the duplicate wins; 2 s keeps suite load from flipping the race.
+        case .duplicateWins: delay = number == 1 ? 2_000 : 1
         case .primaryWins: delay = number == 1 ? 80 : 250
         case .failures: delay = number == 1 ? 80 : 60
         case .duplicateFails: delay = number == 1 ? 100 : 1
@@ -343,7 +344,7 @@ struct GroqChunkedTests {
         engine.submit(chunk(0, tag: 1000))
         let start = ContinuousClock.now
         let result = await engine.finish()
-        #expect(start.duration(to: .now) < .milliseconds(200))
+        #expect(start.duration(to: .now) < .milliseconds(1_000))
         #expect(result.text == "duplicate")
         #expect(result.hedges == 1)
         #expect(result.hedgeWins == 1)

@@ -39,6 +39,12 @@ public struct DictationTimeline: Sendable, Equatable {
     public var onState: (DictationState) -> Void = { _ in }
     public var onTranscript: (String, DictationTimeline) -> Void = { _, _ in }
     public var onGroqRateLimit: ((GroqRateLimit) -> Void)?
+    /// Every diagnostic line (timeline, keys, bridge, media; counts only, never text), on any
+    /// thread. Standalone Dictate writes these to its stderr log; a host should tee them to its own.
+    /// Process-wide: the most recently set engine's sink receives them.
+    public var onDiagnostic: (@Sendable (String) -> Void)? {
+        didSet { AppController.setNoteSink(onDiagnostic) }
+    }
     public var surface: Surface {
         get { controller.engineSurface }
         set { controller.engineSurface = newValue }

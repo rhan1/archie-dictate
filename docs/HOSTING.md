@@ -39,6 +39,18 @@ in `onTranscript`, without cleanup or clipboard changes. Completion returns to
 to use Apple on-device STT and local Ollama cleanup. Mode and fallback are sampled
 at recording start. Quota sessions add `fallback=quota` to the timeline and log.
 
+`onDiagnostic` receives every diagnostic line the standalone app writes to
+`dictate.stderr.log` (`timeline:` with `mic=`, `fmt=`, `bridge_src`, `first_buffer_ms`,
+`peak_dbfs`; `keys=`; `media=`), on any thread, counts only. In a host those lines
+otherwise go to the host's own stderr; tee them into the host's log.
+
+A host that mutes media for its own capture can reuse the same mute logic:
+`OutputMuter(device: SystemOutputMute(), stateFile: <its own muted.state>)` — mute FLAG
+only (never volume), verified restore, 5 s settle re-check across Bluetooth profile
+flips, crash record kept until verified; call `recoverIfNeeded()` at launch. Dictate
+mutes on the first live buffer (after any headset profile flip) and restores on
+every end path.
+
 `onGroqRateLimit` runs on the main actor for each Groq response, including errors,
 hedges, warmup, and incremental/final/racing cleanup. Missing or invalid header
 counts are nil. `.none` suppresses every panel operation while preserving outcome

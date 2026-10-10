@@ -3,13 +3,14 @@ import DictateCore
 
 /// The default output device's MUTE FLAG via CoreAudio. Mute only: this file
 /// must never reference a volume-level selector (grep-checked in the report).
-final class SystemOutputMute: OutputMuteDevice {
+public final class SystemOutputMute: OutputMuteDevice {
+    public init() {}
     private static func address(_ selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope,
                                 element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
     }
 
-    func defaultOutputUID() -> String? {
+    public func defaultOutputUID() -> String? {
         var addr = Self.address(kAudioHardwarePropertyDefaultOutputDevice, scope: kAudioObjectPropertyScopeGlobal)
         var id = AudioDeviceID(0)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -21,7 +22,7 @@ final class SystemOutputMute: OutputMuteDevice {
         return uid.takeRetainedValue() as String
     }
 
-    func isMuted(uid: String) -> Bool? {
+    public func isMuted(uid: String) -> Bool? {
         guard let device = device(for: uid) else { return nil }
         var flags: [Bool] = []
         for element in muteElements(device) {
@@ -36,7 +37,7 @@ final class SystemOutputMute: OutputMuteDevice {
         return first
     }
 
-    func setMuted(_ muted: Bool, uid: String) -> Bool {
+    public func setMuted(_ muted: Bool, uid: String) -> Bool {
         guard let device = device(for: uid) else { return false }
         let elements = muteElements(device)
         guard !elements.isEmpty else { return false }
@@ -51,7 +52,7 @@ final class SystemOutputMute: OutputMuteDevice {
 
     /// Watch the muted UID even when it is no longer the default output.
     /// Rebind its rate listener when CoreAudio replaces its object on reconnect.
-    func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation? {
+    public func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation? {
         ChangeWatch(owner: self, uid: uid, action: action)
     }
 
