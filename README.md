@@ -5,7 +5,7 @@ Dictate is a menu-bar dictation application for macOS. Press **⌥⌥** (double-
 ## Quick start
 
 1. Install the Xcode command line tools (`xcode-select --install`) and [Homebrew](https://brew.sh).
-2. `git clone <repo-url> && cd dictate` — all `tools/` commands run from the repo root.
+2. `git clone https://github.com/rhan1/archie-dictate.git && cd archie-dictate` — all `tools/` commands run from the repo root.
 3. Get a Groq API key at [console.groq.com](https://console.groq.com).
 4. Store the key in your login keychain: `security add-generic-password -s groq-api -a "$USER" -w '<your-groq-key>'`
 5. Install Ollama and start the fallback cleanup model (optional — offline cleanup fallback): `brew install ollama && brew services start ollama && ollama pull llama3.2:3b-instruct-q4_K_M`
@@ -117,7 +117,7 @@ Teach Dictate domain-specific terms, technical names, or phonetic corrections:
 
 ## Benchmarks (optional)
 
-Run benchmarks via `tools/bench.sh`, which signs the benchmark binary and passes the Groq API key via the environment. The bench never reads the keychain itself: `tools/bench.sh` fetches the key with the `security` tool and passes it in the environment.
+Run benchmarks via `tools/bench.sh`, which signs the benchmark binary and passes the Groq API key via the environment. The benchmark binary never reads the keychain itself: the `tools/bench.sh` wrapper fetches the key with the `security` tool and passes it in the environment.
 
 Models: Groq cleanup for `cleanup` / `eval groq` is `qwen/qwen3.8-27b` (the cleanup bench always uses Groq); local cleanup for `cleanup-local` / `eval local` is `llama3.2:3b-instruct-q4_K_M`.
 
