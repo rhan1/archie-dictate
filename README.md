@@ -79,6 +79,9 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 
 - **Default (`groq-chunked`):** Audio is uploaded in short chunks while you talk, minimizing latency when dictation ends.
 - **Automatic Fallback:** Apple on-device speech recognition (`Speech.framework`) serves as the automatic fallback if Groq chunk uploads fail.
+- **Groq quota awareness:** The `x-ratelimit-*` counts from every Groq response are kept in `groq-quota.json` (counts only). When fewer than 10 % of an endpoint's daily requests remain, new dictations switch on their own: speech-to-text to Apple on-device, cleanup to local Ollama. The log shows `fallback=quota quota_low=stt|cleanup|both`. The switch ends when Groq's reset time passes.
+- **Warm connection:** While Dictate is idle (up to 2 h after the last dictation) it sends an unmetered `GET /models` every 4 min so the first chunk of the next dictation skips the TLS handshake. Set `DICTATE_KEEPWARM=0` to disable.
+- **Chunk-boundary repair:** When a chunk boundary splits a phrase like "uh, the screenshots" and Whisper hears "other screenshots", the two chunks are re-transcribed together once (at most 2 extra requests per dictation). Set `DICTATE_REJOIN_GUARD=0` to disable.
 - **Force Apple-Only STT:** To force Apple on-device recognition for the LaunchAgent, set `DICTATE_STT=apple`:
   ```bash
   /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" ~/Library/LaunchAgents/<label>.plist 2>/dev/null
@@ -87,6 +90,14 @@ Use the **left Option** key (press and release cleanly without other modifier ke
   launchctl bootout "gui/$UID/<label>" 2>/dev/null; sleep 2; launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/<label>.plist
   ```
   *Note:* launchd only re-reads the plist on bootstrap (a plain restart reuses the cached job). Re-running `tools/install-launchagent.sh` regenerates the plist and drops this override, so repeat these lines after it. `<label>` is `DICTATE_LABEL` (default `dev.dictate.app`).
+
+## Bluetooth headsets
+
+A microphone that is open on a Bluetooth headset switches it to the hands-free profile (16 kHz, poor music quality). Dictate releases the audio engine within 2 s after every dictation, so music returns to full quality. While the headset's microphone starts (about a second), Dictate records from the built-in microphone so the first words are not lost. The timeline in `dictate.stderr.log` shows `bt_profile=a2dp|hfp`, `bridge_ms` and `bridge_src`. A `bt_hfp_foreign=1` note means another app is holding the headset microphone while Dictate is idle. `tools/probes/bt-probe.swift` prints the headset's live sample rate.
+
+## Embedding (DictateKit)
+
+The `DictateKit` library product exposes the same engine to another app (`DictationEngine`, no pill or menu required). See [docs/HOSTING.md](docs/HOSTING.md).
 
 ## Vocabulary hints
 
@@ -112,6 +123,7 @@ Teach Dictate domain-specific terms, technical names, or phonetic corrections:
   - `~/Library/Logs/Dictate/dictate.stderr.log`: LaunchAgent process stderr and diagnostic output.
 - **State (`~/Library/Application Support/Dictate/`):**
   - `muted.state`: Mute-recovery state file used to restore audio if the app terminates abnormally.
+  - `groq-quota.json`: Latest Groq rate-limit counts per endpoint (numbers and dates only).
   - `build.env`: Optional build environment overrides file.
   - `vocab-hints.txt`: Custom vocabulary terms and phonetic hints.
 
