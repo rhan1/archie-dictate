@@ -584,7 +584,8 @@ public final class AppController {
             apple = engine
             if chunkedEnabled {
                 let keys = keyStore
-                let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner) : nil
+                let qStore = quotaStore
+                let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
                 incrementalCleaner = incremental
                 let streaming = GroqChunkedTranscriber(transport: sttTransport, apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
