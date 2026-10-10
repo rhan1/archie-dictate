@@ -355,6 +355,16 @@ struct CaptureBridgeTests {
             fed += h.frames.count
         }
         #expect(restarts == 1 && fed == 20 * 2400)
+        // A working headset-only link that pauses (DSP gates to zeros) is never cut by a restart.
+        var working = CaptureFeed()
+        working.start(defaultInput: .bluetooth, hasBuiltin: false)
+        _ = working.recordingStarted(at: 10, preRoll: 0)
+        var cut = 0
+        for i in 0..<30 {
+            let h = working.accept(i < 5 ? tone(0.05) : zeros, source: .headset, at: 10 + Double(i) * 0.1)
+            if h.restartHeadset { cut += 1 }
+        }
+        #expect(cut == 0)
         var usb = CaptureFeed()
         usb.start(defaultInput: .other, hasBuiltin: true)                   // not Bluetooth: never
         _ = usb.recordingStarted(at: 10, preRoll: 0)
@@ -401,6 +411,28 @@ struct CaptureBridgeTests {
         var none = CaptureFeed()
         none.start(defaultInput: .bluetooth, hasBuiltin: false)
         #expect(none.headsetFailed().event == nil)                          // nothing carries: the owner fails
+    }
+
+    @Test func headsetRecoveryGapIsNotStale() {
+        var feed = feedStarted()
+        for i in 0..<3 {                                                    // headset carries from 10.1
+            let t = 10 + Double(i) * 0.1
+            _ = feed.accept(tone(0.05), source: .builtin, at: t)
+            _ = feed.accept(tone(0.05), source: .headset, at: t)
+        }
+        feed.setHeadsetRecovering(true)                                     // rebuild: no headset buffers
+        var events: [CaptureBridge.Event] = []
+        for i in 3..<25 {                                                   // 2.2 s of built-in only
+            events += [feed.accept(tone(0.05), source: .builtin, at: 10 + Double(i) * 0.1).event].compactMap { $0 }
+        }
+        #expect(events.isEmpty && feed.bridge.state == .switched)
+        feed.setHeadsetRecovering(false)                                    // the stale clock restarts now
+        #expect(feed.accept(tone(0.05), source: .builtin, at: 12.5).event == nil)
+        #expect(feed.accept(tone(0.05), source: .headset, at: 12.5).frames.count == 2400)
+        for i in 26..<40 {                                                  // headset never returns
+            events += [feed.accept(tone(0.05), source: .builtin, at: 10 + Double(i) * 0.1).event].compactMap { $0 }
+        }
+        #expect(events == [.switchback])
     }
 
     @Test func headsetThatStopsDeliveringHandsBackOnBuiltinBuffers() {
