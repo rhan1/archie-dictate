@@ -6,31 +6,49 @@ import DictateCore
 public final class AppController {
     private var machine = DictationStateMachine()
     private let hotkeys = HotkeyMonitor()
-    private let recorder = AudioRecorder()
-    private let pill = PillPanel()
-    private let statusItem = StatusItemController()
-    private let inserter = TextInserter()
-    private let keyStore = KeyStore()
-    private var prompt: String { Vocabulary.buildPrompt() }
+    private let recorder: EngineRecorder
+    private let dependencies: EngineDependencies?
+    let pill: EnginePanel
+    private var statusItem: StatusItemController?
+    private let inserter: TextInserter
+    private let keyStore: KeyStore
+    private let paths: AppPaths
+    var engineOnState: ((DictateAppKit.DictationState) -> Void)?
+    var engineOnTranscript: ((String, DictationTimeline) -> Void)?
+    private let rateLimitRelay = EngineRateLimitRelay()
+    var engineOnGroqRateLimit: ((GroqRateLimit) -> Void)? {
+        get { MainActor.assumeIsolated { rateLimitRelay.callback } }
+        set { MainActor.assumeIsolated { rateLimitRelay.callback = newValue } }
+    }
+    var engineMode: DictationEngine.Mode
+    var forceFallback: FallbackOverride?
+    var engineSurface: Surface {
+        get { pill.surface }
+        set { pill.surface = newValue }
+    }
+    private var sessionPolicy = EnginePolicy()
+    private var engineConfigured = false
+    private lazy var facade = MainActor.assumeIsolated { DictationEngine(controller: self) }
+    private var prompt: String { Vocabulary.buildPrompt(fileURL: paths.vocabularyURL) }
     /// Local cleanup is the fallback when Groq fails.
-    private let localCleaner: TranscriptCleaner
+    private var localCleaner: TranscriptCleaner
     /// Cleanup default (G7 round 2): Groq qwen3.8-27b, 10/10 quality, p50 367 ms.
-    private let groqCleaner: TranscriptCleaner
+    private var groqCleaner: TranscriptCleaner
     /// Batch Groq STT is used only for explicitly enabled shadow QA.
     private let groqSTT: TranscriptionClient
-    private var apple: AppleTranscriber?
+    private var apple: EngineAppleSession?
     public static let defaultSTTEngine = "groq-chunked"
     private let sttEngine = ProcessInfo.processInfo.environment["DICTATE_STT"] == "apple"
         ? "apple" : AppController.defaultSTTEngine
-    private var chunkedEnabled: Bool { sttEngine == "groq-chunked" }
-    private var chunked: GroqChunkedTranscriber?
+    private var chunkedEnabled: Bool { (sttEngine == "groq-chunked" || sessionPolicy.mode == .captureOnly) && sessionPolicy.usesGroq }
+    private var chunked: EngineChunkSession?
     private var incrementalCleaner: IncrementalCleaner?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private lazy var capture = CaptureLifecycle(engine: recorder, scheduler: captureScheduler)
     /// Media keeps playing, muted while recording. Pausing is the fallback
     /// for devices without a settable output mute flag.
-    private let muter = OutputMuter(device: SystemOutputMute())
+    private let muter: OutputMuter
     private let media = MediaPauser(control: SystemMedia())
     private var muteWatchdog: DispatchWorkItem?
     private var signalSource: DispatchSourceSignal?
@@ -57,30 +75,56 @@ public final class AppController {
     private var outcomeTimer: Timer?
     private var recoveryTap: DispatchWorkItem?
 
-    public init() {
-        let prompt = Vocabulary.buildPrompt()
+    public convenience init() {
+        self.init(keyStore: KeyStore(), paths: AppPaths(), surface: .pill, mode: .dictate)
+    }
+
+    init(keyStore: KeyStore, paths: AppPaths, surface: Surface, mode: DictationEngine.Mode,
+         dependencies: EngineDependencies? = nil) {
+        self.dependencies = dependencies
+        recorder = dependencies?.recorder ?? AudioRecorder()
+        inserter = dependencies?.inserter ?? TextInserter()
+        self.keyStore = keyStore
+        self.paths = paths
+        pill = EnginePanel(surface: surface, factory: dependencies?.panelFactory ?? { PillPanel() })
+        engineMode = mode
+        muter = OutputMuter(device: SystemOutputMute(), stateFile: paths.mutedStateURL)
+        let prompt = Vocabulary.buildPrompt(fileURL: paths.vocabularyURL)
         let keys = keyStore
         let groqKey: @Sendable () throws -> String = {
             guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
             return key
         }
-        var local = TranscriptCleaner(transport: URLSessionTransport(timeout: 2), endpoint: TranscriptCleaner.ollamaEndpoint,
+        var local = TranscriptCleaner(transport: dependencies?.localCleanupTransport ?? URLSessionTransport(timeout: 2), endpoint: TranscriptCleaner.ollamaEndpoint,
                                          model: TranscriptCleaner.localModel, vocabulary: prompt, apiKey: { "ollama" })
         local.reloadVocabularyFromHints = true
         localCleaner = local
-        var groq = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5), endpoint: TranscriptCleaner.groqEndpoint,
+        var groq = TranscriptCleaner(transport: dependencies?.groqCleanupTransport ?? URLSessionTransport(timeout: 1.5), endpoint: TranscriptCleaner.groqEndpoint,
                                      model: TranscriptCleaner.defaultModel, vocabulary: prompt, apiKey: groqKey)
         groq.reasoningEffort = "none"
         groq.reloadVocabularyFromHints = true
         groqCleaner = groq
-        var whisper = TranscriptionClient(transport: URLSessionTransport(timeout: 30), apiKey: groqKey)
+        let shadowTransport = EngineGroqTransport(transport: dependencies?.sttTransport ?? URLSessionTransport(timeout: 30),
+            observer: { [rateLimitRelay] in rateLimitRelay.observe($0) })
+        var whisper = TranscriptionClient(transport: shadowTransport, apiKey: groqKey)
         whisper.endpointURL = TranscriptionClient.groqEndpoint
         whisper.modelName = "whisper-large-v3-turbo"
         groqSTT = whisper
+        groqCleaner.onGroqRateLimit = { [rateLimitRelay] in rateLimitRelay.observe($0) }
+        // Default paths keep today's reload behavior; hosts can isolate vocabulary.
+        if paths.vocabularyURL != AppPaths().vocabularyURL {
+            localCleaner.reloadVocabularyFromHints = false
+            groqCleaner.reloadVocabularyFromHints = false
+            let hints = VocabHints.promptSentence(VocabHints.load(fileURL: paths.vocabularyURL))
+            localCleaner.hintsSentence = hints
+            groqCleaner.hintsSentence = hints
+        }
     }
 
     public func start() {
-        configureCapture()
+        _ = facade // Standalone uses the same public controls as an embedding host.
+        statusItem = StatusItemController()
+        configureEngine()
         do {
             let copied = try AppPaths.migrate()
             AppController.note("migrated=\(copied.isEmpty ? "none" : copied.joined(separator: ","))")
@@ -89,16 +133,13 @@ public final class AppController {
         }
         keyStore.prefetch(services: ["groq-api"])
         logKeyStates()
-        hotkeys.onSignal = { [weak self] signal in self?.hotkey(signal) }
-        hotkeys.onEscape = { [weak self] in self?.escape() }
-        pill.onCancel = { [weak self] in self?.cancel() }
-        pill.onFinish = { [weak self] in self?.finishButton() }
-        statusItem.onToggle = { [weak self] in self?.doubleTap() }
-        statusItem.onPasteLastDictation = { [weak self] in
+        hotkeys.onSignal = { [weak self] signal in MainActor.assumeIsolated { self?.facade.handle(signal) } }
+        hotkeys.onEscape = { [weak self] in MainActor.assumeIsolated { self?.facade.escape() } }
+        statusItem?.onToggle = { [weak self] in MainActor.assumeIsolated { self?.facade.handle(.doubleTap) } }
+        statusItem?.onPasteLastDictation = { [weak self] in
             guard let self, let text = self.lastDictation else { return }
             self.inserter.insert(text)
         }
-        recorder.onLevel = { [weak self] level in self?.pill.push(level: level) }
 
         let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         let tapOK = hotkeys.start()
@@ -119,6 +160,47 @@ public final class AppController {
             self?.micAvailable = granted
             AppController.note("microphone=\(granted)")
         }
+    }
+
+    func configureEngine() {
+        guard !engineConfigured else { return }
+        engineConfigured = true
+        configureCapture()
+        pill.onCancel = { [weak self] in self?.cancel() }
+        pill.onFinish = { [weak self] in self?.finishButton() }
+        pill.onMode = { [weak self] mode in
+            switch mode {
+            case .warming: self?.engineOnState?(.warming)
+            case .recording: self?.engineOnState?(.recording(level: 0))
+            case .transcribing: self?.engineOnState?(.transcribing)
+            case .hidden: self?.engineOnState?(.idle)
+            case .error: break // Outcome supplies the exact PillOutcome word/preview.
+            }
+        }
+        recorder.onLevel = { [weak self] level in
+            guard let self else { return }
+            self.pill.push(level: level)
+            if self.machine.state == .recording { self.engineOnState?(.recording(level: max(0, min(1, level)))) }
+        }
+    }
+
+    func engineStart() {
+        configureEngine()
+        guard machine.state == .idle else { return }
+        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api"]) }
+        let requestAccess = dependencies?.requestMicrophoneAccess ?? AudioRecorder.requestMicrophoneAccess
+        requestAccess { [weak self] in self?.micAvailable = $0 }
+        doubleTap()
+    }
+    func engineFinish() { finishButton() }
+    func engineCancel() { cancel() }
+    func engineEscape() { escape() }
+    func engineHotkey(_ signal: TapSignal) { hotkey(signal) }
+    func enginePasteHeld() { outcomeEvent(.recoverTap) }
+    func engineCopyHeld() {
+        guard let text = outcomeText, !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// ⌘V is only delivered once Accessibility is granted; note the moment it is.
@@ -170,8 +252,8 @@ public final class AppController {
         if signal == .doubleTap { clearOutcome() }
         if signal == .tap, machine.state == .idle {
             clearOutcome()
-            if fakeTranscript == nil {
-                Task { [groqCleaner] in await groqCleaner.warmUp() }
+            if fakeTranscript == nil, engineMode == .dictate {
+                if forceFallback == nil { Task { [groqCleaner] in await groqCleaner.warmUp() } }
                 warmLocalModel()
             }
             prewarmEngine()
@@ -188,11 +270,12 @@ public final class AppController {
         Self.note("keys=groq:\(state)")
     }
 
-    private func showOutcome(_ kind: PillOutcome.Kind, text: String? = nil) {
+    func showOutcome(_ kind: PillOutcome.Kind, text: String? = nil) {
         clearOutcome()
         outcomeText = text
         pillOutcome = PillOutcome(kind, hasText: text?.isEmpty == false)
         renderOutcome()
+        engineOnState?(.outcome(kind, text: text))
         guard pillOutcome?.isVisible == true else { return }
         let start = ProcessInfo.processInfo.systemUptime
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -209,7 +292,7 @@ public final class AppController {
         let text = outcomeText
         if output.label == nil { clearOutcome() }
         else { renderOutcome() }
-        if output.pasteHeldText, let text { inserter.insert(text) }
+        if output.pasteHeldText, let text { inserter.insert(text); engineOnState?(.pasted) }
     }
 
     private func renderOutcome() {
@@ -283,7 +366,7 @@ public final class AppController {
     /// Recording is live: mute the output (media keeps playing). Only a device
     /// with no mute flag falls back to pausing media.
     private func pauseMedia() {
-        guard fakeTranscript == nil else { return }
+        guard fakeTranscript == nil, dependencies?.manageMedia != false else { return }
         if let event = muter.recoverIfNeeded() { mediaLog.append(event.rawValue) }
         let event = muter.mute()
         switch event {
@@ -313,6 +396,7 @@ public final class AppController {
     /// Every end path (paste, cancel, error, silence, cap) restores the mute
     /// flag on the device we muted, and resumes anything the fallback paused.
     private func resumeMedia() -> String {
+        guard dependencies?.manageMedia != false else { return "none" }
         muteWatchdog?.cancel()
         if let event = muter.restore() { mediaLog.append(event.rawValue) }
         if let event = media.resumeIfWePaused() { mediaLog.append(event.rawValue) }
@@ -369,7 +453,9 @@ public final class AppController {
     private func beginRecording() {
         clearOutcome()
         logKeyStates()
-        recordingTarget = Self.frontmostTarget()
+        sessionPolicy = EnginePolicy(mode: engineMode, fallback: forceFallback)
+        if let dependencies { recordingTarget = dependencies.frontmostTarget() }
+        else { recordingTarget = Self.frontmostTarget() }
         generation = CaptureEpoch()
         let token = generation
         btStart = BluetoothProfile.sample()
@@ -377,7 +463,7 @@ public final class AppController {
         recordingStarted = Date()
         micStarting = true
         pill.show(.warming)
-        statusItem.setRecording(true)
+        statusItem?.setRecording(true)
         Task { @MainActor [weak self] in
             guard let self else { return }
             let cancelled = { self.generation !== token || self.machine.state != .recording }
@@ -401,16 +487,17 @@ public final class AppController {
 
     private func attachTranscribers() {
         if fakeTranscript == nil {
-            let engine = AppleTranscriber()
+            let engine = dependencies?.makeApple() ?? AppleTranscriber()
             apple = engine
             if chunkedEnabled {
                 let keys = keyStore
-                let incremental = IncrementalCleaner(cleaner: groqCleaner)
+                let incremental = sessionPolicy.usesCleanup ? IncrementalCleaner(cleaner: groqCleaner) : nil
                 incrementalCleaner = incremental
-                let streaming = GroqChunkedTranscriber(transport: URLSessionTransport(timeout: 30), apiKey: {
+                let streaming = GroqChunkedTranscriber(transport: dependencies?.sttTransport ?? URLSessionTransport(timeout: 30), apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
                     return key
-                }, prompt: prompt, onChunkText: { index, text in incremental.append(index: index, text: text) })
+                }, prompt: prompt, onChunkText: { index, text in incremental?.append(index: index, text: text) },
+                   onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
                 recorder.onPCMChunk = { pcm in
                     engine.append(pcm)
@@ -420,7 +507,9 @@ public final class AppController {
                 recorder.onPCMChunk = { pcm in engine.append(pcm) }
             }
             Task { try? await engine.start() }
-            Task { [groqCleaner] in await groqCleaner.warmUp() }
+            if sessionPolicy.usesCleanup, sessionPolicy.usesGroq {
+                Task { [groqCleaner] in await groqCleaner.warmUp() }
+            }
         } else {
             recorder.onPCMChunk = nil
         }
@@ -440,7 +529,7 @@ public final class AppController {
             cancelAll()
             return
         }
-        statusItem.setRecording(false)
+        statusItem?.setRecording(false)
         let finishedAt = Date()
         let finishClock = DispatchTime.now()
         let warmMs = capture.warmup.warmMs
@@ -470,7 +559,8 @@ public final class AppController {
         let localCleaner = self.localCleaner
         let groqCleaner = self.groqCleaner
         let groqSTT = self.groqSTT
-        let shadowEnabled = self.shadowEnabled
+        let policy = sessionPolicy
+        let shadowEnabled = self.shadowEnabled && policy.usesGroq
         let vocabularyPrompt = self.prompt
         var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn, btStart: btStart,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
@@ -483,32 +573,21 @@ public final class AppController {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                if let chunkedSession {
-                    // Apple finalises concurrently so failed chunks can use its
-                    // own complete transcript without another upload.
-                    let appleFinal = Task { try? await appleSession?.finish() }
-                    let joined = await chunkedSession.finish(at: finishClock)
+                let stt = await policy.transcribe(apple: appleSession, chunked: chunkedSession, at: finishClock)
+                result = stt.result
+                pipeline.path = stt.path
+                if let joined = stt.joined {
                     pipeline.chunks = joined.chunks
                     pipeline.lastChunkMs = joined.lastChunkMs
                     timeline.chunked = joined
-                    if joined.failedCount > 0 || joined.text.isEmpty {
-                        pipeline.path = "apple"
-                        pipeline.chunkFallback = joined.failedCount
-                        if let raw = await appleFinal.value, !raw.isEmpty { result = .success(raw) }
-                        else { result = .failure(TranscriptionError.rejected("no_stt")) }
-                    } else {
-                        pipeline.path = "groq-chunked"
-                        result = .success(joined.text)
-                        if shadowEnabled {
-                            shadow = Task.detached {
-                                let raw = await appleFinal.value ?? ""
-                                guard ShadowScore.overlap(raw) >= 0.60 else { return nil }
-                                return (ShadowScore.nameCount(raw), ShadowScore.nameCount(joined.text), 0)
-                            }
+                    if pipeline.path == "apple" { pipeline.chunkFallback = joined.failedCount }
+                    if shadowEnabled, pipeline.path == "groq-chunked" {
+                        shadow = Task.detached {
+                            let raw = await stt.appleFinal.value ?? ""
+                            guard ShadowScore.overlap(raw) >= 0.60 else { return nil }
+                            return (ShadowScore.nameCount(raw), ShadowScore.nameCount(joined.text), 0)
                         }
                     }
-                } else {
-                    result = await Self.transcribeApple(appleSession, report: &pipeline)
                 }
                 pipeline.sttMs = Int(Date().timeIntervalSince(chunkedSession == nil ? sttStart : finishedAt) * 1000)
                 if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
@@ -532,9 +611,9 @@ public final class AppController {
                     pipeline.cleanupMode = "incremental_fallback"
                     timeline.cleanupFallbackReason = incrementalSession?.fallbackReason
                 }
-                if case .success(let raw) = result, !raw.isEmpty, !TranscriptCleaner.shouldClean(raw) {
+                if case .success(let raw) = result, !raw.isEmpty, (!policy.usesCleanup || !TranscriptCleaner.shouldClean(raw)) {
                     incrementalSession?.cancel()
-                    pipeline.cleanup = "skipped:short"
+                    pipeline.cleanup = policy.usesCleanup ? "skipped:short" : "skipped:capture_only"
                     timeline.incrementalSkipped = pipeline.path != "groq-chunked" ? "not_chunked" :
                         (pipeline.chunks ?? 0) <= 2 ? "short" : "short_text"
                 } else if case .success(let raw) = result, !raw.isEmpty {
@@ -543,7 +622,7 @@ public final class AppController {
                     if pipeline.path == "groq-chunked", let incrementalSession {
                         incremental = await incrementalSession.finish(totalChunks: pipeline.chunks ?? 0, rawText: raw,
                             single: { fullRaw in
-                                let outcome = await Self.cleanUp(fullRaw, groq: groqCleaner, local: localCleaner)
+                                let outcome = await policy.clean(fullRaw, groq: groqCleaner, local: localCleaner)
                                 return .init(text: outcome.text, label: outcome.label, model: outcome.model,
                                              stats: outcome.stats, calls: outcome.calls)
                             })
@@ -563,7 +642,7 @@ public final class AppController {
                         pipeline.cleanupModel = incremental?.single?.model ?? groqCleaner.model
                         timeline.cleanup = incremental?.stats
                     } else {
-                        let outcome = await Self.cleanUp(raw, groq: groqCleaner, local: localCleaner)
+                        let outcome = await policy.clean(raw, groq: groqCleaner, local: localCleaner)
                         pipeline.text = outcome.text
                         pipeline.cleanup = outcome.label
                         pipeline.cleanupModel = outcome.model
@@ -575,6 +654,7 @@ public final class AppController {
                 timeline.cleanupMode = pipeline.cleanupMode
             }
             if fake != nil { timeline.incrementalSkipped = "disabled_fake" }
+            if !policy.usesCleanup { pipeline.cleanupMode = "none"; timeline.incrementalSkipped = nil }
             timeline.cleanupMode = pipeline.cleanupMode
             if pipeline.cleanupMode == "single", timeline.incrementalSkipped == nil {
                 timeline.incrementalSkipped = pipeline.path == "groq-chunked" ? "none_cleanable_before_finish" : "not_chunked"
@@ -624,45 +704,54 @@ public final class AppController {
                                                        pastedText: text))
                     }
                     let start = self.recordingTarget
-                    self.inserter.insert(text, shouldInsert: {
-                        let now = Self.frontmostTarget()
-                        let app = now?.bundleID ?? ""
-                        switch InsertionTarget.decide(start: start, now: now) {
-                        case .paste:
-                            if let cleanup = report.cleanup, cleanup != "skipped:short", cleanup.hasPrefix("skipped:") || cleanup.hasPrefix("rejected:") {
-                                self.showOutcome(.rawPasted(cleanup))
-                            } else {
-                                self.showOutcome(.ok)
+                    let publicTimeline = DictationTimeline(latency_ms: latency, stt_ms: report.sttMs,
+                        cleanup_ms: report.cleanupMs, chunks: report.chunks, path: report.path,
+                        cleanup_mode: policy.usesCleanup ? report.cleanupMode : "none", fallback: policy.fallbackLabel)
+                    policy.deliver(text, transcript: { self.engineOnTranscript?($0, publicTimeline) }, paste: { text in
+                        self.inserter.insert(text, shouldInsert: {
+                            let now = self.currentTarget()
+                            let app = now?.bundleID ?? ""
+                            switch InsertionTarget.decide(start: start, now: now) {
+                            case .paste:
+                                if let cleanup = report.cleanup, cleanup != "skipped:short", cleanup.hasPrefix("skipped:") || cleanup.hasPrefix("rejected:") {
+                                    self.showOutcome(.rawPasted(cleanup))
+                                } else {
+                                    self.showOutcome(.ok)
+                                }
+                                self.traceFocus("pasting")
+                                self.appendLog(entry(text.count, app, .ok), fallback: policy.fallbackLabel)
+                                return true
+                            case .hold:
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(text, forType: .string)
+                                self.rememberHeldDictation(text)
+                                self.showOutcome(.held("focus_changed"), text: text)
+                                self.appendLog(entry(text.count, app, .held("focus_changed")), fallback: policy.fallbackLabel)
+                                return false
                             }
-                            self.traceFocus("pasting")
-                            DictationLog.append(entry(text.count, app, .ok))
-                            return true
-                        case .hold:
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(text, forType: .string)
-                            self.rememberHeldDictation(text)
-                            self.showOutcome(.held("focus_changed"), text: text)
-                            DictationLog.append(entry(text.count, app, .held("focus_changed")))
-                            return false
-                        }
+                        })
                     })
+                    if !policy.usesPaste {
+                        self.clearOutcome()
+                        self.appendLog(entry(text.count, AppController.frontmostBundleID(), .ok), fallback: policy.fallbackLabel)
+                    }
                 case .success:
                     self.showOutcome(.held("no_stt"))
-                    DictationLog.append(entry(0, AppController.frontmostBundleID(), .held("no_stt")))
+                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackLabel)
                 case .failure(let error):
                     let reason = (error as? TranscriptionError)?.logReason ?? "unknown"
                     if reason == "rejected_no_stt" {
                         self.showOutcome(.held("no_stt"))
-                        DictationLog.append(entry(0, AppController.frontmostBundleID(), .held("no_stt")))
+                        self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackLabel)
                     } else {
                         self.showOutcome(.error(reason))
-                        DictationLog.append(entry(0, AppController.frontmostBundleID(), .error(reason)))
+                        self.appendLog(entry(0, AppController.frontmostBundleID(), .error(reason)), fallback: policy.fallbackLabel)
                     }
                 }
                 if fake == nil {
                     AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path,
                                                           chunkFallback: report.chunkFallback,
-                                                          keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok"))
+                                                          keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok") + (policy.fallbackLabel.map { " fallback=\($0)" } ?? ""))
                 }
             }
         }
@@ -671,33 +760,27 @@ public final class AppController {
     /// Groq first (fastest + best measured). If Groq fails or is slower than
     /// its 1.5 s deadline, the local model runs; raw text is used if both fail.
     /// The log says which one produced the text.
-    private static func cleanUp(_ raw: String, groq: TranscriptCleaner, local: TranscriptCleaner) async
+    static func cleanUp(_ raw: String, groq: TranscriptCleaner, local: TranscriptCleaner, forceLocal: Bool = false) async
         -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?, calls: Int) {
-        if let (text, stats) = try? await groq.cleanWithStats(raw) {
+        if !forceLocal, let (text, stats) = try? await groq.cleanWithStats(raw) {
             return (text, "ok", groq.model, stats, 1)
         }
         if Task.isCancelled { return (raw, "skipped:cancelled", groq.model, nil, 1) }
         let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
-        var timedLocal = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline), endpoint: local.endpoint,
+        let localTransport: HTTPTransport = local.transport is URLSessionTransport ? URLSessionTransport(timeout: deadline) : local.transport
+        var timedLocal = TranscriptCleaner(transport: localTransport, endpoint: local.endpoint,
                                            model: local.model, vocabulary: local.vocabulary, apiKey: local.apiKey)
         timedLocal.reloadVocabularyFromHints = local.reloadVocabularyFromHints
+        timedLocal.hintsSentence = local.hintsSentence
         timedLocal.timeoutInterval = deadline
         do {
             let (text, stats) = try await timedLocal.cleanWithStats(raw)
-            return (text, "fallback_local", local.model, stats, 2)
+            return (text, "fallback_local", local.model, stats, forceLocal ? 1 : 2)
         } catch TranscriptionError.rejected(let reason) {
-            return (raw, "rejected:\(reason)", local.model, nil, 2)
+            return (raw, "rejected:\(reason)", local.model, nil, forceLocal ? 1 : 2)
         } catch {
-            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil, 2)
+            return (raw, "skipped:\((error as? TranscriptionError)?.logReason ?? "error")", local.model, nil, forceLocal ? 1 : 2)
         }
-    }
-
-    /// Apple-only recognition. Never invokes a cloud recognizer on failure.
-    private static func transcribeApple(_ engine: AppleTranscriber?,
-                                        report: inout PipelineReport) async -> Result<String, Error> {
-        report.path = "apple"
-        if let engine, let text = try? await engine.finish(), !text.isEmpty { return .success(text) }
-        return .failure(TranscriptionError.rejected("no_stt"))
     }
 
     /// One stderr line per dictation: where the time went. Counts and ms only.
@@ -770,7 +853,7 @@ public final class AppController {
     private func cancelAll() {
         micStarting = false
         generation = CaptureEpoch()
-        statusItem.setRecording(false)
+        statusItem?.setRecording(false)
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
         capture.end(.cancel) // discard: nothing is kept
         let mediaEvents = resumeMedia()
@@ -793,16 +876,31 @@ public final class AppController {
         apple = nil
         let mediaEvents = resumeMedia()
         if mediaEvents != "-" { Self.note("fail media=\(mediaEvents)") }
-        statusItem.setRecording(false)
+        statusItem?.setRecording(false)
         showOutcome(.error(reason))
         log(duration: duration, bytes: bytes, latencyMs: latencyMs, chars: 0, app: AppController.frontmostBundleID(), outcome: .error(reason))
     }
 
     private func log(duration: TimeInterval, bytes: Int, latencyMs: Int, chars: Int, app: String, outcome: DictationOutcome) {
-        DictationLog.append(DictationLogEntry(
+        appendLog(DictationLogEntry(
             time: Date(), durationSeconds: duration, audioBytes: bytes, latencyMs: latencyMs,
             chars: chars, frontmostBundleID: app, outcome: outcome
-        ))
+        ), fallback: sessionPolicy.fallbackLabel)
+    }
+
+    func appendLog(_ entry: DictationLogEntry, fallback: String?) {
+        guard let fallback else { DictationLog.append(entry, to: paths.logURL); return }
+        // DictateCore's line is unchanged; quota adds only its agreed label.
+        do {
+            try FileManager.default.createDirectory(at: paths.logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: paths.logURL.path) {
+                guard FileManager.default.createFile(atPath: paths.logURL.path, contents: nil) else { return }
+            }
+            let handle = try FileHandle(forWritingTo: paths.logURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data((entry.formatted() + " fallback=\(fallback)\n").utf8))
+        } catch { /* Same best-effort diagnostic behavior as DictationLog. */ }
     }
 
     private func traceFocus(_ event: String) {
@@ -822,6 +920,11 @@ public final class AppController {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
     }
 
+    private func currentTarget() -> InsertionTarget? {
+        if let dependencies { return dependencies.frontmostTarget() }
+        return Self.frontmostTarget()
+    }
+
     private static func frontmostTarget() -> InsertionTarget? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         return InsertionTarget(pid: app.processIdentifier, bundleID: app.bundleIdentifier ?? "")
@@ -830,10 +933,10 @@ public final class AppController {
     private func rememberHeldDictation(_ text: String) {
         lastDictationTimer?.invalidate()
         lastDictation = text
-        statusItem.setLastDictationAvailable(true)
+        statusItem?.setLastDictationAvailable(true)
         let timer = Timer(timeInterval: 10 * 60, repeats: false) { [weak self] _ in
             self?.lastDictation = nil
-            self?.statusItem.setLastDictationAvailable(false)
+            self?.statusItem?.setLastDictationAvailable(false)
             self?.lastDictationTimer = nil
         }
         lastDictationTimer = timer

@@ -20,6 +20,7 @@ public final class HotkeyMonitor {
     /// Returns false when macOS refuses the tap (no Accessibility / Input Monitoring grant).
     @discardableResult
     public func start() -> Bool {
+        if tap != nil { return true }
         let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(
@@ -42,6 +43,16 @@ public final class HotkeyMonitor {
         CGEvent.tapEnable(tap: tap, enable: true)
         return true
     }
+
+    public func stop() {
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
+        if let runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes) }
+        tap = nil
+        runLoopSource = nil
+        detector.reset()
+    }
+
+    deinit { stop() }
 
     private func handle(type: CGEventType, event: CGEvent) {
         switch type {

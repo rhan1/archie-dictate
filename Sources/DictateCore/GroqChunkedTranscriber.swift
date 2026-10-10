@@ -77,6 +77,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var originalChunks: [Int: PauseChunker.Chunk] = [:]
     private var rejoinTask: Task<Void, Never>?
     private var rejoins = 0
+    private let onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)?
     private let onChunkText: (@Sendable (Int, String) -> Void)?
     private var chunker: PauseChunker
     private var tasks: [Task<Void, Never>] = []
@@ -93,7 +94,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 fillerLeadIn: Bool = true, leadIn: String? = nil, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
                 hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = nil,
                 finalModel: String? = nil, rejoinGuard: Bool = false,
-                onChunkText: (@Sendable (Int, String) -> Void)? = nil) {
+                onChunkText: (@Sendable (Int, String) -> Void)? = nil,
+                onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
@@ -105,6 +107,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         self.leadIn = leadIn ?? (fillerLeadIn ? Self.fillerLeadIn : "")
         self.finalModel = finalModel
         self.rejoinGuard = rejoinGuard
+        self.onGroqRateLimit = onGroqRateLimit
         self.onChunkText = onChunkText
         chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
     }
@@ -175,6 +178,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private func send(_ request: URLRequest) async -> Response {
         do {
             let (data, response) = try await client.transport.send(request)
+            onGroqRateLimit?(GroqRateLimit(response: response, endpoint: .stt))
             guard (200...299).contains(response.statusCode) else { return Response(text: nil, http: response) }
             struct Transcript: Decodable { let text: String }
             let text = (try? JSONDecoder().decode(Transcript.self, from: data))?.text
