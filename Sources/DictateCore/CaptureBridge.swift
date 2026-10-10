@@ -63,10 +63,9 @@ public struct CaptureBridge {
     private var lastHeadsetEnd: TimeInterval?
     /// The headset delivered ≥ `takeoverSignal` of signal this dictation (its link works).
     private var headsetHadSignal = false
-    /// End of the newest buffer from either source: "now" on the media timeline.
-    private var latestEnd: TimeInterval?
-    /// The owner is recovering the headset engine: its buffer gap is expected, not stale.
-    public private(set) var headsetRecovering = false
+    /// The last switchback was for a headset that stopped delivering (a recovery gap, not
+    /// zeros): a headset that returns with signal may take over again.
+    private var staleSwitchback = false
     private var headsetSignalFrames = 0
     private var headsetSilentFrames = 0
     public init() {}
@@ -112,13 +111,13 @@ public struct CaptureBridge {
         if source == .headset, bluetooth { arbitrate(&result, at: time, frames: frames,
                                                      arrivedAt: arrivedAt, peak: peak) }
         let end = time + Double(frames) / Self.rate
-        latestEnd = max(latestEnd ?? end, end)
         if source == .builtin, state == .builtinOnly, let first = firstHeadsetTime, end - first >= Self.fallbackAfter {
             fallBack(&result)
         }
         // A headset that stops delivering buffers altogether (IO stopped, not zeros).
-        if source == .builtin, canSwitchBack, !headsetRecovering, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
+        if source == .builtin, canSwitchBack, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
             switchBack(&result)
+            staleSwitchback = true
             return result    // the owner replays this buffer from standby, after the frames it missed
         }
         let feeds = (source == .builtin && (state == .builtinOnly || state == .fallback)) ||
@@ -173,6 +172,9 @@ public struct CaptureBridge {
             }
         case .switched where builtinAlive && silent > Self.switchbackAfter:
             switchBack(&result)
+        case .fallback where staleSwitchback && signal >= Self.takeoverSignal:
+            state = .switched                    // the recovered headset carries again
+            staleSwitchback = false
         default: break
         }
         // The one restart runs while the built-in carries; with nothing else to carry, only
@@ -192,15 +194,9 @@ public struct CaptureBridge {
 
     private mutating func switchBack(_ result: inout Decision) {
         state = .fallback
+        staleSwitchback = false
         switchbacks += 1
         result.event = .switchback
-    }
-
-    /// The owner starts/ends a headset-engine recovery; at the end the stale clock restarts
-    /// from the current timeline position.
-    public mutating func setHeadsetRecovering(_ recovering: Bool) {
-        if headsetRecovering, !recovering, lastHeadsetEnd != nil { lastHeadsetEnd = latestEnd ?? lastHeadsetEnd }
-        headsetRecovering = recovering
     }
 
     /// The headset engine failed for good. Returns the event when the built-in carries on
@@ -248,7 +244,7 @@ public struct CaptureBridge {
         builtinAlive = false
         restart = nil
         switchbacks = 0
-        headsetRecovering = false
+        staleSwitchback = false
         return release
     }
 

@@ -174,5 +174,4 @@ public struct CaptureFeed {
 
     public mutating func builtinFailed() { bridge.builtinFailed() }
     public mutating func headsetRestarted(started: Bool = true) { bridge.headsetRestarted(started: started) }
-    public mutating func setHeadsetRecovering(_ recovering: Bool) { bridge.setHeadsetRecovering(recovering) }
 }
