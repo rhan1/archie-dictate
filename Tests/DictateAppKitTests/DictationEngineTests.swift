@@ -23,7 +23,9 @@ private final class TestRecorder: EngineRecorder {
     var stats = AudioRecorder.CaptureStats()
     var ready = false
     var starts = 0, stops = 0
-    func start(device: MicChoice) throws { starts += 1; isRunning = true; onFirstBuffer?() }
+    var isAllocated = false
+    func release() { isAllocated = false; isRunning = false }
+    func start(device: MicChoice) throws { starts += 1; isAllocated = true; isRunning = true; onFirstBuffer?() }
     func startAsync(device: MicChoice) async throws { try start(device: device) }
     func rebuild() throws {}
     func rebuildAsync() async throws {}
