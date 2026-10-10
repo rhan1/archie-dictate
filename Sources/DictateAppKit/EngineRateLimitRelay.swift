@@ -5,7 +5,10 @@ import DictateCore
 /// Only the main actor reads/writes the host callback.
 final class EngineRateLimitRelay: @unchecked Sendable {
     @MainActor var callback: ((GroqRateLimit) -> Void)?
+    private let store: GroqQuotaStore
+    init(store: GroqQuotaStore) { self.store = store }
     func observe(_ limits: GroqRateLimit) {
+        store.record(limits)   // thread-safe: any executor, before the main-actor hop
         DispatchQueue.main.async { [self] in callback?(limits) }
     }
 }
