@@ -1,6 +1,7 @@
 import CoreAudio
 import AudioToolbox
 import AVFoundation
+import DictateCore
 
 /// Hardware lookup is kept out of Core. Selection belongs to a fresh, stopped engine.
 enum AudioDevices {
@@ -30,6 +31,27 @@ enum AudioDevices {
         }
         throw NSError(domain: "AudioDevices", code: 1,
                       userInfo: [NSLocalizedDescriptionKey: "No built-in microphone with input streams"])
+    }
+
+    /// Use CoreAudio's actual default input, rather than a display name heuristic.
+    static func bridgeEligibility() throws -> (CaptureBridge.DefaultInput, Bool) {
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        try check(AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address,
+                                            0, nil, &size, &device))
+        var transport: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        address.mSelector = kAudioDevicePropertyTransportType
+        try check(AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport))
+        let input: CaptureBridge.DefaultInput
+        switch transport {
+        case kAudioDeviceTransportTypeBuiltIn: input = .builtin
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: input = .bluetooth
+        default: input = .other
+        }
+        return (input, (try? builtInInput()) != nil)
     }
 
     static func selectBuiltIn(on input: AVAudioInputNode) throws {
