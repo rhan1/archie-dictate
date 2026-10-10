@@ -31,3 +31,19 @@ public final class CaptureDispatchScheduler: CaptureScheduler {
 public final class CaptureEpoch {
     public init() {}
 }
+
+/// The operation currently running on a recorder's serial executor. One that has
+/// not returned after `wedgeSeconds` (a CoreAudio call that never comes back)
+/// lets the owner abandon that executor rather than queue every later start and
+/// teardown behind it (D-b). The owner serializes access.
+public struct CaptureExecutorWatch: Sendable {
+    /// The bridge's built-in start is ~0.1 s; its teardown is milliseconds.
+    public static let wedgeSeconds: TimeInterval = 1.5
+    public private(set) var busySince: TimeInterval?
+    public init() {}
+    public mutating func began(at time: TimeInterval) { busySince = time }
+    public mutating func ended() { busySince = nil }
+    public func isWedged(at now: TimeInterval) -> Bool {
+        busySince.map { now - $0 >= Self.wedgeSeconds } ?? false
+    }
+}

@@ -30,6 +30,8 @@ public final class AudioRecorder: CaptureEngine {
         public var bridgeMs: Int?
         public var bridgeSource = "none"
         public var bridgeReason: String?
+        /// Second tap → first kept frames (0 when the first-tap ring already held them).
+        public var tap2ToFirstKeptMs: Int?
     }
     public private(set) var stats = CaptureStats()
     /// Called on the main queue when the first audio buffer arrives after
@@ -43,7 +45,7 @@ public final class AudioRecorder: CaptureEngine {
     public var isAllocated: Bool { lock.withLock { engine != nil || builtin?.isAllocated == true } }
     /// A short dictation can finish through the bridge while headset startup is
     /// still in flight; its captured samples are already in the shared pipeline.
-    public var bridgeHasAudio: Bool { lock.withLock { bridge.bridgeSource == "builtin" && !samples.isEmpty } }
+    public var bridgeHasAudio: Bool { lock.withLock { feed.bridge.bridgeSource == "builtin" && !samples.isEmpty } }
     private var captureRunning = false
     private var startedAt = DispatchTime.now()
     private var recording = false
@@ -65,9 +67,15 @@ public final class AudioRecorder: CaptureEngine {
     private var meter = WisprLevel() // persists for this app-lifetime recorder
     private var levelTimer: DispatchSourceTimer?
 
-    private let builtin: AudioRecorder?
-    private var bridge = CaptureBridge()
+    // Replaced (under lock) when its executor wedges; see CaptureExecutorWatch.
+    private var builtin: AudioRecorder?
+    // Arbitration + the first-tap pre-roll ring, serialized by `lock`.
+    private var feed = CaptureFeed()
     private var bridgeConfigured = false
+    private var watch = CaptureExecutorWatch()
+    /// Built-in setup finishes before the headset start triggers its Bluetooth
+    /// profile switch (D-b); a stuck setup never delays the headset longer.
+    static let builtinSetupWait: TimeInterval = 0.25
     private var captureBoundary: TimeInterval?
     // Internal converted-buffer handoff avoids independent chunkers/remainders.
     private var onConvertedBuffer: (([Float], TimeInterval) -> Void)?
@@ -77,43 +85,73 @@ public final class AudioRecorder: CaptureEngine {
         builtin = bridgeEnabled ? AudioRecorder(bridgeEnabled: false) : nil
     }
 
-    /// Runs on the headset executor, but schedules built-in startup on its own
-    /// executor BEFORE the potentially blocking Bluetooth profile transition.
+    /// Runs on the headset executor, and starts the built-in mic on its own executor
+    /// BEFORE the potentially blocking Bluetooth profile transition (first ⌥ tap).
     private func configureBridge(device: MicChoice, epoch: CaptureEpoch) {
-        guard let builtin, !lock.withLock({ bridgeConfigured }) else { return }
+        guard lock.withLock({ builtin != nil && !bridgeConfigured }) else { return }
         let eligibility = device == .default ? (try? AudioDevices.bridgeEligibility()) : nil
-        let builtinEpoch: CaptureEpoch? = lock.withLock {
-            guard engineEpoch === epoch else { return nil }
+        var abandonedMs: Int?
+        let started: (AudioRecorder, CaptureEpoch)? = lock.withLock {
+            guard engineEpoch === epoch, var current = builtin else { return nil }
+            if let busy = current.wedgedMs {
+                abandonedMs = busy
+                current.release()
+                current = AudioRecorder(bridgeEnabled: false)
+                builtin = current
+            }
             bridgeConfigured = true
-            bridge.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch)
-            if let captureBoundary { bridge.recordingStarted(at: captureBoundary) }
-            guard bridge.state == .builtinOnly else {
-                AppController.note("bridge_src=none reason=\(bridge.skipReason ?? "cancelled")")
+            feed.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch)
+            if let captureBoundary { _ = feed.recordingStarted(at: captureBoundary) }
+            guard feed.bridge.state == .builtinOnly else {
+                AppController.note("bridge_src=none reason=\(feed.bridge.skipReason ?? "cancelled")")
                 return nil
             }
-            return builtin.lock.withLock {
-                builtin.onConvertedBuffer = { [weak self] chunk, time in
+            return current.lock.withLock {
+                current.onConvertedBuffer = { [weak self] chunk, time in
                     self?.acceptConverted(chunk, at: time, source: .builtin, epoch: epoch)
                 }
-                builtin.onCaptureFailure = { [weak self] in self?.bridgeFailed(epoch: epoch) }
-                return builtin.engineEpoch
+                current.onCaptureFailure = { [weak self] in self?.bridgeFailed(epoch: epoch) }
+                return (current, current.engineEpoch)
             }
         }
-        guard let builtinEpoch else { return }
-        builtin.enqueueStart(device: .builtIn, epoch: builtinEpoch) { [weak self] result in
-            if case .failure = result { self?.bridgeFailed(epoch: epoch) }
+        if let abandonedMs { AppController.note("bridge_abandoned=1 busy_ms=\(abandonedMs)") }
+        guard let (current, builtinEpoch) = started else { return }
+        let ready = DispatchSemaphore(value: 0)
+        current.enqueueStart(device: .builtIn, epoch: builtinEpoch) { [weak self] result in
+            if case .failure(let error) = result { self?.bridgeFailed(epoch: epoch, error: error) }
+            ready.signal()
         }
+        _ = ready.wait(timeout: .now() + Self.builtinSetupWait)
     }
 
-    private func bridgeFailed(epoch: CaptureEpoch) {
+    private func bridgeFailed(epoch: CaptureEpoch, error: Error? = nil) {
         let failed = lock.withLock {
-            guard engineEpoch === epoch, bridge.state == .builtinOnly else { return false }
-            bridge.builtinFailed()
+            guard engineEpoch === epoch, feed.bridge.state == .builtinOnly else { return false }
+            feed.builtinFailed()
             builtin?.release()
             return true
         }
-        if failed {
-            AppController.note("bridge_src=none reason=builtin_start_failed")
+        guard failed else { return }
+        var line = "bridge_src=none reason=builtin_start_failed"
+        if let mismatch = error as? TapFormatPlan.Mismatch { line += " builtin_error=\(mismatch)" }
+        else if let error = error as NSError? { line += " builtin_error=\(error.domain):\(error.code)" }
+        AppController.note(line)
+    }
+
+    /// Every executor operation is watched: one that never returns marks it wedged.
+    private func onExecutor(_ work: @escaping () -> Void) {
+        engineQueue.async { [self] in
+            lock.withLock { watch.began(at: ProcessInfo.processInfo.systemUptime) }
+            defer { lock.withLock { watch.ended() } }
+            work()
+        }
+    }
+    /// How long the current executor operation has been stuck, once it counts as wedged.
+    private var wedgedMs: Int? {
+        lock.withLock {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard watch.isWedged(at: now), let since = watch.busySince else { return nil }
+            return Int((now - since) * 1000)
         }
     }
 
@@ -170,7 +208,7 @@ public final class AudioRecorder: CaptureEngine {
 
     private func enqueueStart(device: MicChoice, epoch: CaptureEpoch,
                               completion: @escaping (Result<Void, Error>) -> Void) {
-        engineQueue.async { [self] in
+        onExecutor { [self] in
             do {
                 guard lock.withLock({ engineEpoch === epoch }) else { throw CancellationError() }
                 try start(device: device)
@@ -189,7 +227,7 @@ public final class AudioRecorder: CaptureEngine {
     public func rebuildAsync() async throws {
         let epoch = lock.withLock { engineEpoch }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            engineQueue.async { [self] in
+            onExecutor { [self] in
                 do {
                     guard lock.withLock({ engineEpoch === epoch }) else { throw CancellationError() }
                     try rebuild()
@@ -216,7 +254,7 @@ public final class AudioRecorder: CaptureEngine {
         ) { [weak self] _ in
             guard let self else { return }
             let epoch = self.lock.withLock { self.engineEpoch }
-            self.engineQueue.async { [weak self] in
+            self.onExecutor { [weak self] in
                 guard let self else { return }
                 let current = { self.recording && self.lock.withLock {
                     self.engineIdentity === identity &&
@@ -266,20 +304,23 @@ public final class AudioRecorder: CaptureEngine {
         return engine
     }
 
-    private func installTapAndStart(allowRebuild: Bool = true) throws {
+    private func installTapAndStart() throws {
         try captureObjC {
+            let plan = try TapFormatPlan.run(device: selectedDevice, formats: {
+                let input = try requireEngine().inputNode
+                let hardware = input.inputFormat(forBus: 0), output = input.outputFormat(forBus: 0)
+                return (TapFormatPlan.Format(sampleRate: hardware.sampleRate, channels: hardware.channelCount),
+                        TapFormatPlan.Format(sampleRate: output.sampleRate, channels: output.channelCount))
+            }, align: {
+                try AudioDevices.alignClientFormat(on: requireEngine().inputNode)
+            }, rebuild: {
+                try rebuild()
+                if selectedDevice == .builtIn { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) }
+            })
             let input = try requireEngine().inputNode
             let hardware = input.inputFormat(forBus: 0)
-            let output = input.outputFormat(forBus: 0)
-            guard hardware.sampleRate > 0, hardware.channelCount > 0,
-                  hardware.sampleRate == output.sampleRate, hardware.channelCount == output.channelCount else {
-                if allowRebuild {
-                    try rebuild()
-                    if selectedDevice == .builtIn { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) }
-                    try installTapAndStart(allowRebuild: false)
-                    return
-                }
-                throw RecorderError.noInput
+            if case .ready(aligned: true, _) = plan {
+                AppController.note("builtin_format_aligned=1 fmt=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch")
             }
             if stats.startFormat.isEmpty {
                 stats.startFormat = "\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch"
@@ -327,19 +368,23 @@ public final class AudioRecorder: CaptureEngine {
         Int((DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds) / 1_000_000)
     }
 
-    /// Reset the shared 24 kHz pipeline at the recording boundary.
-    /// Dictation begins on an engine that may already be running (pre-warmed on
-    /// the first ⌥ tap): drop the pre-roll so only post-double-tap audio counts.
+    /// Reset the shared 24 kHz pipeline at the recording boundary (second tap).
+    /// The engines may already be running (started on the first ⌥ tap): keep the
+    /// ring's audio from boundary − 150 ms; earlier pre-roll is discarded.
     public func resetCapture() {
-        lock.withLock {
-            captureBoundary = ProcessInfo.processInfo.systemUptime
-            bridge.recordingStarted(at: captureBoundary!)
+        let kept: Int = lock.withLock {
+            let boundary = ProcessInfo.processInfo.systemUptime
+            captureBoundary = boundary
+            let preRoll = feed.recordingStarted(at: boundary)
             samples.removeAll(keepingCapacity: true)
-            pendingPCM.removeAll()
+            samples.append(contentsOf: preRoll)
+            pendingPCM = WAVEncoder.pcm16(from: preRoll)
             levelTimer?.cancel()
             levelTimer = nil
             meter.clearBatch()
+            return preRoll.count
         }
+        if kept > 0 { AppController.note("tap2_to_first_kept_buffer_ms=0 kept_src=ring preroll_frames=\(kept)") }
     }
 
     @discardableResult public func stop() -> [Float] {
@@ -347,10 +392,11 @@ public final class AudioRecorder: CaptureEngine {
         lock.lock()
         engineEpoch = CaptureEpoch()
         tapEpoch = CaptureEpoch()
-        stats.bridgeMs = bridge.bridgeMs
-        stats.bridgeSource = bridge.bridgeSource
-        stats.bridgeReason = bridge.skipReason
-        bridge.cancel()
+        stats.bridgeMs = feed.bridge.bridgeMs
+        stats.bridgeSource = feed.bridge.bridgeSource
+        stats.bridgeReason = feed.bridge.reason
+        stats.tap2ToFirstKeptMs = feed.bridge.firstKeptMs
+        feed.cancel() // a lone tap's ring is discarded here
         bridgeConfigured = false
         captureBoundary = nil
         captureRunning = false
@@ -363,10 +409,16 @@ public final class AudioRecorder: CaptureEngine {
         levelTimer?.cancel()
         levelTimer = nil
         meter.clearBatch()
-        builtin?.release()
+        var abandonedMs: Int?
+        if let current = builtin {
+            current.release()
+            // Its queued teardown would wait forever behind a wedged call (D-b).
+            if let busy = current.wedgedMs { abandonedMs = busy; builtin = AudioRecorder(bridgeEnabled: false) }
+        }
         lock.unlock()
+        if let abandonedMs { AppController.note("bridge_abandoned=1 busy_ms=\(abandonedMs)") }
         if !remainder.isEmpty { callback?(remainder) }
-        engineQueue.async { [self] in teardownEngine() }
+        onExecutor { [self] in teardownEngine() }
         return captured
     }
 
@@ -422,9 +474,9 @@ public final class AudioRecorder: CaptureEngine {
                                  tap: CaptureEpoch? = nil) {
         lock.lock()
         guard engineEpoch === epoch, tap == nil || tapEpoch === tap else { lock.unlock(); return }
-        let decision = bridge.buffer(source: source, at: time, frames: converted.count,
-                                     arrivedAt: ProcessInfo.processInfo.systemUptime, epoch: epoch)
-        let chunk = Array(converted.dropFirst(decision.dropFrames).prefix(decision.framesToFeed))
+        let decision = feed.accept(converted, source: source, at: time,
+                                   arrivedAt: ProcessInfo.processInfo.systemUptime, epoch: epoch)
+        let chunk = decision.frames
         samples.append(contentsOf: chunk)
         // Accumulate even before the transcriber attaches; nothing after the
         // recording boundary is discarded during asynchronous hardware startup.
@@ -446,11 +498,15 @@ public final class AudioRecorder: CaptureEngine {
                 timer.resume()
             }
         }
-        let bridgeMs = bridge.bridgeMs
+        let bridgeMs = feed.bridge.bridgeMs, builtinFrames = feed.bridge.builtinFrames
+        let firstKeptMs = decision.firstKept ? feed.bridge.firstKeptMs : nil
         if decision.releaseBuiltin { builtin?.release() }
         lock.unlock()
+        if let firstKeptMs {
+            AppController.note("tap2_to_first_kept_buffer_ms=\(firstKeptMs) kept_src=\(source == .builtin ? "builtin" : "headset")")
+        }
         if decision.releaseBuiltin {
-            if let bridgeMs { AppController.note("bridge_ms=\(bridgeMs) bridge_src=builtin") }
+            if let bridgeMs { AppController.note("bridge_ms=\(bridgeMs) bridge_src=builtin builtin_frames=\(builtinFrames)") }
         }
     }
 

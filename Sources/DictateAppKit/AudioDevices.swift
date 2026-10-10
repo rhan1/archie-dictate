@@ -62,6 +62,36 @@ enum AudioDevices {
         try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                                       kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)))
     }
+    /// D-a: after CurrentDevice changes, AUHAL keeps the previous default device's
+    /// client (output-scope) format, and its input element does no sample-rate
+    /// conversion, so the tap guard saw 48 kHz hardware vs a 44.1 kHz client on
+    /// every attempt. Match the client rate/channels to the new hardware.
+    static func alignClientFormat(on input: AVAudioInputNode) throws {
+        guard let unit = input.audioUnit else {
+            throw NSError(domain: "AudioDevices", code: 2, userInfo: [NSLocalizedDescriptionKey: "Input AUHAL unavailable"])
+        }
+        let size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var hardware = AudioStreamBasicDescription(), client = AudioStreamBasicDescription()
+        var readSize = size
+        try check(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hardware, &readSize))
+        readSize = size
+        try check(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &client, &readSize))
+        client.mSampleRate = hardware.mSampleRate
+        if client.mChannelsPerFrame != hardware.mChannelsPerFrame {
+            client.mChannelsPerFrame = hardware.mChannelsPerFrame
+            if client.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0 {
+                client.mBytesPerFrame = client.mBitsPerChannel / 8 * client.mChannelsPerFrame
+                client.mBytesPerPacket = client.mBytesPerFrame * client.mFramesPerPacket
+            }
+        }
+        var status = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &client, size)
+        if status == kAudioUnitErr_Initialized {
+            // Fresh, stopped engine: prepare() initializes it again before start.
+            try check(AudioUnitUninitialize(unit))
+            status = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &client, size)
+        }
+        try check(status)
+    }
     private static func check(_ status: OSStatus) throws {
         if status != noErr { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
     }
