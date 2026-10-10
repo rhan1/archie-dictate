@@ -54,6 +54,7 @@ public struct TranscriptCleaner: Sendable {
     Never join a vocabulary term to a neighbouring word; vocabulary spelling applies only to the term itself. "the Limpar match counts" stays four words, never "LimparMatch counts".
     """#
 
+    public var onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)?
     public let transport: HTTPTransport
     /// Groq cleanup with a local Ollama fallback.
     public let endpoint: URL
@@ -75,7 +76,9 @@ public struct TranscriptCleaner: Sendable {
     public static let groqEndpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
 
     public init(transport: HTTPTransport, endpoint: URL = TranscriptCleaner.endpoint, model: String = TranscriptCleaner.defaultModel,
-                vocabulary: String, includeExamples: Bool = true, apiKey: @escaping @Sendable () throws -> String) {
+                vocabulary: String, includeExamples: Bool = true, apiKey: @escaping @Sendable () throws -> String,
+                onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil) {
+        self.onGroqRateLimit = onGroqRateLimit
         self.transport = transport
         self.endpoint = endpoint
         self.model = model
@@ -149,6 +152,9 @@ public struct TranscriptCleaner: Sendable {
         } catch let error as URLError {
             throw TranscriptionError.network(error.code == .timedOut ? "timedOut" : "\(error.code.rawValue)")
         } catch { throw TranscriptionError.network("transport") }
+        if endpoint.host == Self.groqEndpoint.host {
+            onGroqRateLimit?(GroqRateLimit(response: response, endpoint: .cleanup))
+        }
         switch response.statusCode {
         case 200..<300: break
         case 401, 403: throw TranscriptionError.auth
@@ -196,7 +202,9 @@ public struct TranscriptCleaner: Sendable {
         var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/models")!)
         request.timeoutInterval = 2
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        _ = try? await transport.send(request)
+        if let (_, response) = try? await transport.send(request) {
+            onGroqRateLimit?(GroqRateLimit(response: response, endpoint: .cleanup))
+        }
     }
 
     /// Response timing and token count for the stderr timeline.
@@ -225,6 +233,9 @@ public struct TranscriptCleaner: Sendable {
             throw TranscriptionError.network(error.code == .timedOut ? "timedOut" : "\(error.code.rawValue)")
         } catch {
             throw TranscriptionError.network("transport")
+        }
+        if endpoint.host == Self.groqEndpoint.host {
+            onGroqRateLimit?(GroqRateLimit(response: response, endpoint: .cleanup))
         }
         switch response.statusCode {
         case 200..<300: break
