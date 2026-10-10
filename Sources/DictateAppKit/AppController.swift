@@ -94,10 +94,7 @@ public final class AppController {
         let quotaFile = quotaFileURL ?? GroqQuotaStore.defaultFileURL(for: paths)
         quotaStore = quotaFile == GroqQuotaStore.shared.fileURL ? .shared : GroqQuotaStore(fileURL: quotaFile)
         rateLimitRelay = EngineRateLimitRelay(store: quotaStore)
-        let injectURL = injectedAudioURL ?? {
-            guard let env = ProcessInfo.processInfo.environment["DICTATE_INJECT_WAV"], !env.isEmpty else { return nil }
-            return URL(fileURLWithPath: env)
-        }()
+        let injectURL = Self.injectedAudioURL(injectedAudioURL, environment: ProcessInfo.processInfo.environment)
         if let injectURL { AppController.note("inject_wav=\(injectURL.lastPathComponent)") }
         recorder = dependencies?.recorder ?? injectURL.map { WAVInjectedRecorder(url: $0) } ?? AudioRecorder()
         inserter = dependencies?.inserter ?? TextInserter()
@@ -224,6 +221,21 @@ public final class AppController {
         doubleTap()
     }
     func engineFinish() { finishButton() }
+    /// Tests: a finish before the mic start completes is discarded by design (BT3); wait this out.
+    var micStartPending: Bool { micStarting }
+    /// The explicit URL wins; else a non-empty `DICTATE_INJECT_WAV` path.
+    static func injectedAudioURL(_ explicit: URL?, environment: [String: String]) -> URL? {
+        if let explicit { return explicit }
+        guard let path = environment["DICTATE_INJECT_WAV"], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    /// A host's single ⌥ tap, exactly as the standalone hotkey: pre-starts capture while idle
+    /// (the double-tap window then hides the engine start), finishes a recording, recovers held text.
+    func engineTap() {
+        configureEngine()
+        hotkey(.tap)
+    }
     func engineRecoverStaleMute() -> String? {
         guard let event = muter.recoverIfNeeded() else { return nil }
         AppController.note("media=\(event.rawValue) (host launch)")
