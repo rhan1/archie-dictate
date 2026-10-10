@@ -182,4 +182,23 @@ struct WAVInjectedRecorderTests {
         )
         #expect(engine.surface == .none)
     }
+
+    // AppController/CaptureLifecycle expect first-buffer and level on main, like AudioRecorder.
+    @Test func firstBufferAndLevelOnMainWithInjectSource() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let wavURL = tempDir.appendingPathComponent("sine24k.wav")
+        try WAVEncoder.encode(samples: makeSineSamples(), sampleRate: 24_000, channels: 1).write(to: wavURL)
+        let recorder = WAVInjectedRecorder(url: wavURL, pace: 1.0)
+        #expect(recorder.stats.bridgeSource == "inject")
+        var firstOnMain: Bool?
+        var levelOnMain: Bool?
+        recorder.onFirstBuffer = { firstOnMain = Thread.isMainThread }
+        recorder.onLevel = { _ in levelOnMain = levelOnMain ?? Thread.isMainThread }
+        try recorder.start()
+        for _ in 0..<100 where firstOnMain == nil || levelOnMain == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        _ = recorder.stop()
+        #expect(firstOnMain == true)
+        #expect(levelOnMain == true)
+    }
 }

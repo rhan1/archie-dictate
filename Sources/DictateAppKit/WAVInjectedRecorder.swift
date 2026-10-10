@@ -1,6 +1,8 @@
 import Foundation
 import DictateCore
 
+/// Replaces the microphone with a 24 kHz mono 16-bit WAV for unattended end-to-end runs:
+/// 100 ms chunks paced in real time, then silence until stop(). Timeline: `bridge_src=inject`.
 public final class WAVInjectedRecorder: EngineRecorder {
     public let url: URL
     public let pace: Double
@@ -31,6 +33,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         var s = AudioRecorder.CaptureStats()
         s.device = "injected:\(url.lastPathComponent)"
         s.startFormat = "24000Hz/1ch"
+        s.bridgeSource = "inject"
         self.stats = s
     }
 
@@ -161,9 +164,13 @@ public final class WAVInjectedRecorder: EngineRecorder {
         let levelCb = onLevel
         lock.unlock()
 
-        firstCb?()
+        // Same threads as AudioRecorder: PCM from the capture queue, first-buffer and level on main.
         pcmCb?(chunk)
-        levelCb?(level)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRunning else { return }   // dropped after stop(), like the real epoch check
+            firstCb?()
+            levelCb?(level)
+        }
     }
 
     @discardableResult public func stop() -> [Float] {
