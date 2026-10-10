@@ -43,8 +43,8 @@ public final class AudioRecorder: CaptureEngine {
     public var onFirstBuffer: (() -> Void)?
     public var onCaptureFailure: (() -> Void)?
     public var isRunning: Bool {
-        let state = lock.withLock { (captureRunning, engine, restarting) }
-        if state.2 { return true }    // H2: the one headset restart is in flight
+        let state = lock.withLock { (captureRunning, engine, restarting && restartEpoch === engineEpoch) }
+        if state.2 { return true }    // H2: this dictation's one headset restart is in flight
         return state.0 && ((try? captureObjC { state.1?.isRunning ?? false }) ?? false)
     }
     public var isAllocated: Bool { lock.withLock { engine != nil || builtin?.isAllocated == true } }
@@ -89,6 +89,7 @@ public final class AudioRecorder: CaptureEngine {
     private var recoveryThrottle = RecoveryThrottle()
     private var throttleGeneration = 0
     private var restarting = false
+    private var restartEpoch = CaptureEpoch()
     // Internal converted-buffer handoff avoids independent chunkers/remainders.
     private var onConvertedBuffer: (([Float], TimeInterval) -> Void)?
 
@@ -148,11 +149,13 @@ public final class AudioRecorder: CaptureEngine {
         guard let starting = failed else { return }
         // After the headset took over (or a fallback) the built-in can no longer carry the dictation.
         guard starting else {
-            let headsetCapturing = lock.withLock { captureRunning || restarting }
-            AppController.note("bridge_builtin_lost=1 state=\(lock.withLock { feed.bridge.state }) headset_capturing=\(headsetCapturing ? 1 : 0)")
-            if !headsetCapturing {
-                // Nothing carries the dictation any more: fail it rather than record silence.
-                let callback = onCaptureFailure
+            AppController.note("bridge_builtin_lost=1 state=\(lock.withLock { feed.bridge.state })")
+            // Decided on the headset executor, after any recovery or restart already in flight:
+            // only a headset that is still not capturing then means nothing carries.
+            onExecutor { [weak self] in
+                guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.captureRunning }) else { return }
+                AppController.note("bridge_nothing_carries=1")
+                let callback = self.onCaptureFailure
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
                     callback?()
@@ -304,13 +307,17 @@ public final class AudioRecorder: CaptureEngine {
         if !builtinChild {
             let now = ProcessInfo.processInfo.systemUptime
             if let generation = deferred {
-                guard generation == throttleGeneration, lock.withLock({ engineEpoch === epoch }) else { return }
+                guard generation == throttleGeneration, lock.withLock({ engineEpoch === epoch }) else {
+                    lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(false) } }
+                    return
+                }
                 recoveryThrottle.deferredFired(at: now)
             } else if current() {
                 switch recoveryThrottle.request(at: now) {
                 case .now: break
                 case .coalesced: return
                 case .after(let wait):
+                    lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(true) } }
                     AppController.note("config_recovery_backoff_ms=\(Int((wait * 1000).rounded()))")
                     let generation = throttleGeneration
                     engineQueue.asyncAfter(deadline: .now() + wait) { [weak self] in
@@ -322,8 +329,13 @@ public final class AudioRecorder: CaptureEngine {
                 }
             }
         }
-        guard current() else { return }
+        guard current() else {
+            if !builtinChild { lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(false) } } }
+            return
+        }
         stats.configChanges += 1
+        if !builtinChild { lock.withLock { feed.setHeadsetRecovering(true) } }
+        defer { if !builtinChild { lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(false) } } } }
         // The observer identity was checked before entry. Our own rebuild
         // changes the engine/active flags, so only the epoch gates recovery.
         var result = CaptureConfigurationRecovery.run(isCurrent: {
@@ -370,6 +382,7 @@ public final class AudioRecorder: CaptureEngine {
             }
             if let carried {
                 AppController.note("headset_engine_failed=1 builtin_carries=\(carried == .switchback ? "switchback" : "fallback")")
+                Self.noteCarried(carried, reason: "headset_engine_failed")
                 return
             }
         }
@@ -380,6 +393,12 @@ public final class AudioRecorder: CaptureEngine {
                 callback?()
             }
         }
+    }
+
+    /// The built-in carries the rest of the dictation after a headset failure (bt-proof.sh reads this).
+    private static func noteCarried(_ event: CaptureBridge.Event, reason: String) {
+        AppController.note(event == .switchback ? "bridge_switchback=1 reason=\(reason)"
+                                                 : "bridge_src=builtin_fallback reason=\(reason)")
     }
 
     private func resetRecoveryThrottle() {
@@ -412,7 +431,7 @@ public final class AudioRecorder: CaptureEngine {
     private func restartHeadset(epoch: CaptureEpoch) {
         onExecutor { [self] in
             guard lock.withLock({ engineEpoch === epoch && captureRunning }), engine != nil else { return }
-            lock.withLock { restarting = true }
+            lock.withLock { restarting = true; restartEpoch = epoch }
             defer { lock.withLock { restarting = false } }
             resetRecoveryThrottle()
             // Same shape as a cold start: a fresh engine, never the stopped one (its input
@@ -436,10 +455,12 @@ public final class AudioRecorder: CaptureEngine {
             })
             let nothingCarries: Bool = lock.withLock {
                 guard engineEpoch === epoch else { return false }
+                feed.setHeadsetRecovering(false)    // a deferred recovery from before the restart is void
                 feed.headsetRestarted(started: outcome.started)
                 guard !outcome.started else { return false }
                 let out = feed.headsetFailed()
                 deliverLocked(out.frames)
+                if let event = out.event { Self.noteCarried(event, reason: "headset_restart_failed") }
                 return out.event == nil
             }
             if nothingCarries {
