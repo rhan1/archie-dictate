@@ -307,17 +307,13 @@ public final class AudioRecorder: CaptureEngine {
         if !builtinChild {
             let now = ProcessInfo.processInfo.systemUptime
             if let generation = deferred {
-                guard generation == throttleGeneration, lock.withLock({ engineEpoch === epoch }) else {
-                    lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(false) } }
-                    return
-                }
+                guard generation == throttleGeneration, lock.withLock({ engineEpoch === epoch }) else { return }
                 recoveryThrottle.deferredFired(at: now)
             } else if current() {
                 switch recoveryThrottle.request(at: now) {
                 case .now: break
                 case .coalesced: return
                 case .after(let wait):
-                    lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(true) } }
                     AppController.note("config_recovery_backoff_ms=\(Int((wait * 1000).rounded()))")
                     let generation = throttleGeneration
                     engineQueue.asyncAfter(deadline: .now() + wait) { [weak self] in
@@ -329,13 +325,8 @@ public final class AudioRecorder: CaptureEngine {
                 }
             }
         }
-        guard current() else {
-            if !builtinChild { lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(false) } } }
-            return
-        }
+        guard current() else { return }
         stats.configChanges += 1
-        if !builtinChild { lock.withLock { feed.setHeadsetRecovering(true) } }
-        defer { if !builtinChild { lock.withLock { if engineEpoch === epoch { feed.setHeadsetRecovering(false) } } } }
         // The observer identity was checked before entry. Our own rebuild
         // changes the engine/active flags, so only the epoch gates recovery.
         var result = CaptureConfigurationRecovery.run(isCurrent: {
@@ -453,17 +444,17 @@ public final class AudioRecorder: CaptureEngine {
                 self.teardownEngine()
                 AppController.note("headset_restart_error=\(error as NSError)")
             })
-            let nothingCarries: Bool = lock.withLock {
-                guard engineEpoch === epoch else { return false }
-                feed.setHeadsetRecovering(false)    // a deferred recovery from before the restart is void
+            let carried: (nothing: Bool, event: CaptureBridge.Event?) = lock.withLock {
+                guard engineEpoch === epoch else { return (false, nil) }
                 feed.headsetRestarted(started: outcome.started)
-                guard !outcome.started else { return false }
+                guard !outcome.started else { return (false, nil) }
                 let out = feed.headsetFailed()
                 deliverLocked(out.frames)
-                if let event = out.event { Self.noteCarried(event, reason: "headset_restart_failed") }
-                return out.event == nil
+                return (out.event == nil, out.event)
             }
-            if nothingCarries {
+            // Notes reach the host's sink: never under `lock`.
+            if let event = carried.event { Self.noteCarried(event, reason: "headset_restart_failed") }
+            if carried.nothing {
                 let callback = onCaptureFailure
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }

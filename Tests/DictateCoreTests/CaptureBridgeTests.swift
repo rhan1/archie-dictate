@@ -413,26 +413,20 @@ struct CaptureBridgeTests {
         #expect(none.headsetFailed().event == nil)                          // nothing carries: the owner fails
     }
 
-    @Test func headsetRecoveryGapIsNotStale() {
+    @Test func headsetBackAfterARecoveryGapTakesOverAgainWithoutLoss() {
         var feed = feedStarted()
-        for i in 0..<3 {                                                    // headset carries from 10.1
+        var total = 0, events: [CaptureBridge.Event] = []
+        for i in 0..<40 {
             let t = 10 + Double(i) * 0.1
-            _ = feed.accept(tone(0.05), source: .builtin, at: t)
-            _ = feed.accept(tone(0.05), source: .headset, at: t)
-        }
-        feed.setHeadsetRecovering(true)                                     // rebuild: no headset buffers
-        var events: [CaptureBridge.Event] = []
-        for i in 3..<25 {                                                   // 2.2 s of built-in only
-            events += [feed.accept(tone(0.05), source: .builtin, at: 10 + Double(i) * 0.1).event].compactMap { $0 }
-        }
-        #expect(events.isEmpty && feed.bridge.state == .switched)
-        feed.setHeadsetRecovering(false)                                    // the stale clock restarts now
-        #expect(feed.accept(tone(0.05), source: .builtin, at: 12.5).event == nil)
-        #expect(feed.accept(tone(0.05), source: .headset, at: 12.5).frames.count == 2400)
-        for i in 26..<40 {                                                  // headset never returns
-            events += [feed.accept(tone(0.05), source: .builtin, at: 10 + Double(i) * 0.1).event].compactMap { $0 }
+            let b = feed.accept(tone(0.05), source: .builtin, at: t)
+            total += b.frames.count
+            events += [b.event].compactMap { $0 }
+            // Headset carries, stops for a 2 s rebuild (10.5–12.5), then returns with signal.
+            if i < 5 || i >= 25 { total += feed.accept(tone(0.05), source: .headset, at: t).frames.count }
         }
         #expect(events == [.switchback])
+        #expect(feed.bridge.state == .switched)                             // the recovered headset carries again
+        #expect(total == 4 * 24_000)                                       // 10.0 → 14.0: nothing lost
     }
 
     @Test func headsetThatStopsDeliveringHandsBackOnBuiltinBuffers() {
