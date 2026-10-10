@@ -1,4 +1,4 @@
-# Dictate
+# Archie Dictate
 
 Dictate is a menu-bar dictation application for macOS. Press **⌥⌥** (double-tap Option) to start recording, speak naturally in any application, and tap **⌥ once** (or click the checkmark) to finish—Dictate transcribes your speech via Groq, cleans up filler words and spoken self-corrections, and pastes the result directly at your cursor. Audio output is automatically muted while you talk (using the macOS mute flag, leaving system volume unchanged) and restored when you finish. If network or cloud services are unavailable, Dictate automatically falls back to Apple on-device speech recognition and local Ollama cleanup.
 
