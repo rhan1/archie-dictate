@@ -138,6 +138,30 @@ struct DictationEngineTests {
         engine.cancel()
     }
 
+    // While a held/error outcome is up, the first ⌥ of the next ⌥⌥ must still pre-start capture.
+    @Test func tapPrestartsEvenWhileARecoverableOutcomeIsShown() async throws {
+        let recorder = TestRecorder()
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { TestApple("") }, sttTransport: TestHTTP(""),
+            groqCleanupTransport: TestHTTP(""), localCleanupTransport: TestHTTP(""), inserter: TextInserter(),
+            panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { nil }, manageMedia: false)
+        let controller = AppController(keyStore: KeyStore(reader: { _ in throw URLError(.userAuthenticationRequired) }),
+            paths: AppPaths(home: FileManager.default.temporaryDirectory.appendingPathComponent("dictate-outcome-\(UUID().uuidString)")),
+            surface: .none, mode: .dictate, dependencies: dependencies)
+        let engine = DictationEngine(controller: controller)
+        var states: [DictateAppKit.DictationState] = []
+        engine.onState = { states.append($0) }
+        engine.start()
+        try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending }
+        engine.finish()
+        try await waitFor { states.contains { if case .error = $0 { return true }; if case .held = $0 { return true }; return false } }
+        try await waitFor { !recorder.isAllocated }
+        let before = recorder.starts
+        engine.tap()
+        try await waitFor { recorder.starts > before }
+        engine.escape()
+    }
+
     @Test func keepWarmIsNeverScheduledWithFakeDependenciesAndSharesTheSTTSession() async throws {
         let recorder = TestRecorder()
         let stt = TestHTTP("x"), groq = TestHTTP("x"), local = TestHTTP("x")
