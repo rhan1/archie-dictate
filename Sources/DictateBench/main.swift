@@ -533,6 +533,8 @@ case "stt-groq-chunked":
                 var calls = incremental?.callCount ?? 0
                 var reason = incremental?.fallbackReason ?? "-"
                 var skipped = incremental == nil ? "disabled" : joined.chunks <= 2 ? "short" : "short_text"
+                var cleanupLabel = "-"
+                var cleanupModel = "-"
                 if TranscriptCleaner.shouldClean(joined.text) {
                     let output = await incremental?.finish(totalChunks: joined.chunks, rawText: joined.text,
                         single: { fullRaw in
@@ -575,6 +577,8 @@ case "stt-groq-chunked":
                             return .init(text: fullRaw, label: "skipped:error", model: local.model, stats: nil, calls: 2)
                         })
                     mode = output?.mode ?? "single"
+                    cleanupLabel = output?.single?.label ?? "-"
+                    cleanupModel = output?.single?.model ?? "-"
                     reason = output?.fallbackReason ?? "-"
                     calls = output?.calls ?? 0
                     skipped = output?.skippedReason ?? (incremental == nil ? "disabled" : "none_cleanable_before_finish")
@@ -589,7 +593,7 @@ case "stt-groq-chunked":
                 let pasteMs = ms(since: finish)
                 results.append(pasteMs)
                 lastText = cleaned
-                print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : "") + " script_exact=\(ShadowScore.scriptExact(cleaned))")
+                print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : "") + " cleanup_label=\(cleanupLabel) cleanup_model=\(cleanupModel) script_exact=\(ShadowScore.scriptExact(cleaned))")
                 if showText { print("   raw: \(joined.text)\n   out: \(cleaned)") }
             } else {
                 results.append(elapsed)
