@@ -20,6 +20,8 @@ private final class FakeAudioEngine: CaptureEngine {
     var attempts: [MicChoice] = []
     var rebuilds = 0
     var events: [String] = []
+    /// D-b: an engine whose release cannot complete (wedged executor) stays allocated.
+    var releaseSticks = false
     func start(device: MicChoice) throws {
         if allocation == nil { allocation = Allocation(); allocations += 1 }
         attempts.append(device)
@@ -37,7 +39,7 @@ private final class FakeAudioEngine: CaptureEngine {
         isRunning = false; tapInstalled = false; observerInstalled = false; converterInstalled = false
         return []
     }
-    func release() { _ = stop(); allocation = nil; releases += 1 }
+    func release() { _ = stop(); if !releaseSticks { allocation = nil }; releases += 1 }
     func rebuild() {
         events.append("rebuild")
         release()
@@ -79,10 +81,30 @@ struct CaptureLifecycleTests {
         #expect(engine.isAllocated == false)
         #expect(engine.releases == 1)
         #expect(notes == ["engine_idle_release"])
-        // A later stray rebuild while still idle is guarded too.
+        // A later stray rebuild while still idle is guarded too (released, logged once per episode).
         engine.rebuild()
         clock.advance(2)
-        #expect(engine.isAllocated == false)
+        #expect(engine.isAllocated == false && engine.releases == 3)
+        #expect(notes == ["engine_idle_release"])
+    }
+
+    /// D-b (live 12:02:11Z…12:02:40Z): an allocation that survives release must not
+    /// log every 2 s; the guard keeps releasing but notes once per idle episode.
+    @Test func idleGuardLogsOncePerIdleEpisode() {
+        let engine = FakeAudioEngine(), clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
+        var notes: [String] = []
+        lifecycle.note = { notes.append($0) }
+        engine.releaseSticks = true
+        clock.advance(30)
+        #expect(engine.isAllocated && engine.releases >= 10) // positive control: still wedged, still retried
+        #expect(notes == ["engine_idle_release"])
+        // A new episode (after a lone tap) may log once more.
+        engine.releaseSticks = false
+        lifecycle.firstTap()
+        engine.releaseSticks = true
+        clock.advance(CaptureWarmup.prewarmTimeout)
+        clock.advance(30)
         #expect(notes == ["engine_idle_release", "engine_idle_release"])
     }
 
