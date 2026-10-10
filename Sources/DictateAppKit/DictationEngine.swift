@@ -47,6 +47,10 @@ public struct DictationTimeline: Sendable, Equatable {
         get { controller.engineMode }
         set { controller.engineMode = newValue }
     }
+    /// Where Groq's rate-limit counts are persisted (counts only). Relocate via `init(quotaFileURL:)`.
+    public var quotaFileURL: URL { controller.quotaStore.fileURL }
+    /// Latest counts from every Groq response this engine has seen (also read from the file at launch).
+    public var groqQuota: GroqQuota { controller.quotaStore.current }
     public var forceFallback: FallbackOverride? {
         get { controller.forceFallback }
         set { controller.forceFallback = newValue }
@@ -56,8 +60,9 @@ public struct DictationTimeline: Sendable, Equatable {
     private unowned let controller: AppController
     private let ownedController: AppController?
 
-    public init(keyStore: KeyStore, paths: AppPaths, surface: Surface = .pill, mode: Mode = .dictate) {
-        let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode)
+    public init(keyStore: KeyStore, paths: AppPaths, surface: Surface = .pill, mode: Mode = .dictate,
+                quotaFileURL: URL? = nil) {
+        let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode, quotaFileURL: quotaFileURL)
         self.controller = controller
         ownedController = controller
         bind()
