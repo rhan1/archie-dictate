@@ -34,6 +34,9 @@ public final class CaptureLifecycle {
     private let scheduler: CaptureScheduler
     public let idleReleaseSeconds: TimeInterval
     private var idleGuard: CaptureCancellation?
+    // One engine_idle_release note per idle episode; a release that cannot
+    // complete is retried silently instead of logging every pass (D-b).
+    private var idleReleaseNoted = false
     private var expiry: CaptureCancellation?
     private var firstBufferDeadline: CaptureCancellation?
     private var cap: CaptureCancellation?
@@ -55,6 +58,7 @@ public final class CaptureLifecycle {
         warmup.phase == .off && !recordingRequested && !hasPendingPrewarmExpiry && !prewarmStarting
     }
     private func cancelIdleGuard() { idleGuard?.cancel(); idleGuard = nil }
+    private func leaveIdle() { cancelIdleGuard(); idleReleaseNoted = false }
     private func armIdleGuard() {
         cancelIdleGuard()
         guard isIdle else { return }
@@ -64,7 +68,7 @@ public final class CaptureLifecycle {
             self.idleGuard = nil
             if self.engine.isAllocated {
                 self.releaseEngine()
-                self.note?("engine_idle_release")
+                if !self.idleReleaseNoted { self.idleReleaseNoted = true; self.note?("engine_idle_release") }
             }
             // Keep watching for an allocation left by a late recovery operation.
             self.armIdleGuard()
@@ -93,7 +97,7 @@ public final class CaptureLifecycle {
 
     public func firstTap() {
         guard warmup.phase == .off, !recordingRequested, !prewarmStarting else { return }
-        cancelIdleGuard()
+        leaveIdle()
         let token = CaptureEpoch()
         epoch = token
         prewarmStarting = true
@@ -114,7 +118,7 @@ public final class CaptureLifecycle {
     @MainActor public func firstTapAsync(start: (MicChoice) async throws -> Void,
                               isCancelled: () -> Bool) async {
         guard warmup.phase == .off, !recordingRequested, !prewarmStarting, !isCancelled() else { return }
-        cancelIdleGuard()
+        leaveIdle()
         let token = CaptureEpoch()
         epoch = token
         prewarmStarting = true
@@ -135,7 +139,7 @@ public final class CaptureLifecycle {
     }
 
     private func prepareRecording(at time: TimeInterval) -> CaptureEpoch {
-        cancelIdleGuard()
+        leaveIdle()
         let token = CaptureEpoch()
         epoch = token
         prewarmStarting = false

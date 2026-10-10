@@ -95,3 +95,58 @@ func redTeamRig() -> (RedTeamEngine, CaptureLifecycle, RedTeamClock) {
     let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
     return (engine, lifecycle, clock)
 }
+
+/// D0b: AudioRecorder's bridge wiring on fakes — the default-input engine, a
+/// built-in bridge engine on its own executor (watched for a wedge), and the
+/// production CaptureFeed (arbitration + pre-roll ring). No audio hardware.
+final class PreRollEngine: CaptureEngine {
+    let headset = RedTeamEngine()
+    private(set) var builtin = RedTeamEngine()
+    private(set) var feed = CaptureFeed()
+    private(set) var samples: [Float] = []
+    private(set) var abandoned = 0
+    private var builtinWatch = CaptureExecutorWatch()
+    private let clock: RedTeamClock
+    var defaultInput: CaptureBridge.DefaultInput = .bluetooth
+    /// The bridge executor never returns from its current CoreAudio call (live 11:58Z).
+    var builtinWedged = false
+    init(clock: RedTeamClock) { self.clock = clock; headset.isAllocated = false; builtin.isAllocated = false }
+
+    var isRunning: Bool { headset.isRunning }
+    var isAllocated: Bool { headset.isAllocated || builtin.isAllocated }
+    func start(device: MicChoice) throws {
+        if isRunning { return }
+        feed.start(defaultInput: device == .default ? defaultInput : .other, hasBuiltin: true)
+        if feed.bridge.state == .builtinOnly {
+            builtinWatch.began(at: clock.now)
+            try builtin.start(device: .builtIn)
+            if !builtinWedged { builtinWatch.ended() }
+        }
+        try headset.start(device: device)
+    }
+    func resetCapture(at time: TimeInterval) { samples = feed.recordingStarted(at: time) }
+    func deliver(_ source: CaptureBridge.Source, at time: TimeInterval, frames: [Float], arrivedAt: TimeInterval? = nil) {
+        let out = feed.accept(frames, source: source, at: time, arrivedAt: arrivedAt)
+        samples += out.frames
+        if out.releaseBuiltin { releaseBuiltin() }
+    }
+    func stop() -> [Float] {
+        let captured = samples
+        samples = []
+        feed.cancel()
+        releaseBuiltin()
+        _ = headset.stop()
+        return captured
+    }
+    func release() { _ = stop(); headset.release() }
+    func rebuild() { headset.rebuild() }
+    private func releaseBuiltin() {
+        guard builtinWedged else { builtin.release(); return }
+        // The queued teardown lands behind (or is) the call that never returns.
+        if builtinWatch.busySince == nil { builtinWatch.began(at: clock.now) }
+        if builtinWatch.isWedged(at: clock.now) {
+            builtin = RedTeamEngine(); builtin.isAllocated = false
+            builtinWatch = CaptureExecutorWatch(); builtinWedged = false; abandoned += 1
+        }
+    }
+}
