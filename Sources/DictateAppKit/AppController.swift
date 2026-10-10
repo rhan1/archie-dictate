@@ -881,6 +881,7 @@ public final class AppController {
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
                 "bridge_ms=\(capture.bridgeMs.map(String.init) ?? "-")", "bridge_src=\(capture.bridgeSource)",
+                "tap2_to_first_kept_buffer_ms=\(capture.tap2ToFirstKeptMs.map(String.init) ?? "-")",
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
                 "path=\(path)", "stt_ms=\(sttMs.map(String.init) ?? "-")",
                 "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
