@@ -151,7 +151,8 @@ public final class AppController {
             AppController.note("migration_error=\(error.localizedDescription)")
         }
         keyStore.prefetch(services: ["groq-api"])
-        logKeyStates()
+        // Logged once the background read has had time to resolve (at request time it is always pending).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.logKeyStates() }
         hotkeys.onSignal = { [weak self] signal in MainActor.assumeIsolated { self?.facade.handle(signal) } }
         hotkeys.onEscape = { [weak self] in MainActor.assumeIsolated { self?.facade.escape() } }
         statusItem?.onToggle = { [weak self] in MainActor.assumeIsolated { self?.facade.handle(.doubleTap) } }
