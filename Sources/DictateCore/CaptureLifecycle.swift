@@ -310,7 +310,9 @@ public final class CaptureLifecycle {
         return false
     }
 
-    public func bufferArrived(at time: TimeInterval, epoch token: CaptureEpoch? = nil) {
+    public func bufferArrived(at time: TimeInterval, epoch token: CaptureEpoch? = nil,
+                              source: CaptureBridge.Source = .headset) {
+        guard source == .headset else { return }
         if let token, epoch !== token { return }
         guard warmup.phase != .off else { return }
         for effect in warmup.bufferArrived(at: time) { onEffect?(effect) }
