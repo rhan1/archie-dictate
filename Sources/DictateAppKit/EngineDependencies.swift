@@ -11,6 +11,7 @@ protocol EngineRecorder: CaptureEngine {
     func startAsync(device: MicChoice) async throws
     func rebuildAsync() async throws
     func resetCapture()
+    var bridgeHasAudio: Bool { get }
 }
 extension AudioRecorder: EngineRecorder {}
 

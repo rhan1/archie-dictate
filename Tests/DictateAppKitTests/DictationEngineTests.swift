@@ -24,6 +24,7 @@ private final class TestRecorder: EngineRecorder {
     var ready = false
     var starts = 0, stops = 0
     var isAllocated = false
+    var bridgeHasAudio = false
     func release() { isAllocated = false; isRunning = false }
     func start(device: MicChoice) throws { starts += 1; isAllocated = true; isRunning = true; onFirstBuffer?() }
     func startAsync(device: MicChoice) async throws { try start(device: device) }
@@ -152,7 +153,8 @@ struct DictationEngineTests {
             engine.onTranscript = { deliveries.append(($0, $1)) }
             engine.onGroqRateLimit = { limits.append($0) }
             engine.start()
-            try await waitFor { recorder.ready }
+            // BT3 resets pre-roll before the asynchronous start; wait for the start itself.
+            try await waitFor { recorder.ready && recorder.starts > 0 }
             recorder.onLevel?(2); recorder.onLevel?(-1)
             #expect(states.contains(.warming) && states.contains(.recording(level: 0)))
             #expect(states.contains(.recording(level: 1)))

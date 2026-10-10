@@ -466,6 +466,10 @@ public final class AppController {
         micStarting = true
         pill.show(.warming)
         statusItem?.setRecording(true)
+        // BT3: establish the recording boundary before either asynchronous start
+        // completes, so built-in bridge audio feeds the existing transcribers.
+        recorder.resetCapture()
+        attachTranscribers()
         Task { @MainActor [weak self] in
             guard let self else { return }
             let cancelled = { self.generation !== token || self.machine.state != .recording }
@@ -481,8 +485,6 @@ public final class AppController {
                 self.fail(reason: "mic_\(self.micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
                 return
             }
-            self.recorder.resetCapture() // drop all pre-roll, including recovery audio
-            self.attachTranscribers()
             self.traceFocus("pill shown")
         }
     }
@@ -526,11 +528,12 @@ public final class AppController {
     }
 
     private func endRecording() {
-        if micStarting {
+        if micStarting && !recorder.bridgeHasAudio {
             machine = DictationStateMachine()
             cancelAll()
             return
         }
+        micStarting = false
         statusItem?.setRecording(false)
         let finishedAt = Date()
         let finishClock = DispatchTime.now()
@@ -808,6 +811,7 @@ public final class AppController {
                 "conflict=\(AppController.conflictingDictationApps())", "fmt=\(capture.startFormat)",
                 "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
+                "bridge_ms=\(capture.bridgeMs.map(String.init) ?? "-")", "bridge_src=\(capture.bridgeSource)",
                 String(format: "captured_s=%.1f", capturedSeconds), String(format: "peak_dbfs=%.1f", peakDBFS),
                 "path=\(path)", "stt_ms=\(sttMs.map(String.init) ?? "-")",
                 "cleanup_first_byte_ms=\(cleanup?.firstByteMs.map(String.init) ?? "-")", "cleanup_ms=\(cleanupMs.map(String.init) ?? "-")",
@@ -818,6 +822,7 @@ public final class AppController {
             if cleanupMode == "single", let incrementalSkipped {
                 fields.append("incremental_skipped=\(incrementalSkipped)")
             }
+            if let reason = capture.bridgeReason { fields.append("bridge_reason=\(reason)") }
             if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
