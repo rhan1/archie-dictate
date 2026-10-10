@@ -191,4 +191,48 @@ struct WAVInjectedRecorderTests {
         #expect(firstOnMain == true)
         #expect(levelOnMain == true)
     }
+
+    // A failed start (bad file) must not leave the lock held: the controller reads isRunning next.
+    @Test func failedStartReleasesTheLock() throws {
+        let recorder = WAVInjectedRecorder(url: URL(fileURLWithPath: "/nonexistent/missing.wav"))
+        #expect(throws: AudioRecorder.RecorderError.self) { try recorder.start() }
+        let done = DispatchSemaphore(value: 0)
+        let box = LockedResult()
+        Thread.detachNewThread { box.value = recorder.isRunning; done.signal() }
+        #expect(done.wait(timeout: .now() + 1) == .success, "isRunning deadlocked after a failed start")
+        #expect(box.value == false)
+    }
+
+    // WAVE_FORMAT_EXTENSIBLE (tag 0xFFFE, as afconvert/the real fixture write) with the PCM subformat.
+    @Test func extensiblePCMParsesAndFloatSubformatThrows() throws {
+        func extensible(subformatFirstByte: UInt8, samples: [Int16]) -> Data {
+            var d = Data()
+            func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+            func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+            d.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(4 + 48 + 8 + samples.count * 2))
+            d.append(contentsOf: Array("WAVE".utf8)); d.append(contentsOf: Array("fmt ".utf8)); u32(40)
+            u16(0xFFFE); u16(1); u32(24_000); u32(48_000); u16(2); u16(16); u16(22); u16(16); u32(4)
+            d.append(contentsOf: [subformatFirstByte, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+                                  0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71])
+            d.append(contentsOf: Array("data".utf8)); u32(UInt32(samples.count * 2))
+            for v in samples { u16(UInt16(bitPattern: v)) }
+            return d
+        }
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let pcm = dir.appendingPathComponent("ext-pcm.wav"), float = dir.appendingPathComponent("ext-float.wav")
+        try extensible(subformatFirstByte: 0x01, samples: [1, -2, 3]).write(to: pcm)
+        try extensible(subformatFirstByte: 0x03, samples: [1, -2, 3]).write(to: float)
+        #expect(try WAVInjectedRecorder.parseWAV(at: pcm) == [1, -2, 3])
+        #expect(throws: AudioRecorder.RecorderError.self) { try WAVInjectedRecorder.parseWAV(at: float) }
+    }
+}
+
+private final class LockedResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool?
+    var value: Bool? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
 }
