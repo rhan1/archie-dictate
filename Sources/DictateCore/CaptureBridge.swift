@@ -9,6 +9,8 @@ public struct CaptureBridge {
     public struct Decision: Equatable, Sendable {
         public var dropFrames: Int = 0
         public var framesToFeed: Int = 0
+        /// Before the second tap, accepted frames go to the owner's pre-roll ring.
+        public var framesToRing: Int = 0
         public var releaseBuiltin = false
     }
     public private(set) var state: State = .off
@@ -16,9 +18,19 @@ public struct CaptureBridge {
     public private(set) var bridgeSource = "none"
     public private(set) var skipReason: String?
     public private(set) var epoch = CaptureEpoch()
+    /// Second tap → first kept frames available (0 when the ring already held audio).
+    public private(set) var firstKeptMs: Int?
+    /// Built-in frames accepted (ring or dictation); 0 means the bridge carried nothing.
+    public private(set) var builtinFrames = 0
     private var recordingStart: TimeInterval?
+    private var tapTime: TimeInterval?
     private var fedThrough: TimeInterval?
     public init() {}
+
+    /// Timeline reason: a skip, or a bridge whose built-in engine delivered no audio.
+    public var reason: String? {
+        skipReason ?? (bridgeSource == "builtin" && builtinFrames == 0 ? "builtin_no_audio" : nil)
+    }
 
     public mutating func start(defaultInput: DefaultInput, hasBuiltin: Bool,
                                epoch token: CaptureEpoch = CaptureEpoch()) {
@@ -31,11 +43,15 @@ public struct CaptureBridge {
         else { state = .switched }
     }
 
-    /// Both sources discard pre-roll at the second tap, even when hardware startup
+    /// Both sources discard audio before `time − preRoll`, even when hardware startup
     /// is still in flight. A headset already flowing in prewarm needs no bridge.
-    public mutating func recordingStarted(at time: TimeInterval) {
-        recordingStart = time
-        fedThrough = nil
+    /// Ring frames already accepted stay the continuity point, so live buffers
+    /// never duplicate kept pre-roll.
+    public mutating func recordingStarted(at time: TimeInterval, preRoll: TimeInterval = 0,
+                                          keptFrames: Int = 0) {
+        recordingStart = time - preRoll
+        tapTime = time
+        firstKeptMs = keptFrames > 0 ? 0 : nil
         bridgeMs = state == .switched && bridgeSource == "builtin" ? 0 : nil
     }
 
@@ -47,20 +63,27 @@ public struct CaptureBridge {
         if source == .headset, state == .builtinOnly {
             state = .switched
             result.releaseBuiltin = true
-            if let start = recordingStart {
-                bridgeMs = max(0, Int((((arrivedAt ?? time) - start) * 1000).rounded()))
+            if let tap = tapTime {
+                bridgeMs = max(0, Int((((arrivedAt ?? time) - tap) * 1000).rounded()))
             }
         }
-        guard let recordingStart,
-              (source == .builtin && state == .builtinOnly) ||
+        guard (source == .builtin && state == .builtinOnly) ||
               (source == .headset && state == .switched) else { return result }
         // Trim all samples before the recording boundary or already delivered by
         // either source. This also handles a whole overlapping headset buffer.
-        let boundary = max(recordingStart, fedThrough ?? recordingStart)
-        result.dropFrames = min(frames, max(0, Int(ceil((boundary - time) * 24_000 - 0.000001))))
-        result.framesToFeed = frames - result.dropFrames
-        if result.framesToFeed > 0 {
-            fedThrough = max(boundary, time + Double(frames) / 24_000)
+        let boundary = [recordingStart, fedThrough].compactMap { $0 }.max()
+        if let boundary {
+            result.dropFrames = min(frames, max(0, Int(ceil((boundary - time) * 24_000 - 0.000001))))
+        }
+        let accepted = frames - result.dropFrames
+        if accepted > 0 {
+            fedThrough = max(boundary ?? time, time + Double(frames) / 24_000)
+            if source == .builtin { builtinFrames += accepted }
+        }
+        guard recordingStart != nil else { result.framesToRing = accepted; return result }
+        result.framesToFeed = accepted
+        if accepted > 0, firstKeptMs == nil, let tap = tapTime {
+            firstKeptMs = max(0, Int((((arrivedAt ?? time) - tap) * 1000).rounded()))
         }
         return result
     }
@@ -71,6 +94,7 @@ public struct CaptureBridge {
         state = .off
         epoch = CaptureEpoch()
         recordingStart = nil
+        tapTime = nil
         fedThrough = nil
         return release
     }

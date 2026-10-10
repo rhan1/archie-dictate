@@ -527,4 +527,122 @@ struct LifecycleRedTeamTests {
         #expect(activations == 1)
         next(engine, lifecycle, clock)
     }
+    // MARK: D0b — first-tap pre-start, pre-roll, lone tap, D-b release
+
+    private func preRollRig() -> (PreRollEngine, CaptureLifecycle, RedTeamClock) {
+        let clock = RedTeamClock()
+        let engine = PreRollEngine(clock: clock)
+        return (engine, CaptureLifecycle(engine: engine, scheduler: clock), clock)
+    }
+    private func frames(_ start: Int, _ count: Int) -> [Float] { (start..<(start + count)).map(Float.init) }
+
+    @Test func firstTapStartsBuiltinAndHeadsetTogether() {
+        let (engine, lifecycle, _) = preRollRig()
+        lifecycle.firstTap()
+        #expect(engine.builtin.isRunning && engine.builtin.attempts == [.builtIn])
+        #expect(engine.headset.isRunning && engine.headset.attempts == [.default])
+        #expect(lifecycle.warmup.phase == .prewarming) // never shows recording before the second tap
+        lifecycle.end(.cancel)
+    }
+
+    @Test func loneTapDiscardsRingAndReleasesBothWithinOneSecond() {
+        let (engine, lifecycle, clock) = preRollRig()
+        lifecycle.firstTap()
+        for i in 0..<10 { engine.deliver(.builtin, at: 0.05 + Double(i) * 0.05, frames: frames(i * 1200, 1200)) }
+        clock.advance(0.69)
+        #expect(engine.isAllocated && engine.feed.ring.count > 0) // positive control: the window is still open
+        clock.advance(0.01) // the double-tap window + maxHold (0.7 s) closes
+        #expect(!engine.isAllocated && !engine.builtin.isAllocated && !engine.headset.isAllocated)
+        #expect(engine.feed.ring.count == 0 && engine.samples.isEmpty)
+        #expect(lifecycle.warmup.phase == .off)
+        next(engine.headset, lifecycle, clock)
+    }
+
+    @Test func doubleTapKeepsPreRollAndHandsOverExactly() {
+        let (engine, lifecycle, clock) = preRollRig()
+        lifecycle.firstTap()
+        for i in 0..<5 { engine.deliver(.builtin, at: 0.10 + Double(i) * 0.05, frames: frames(i * 1200, 1200)) }
+        clock.advance(0.35)
+        engine.resetCapture(at: 0.35)
+        #expect(lifecycle.beginRecording(at: 0.35))
+        #expect(engine.samples == frames(2400, 3600)) // boundary − 150 ms, available at the tap
+        #expect(engine.feed.bridge.firstKeptMs == 0)
+        #expect(lifecycle.warmup.phase == .warming) // honest: the headset is not live yet
+        engine.deliver(.builtin, at: 0.35, frames: frames(6000, 1200))
+        engine.deliver(.headset, at: 0.38, frames: Array(repeating: -1, count: 1200), arrivedAt: 1.4)
+        lifecycle.bufferArrived(at: 1.4)
+        #expect(lifecycle.warmup.phase == .live && !engine.builtin.isAllocated)
+        engine.deliver(.headset, at: 0.43, frames: Array(repeating: -2, count: 1200))
+        // 0.20 ..< 0.48: no duplicate at the handover, no gap.
+        #expect(engine.samples.count == 6720)
+        let captured = lifecycle.end(.finished(.ok))
+        #expect(captured.count == 6720 && Array(captured.prefix(4800)) == frames(2400, 4800))
+        #expect(!engine.isAllocated)
+    }
+
+    @Test func builtinDefaultMicPreStartsOnFirstTapAndKeepsPreRoll() {
+        let (engine, lifecycle, clock) = preRollRig()
+        engine.defaultInput = .builtin
+        lifecycle.firstTap()
+        #expect(engine.headset.isRunning && !engine.builtin.isAllocated) // one engine: the default IS built-in
+        for i in 0..<4 { engine.deliver(.headset, at: 0.12 + Double(i) * 0.05, frames: frames(i * 1200, 1200)) }
+        lifecycle.bufferArrived(at: 0.13)
+        clock.advance(0.3)
+        engine.resetCapture(at: 0.30)
+        #expect(lifecycle.beginRecording(at: 0.30))
+        #expect(engine.samples == frames(720, 4080) && engine.feed.bridge.firstKeptMs == 0)
+        #expect(lifecycle.warmup.phase == .live && lifecycle.warmup.warmMs == 0)
+        lifecycle.end(.cancel)
+        #expect(!engine.isAllocated)
+    }
+
+    /// D-b (live 12:00:20Z…): after a bridged dictation the bridge executor never
+    /// ran its teardown, so `isAllocated` stayed true and the guard logged every 2 s.
+    @Test(arguments: [false, true])
+    func wedgedBridgeIsAbandonedSoBothEnginesReleaseWithinTwoSeconds(_ wedgeAtStart: Bool) {
+        let (engine, lifecycle, clock) = preRollRig()
+        var notes: [String] = []
+        lifecycle.note = { notes.append($0) }
+        engine.builtinWedged = wedgeAtStart
+        lifecycle.firstTap()
+        engine.builtinWedged = true // otherwise its handover teardown is the call that never returns
+        clock.advance(0.3)
+        engine.resetCapture(at: 0.3)
+        #expect(lifecycle.beginRecording(at: 0.3))
+        engine.deliver(.headset, at: 1.0, frames: frames(0, 1200), arrivedAt: 1.1)
+        lifecycle.bufferArrived(at: 1.1)
+        clock.advance(20)
+        #expect(engine.builtin.isAllocated && engine.abandoned == 0) // positive control: v1.5.4 stays here
+        lifecycle.end(.finished(.ok))
+        #expect(engine.abandoned == 1 && !engine.isAllocated) // at the finish, well inside 2 s
+        clock.advance(30)
+        #expect(!engine.isAllocated && !notes.contains("engine_idle_release"))
+        next(engine.headset, lifecycle, clock) // the next dictation gets a fresh bridge executor
+        #expect(engine.abandoned == 1)
+    }
+
+    @Test func wedgedBridgeAfterALoneTapIsReleasedByTheIdleGuardOnce() {
+        let (engine, lifecycle, clock) = preRollRig()
+        var notes: [String] = []
+        lifecycle.note = { notes.append($0) }
+        engine.builtinWedged = true
+        lifecycle.firstTap()
+        clock.advance(0.7) // lone tap: expiry releases; the wedge is only 0.7 s old
+        #expect(engine.isAllocated && engine.abandoned == 0)
+        clock.advance(2.0) // idle guard: ≤ 2 s after the release
+        #expect(!engine.isAllocated && engine.abandoned == 1)
+        clock.advance(30)
+        #expect(notes == ["engine_idle_release"])
+        next(engine.headset, lifecycle, clock)
+    }
+
+    @Test func executorWatchFlagsOnlyAnOperationThatNeverReturns() {
+        var watch = CaptureExecutorWatch()
+        #expect(!watch.isWedged(at: 100))
+        watch.began(at: 10)
+        #expect(!watch.isWedged(at: 10 + CaptureExecutorWatch.wedgeSeconds - 0.01))
+        #expect(watch.isWedged(at: 10 + CaptureExecutorWatch.wedgeSeconds))
+        watch.ended()
+        #expect(!watch.isWedged(at: 100) && watch.busySince == nil)
+    }
 }
