@@ -63,8 +63,10 @@ private actor TestHTTP: HTTPTransport {
 
 @Suite("DictationEngineTests") @MainActor
 struct DictationEngineTests {
+    // Wall-clock deadline: under suite load 2000 × 1 ms polls ran out before the fake pipeline finished.
     private func waitFor(_ condition: () -> Bool) async throws {
-        for _ in 0..<2000 {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < deadline {
             if condition() { return }
             try await Task.sleep(nanoseconds: 1_000_000)
         }
