@@ -88,7 +88,16 @@ func pseudoChunks(_ text: String) -> [String] {
 
 /// App-equivalent full-text fallback, including the length-scaled local deadline.
 func benchCleanUp(_ raw: String, groq: TranscriptCleaner) async -> (text: String, calls: Int) {
-    if let text = try? await groq.clean(raw) { return (text, 1) }
+    do {
+        let text = try await groq.clean(raw)
+        return (text, 1)
+    } catch TranscriptionError.client(429) {
+        var retryGroq = TranscriptCleaner(
+            transport: groq.transport, endpoint: groq.endpoint, model: TranscriptCleaner.retryModel,
+            vocabulary: groq.vocabulary, apiKey: groq.apiKey
+        )
+        if let text = try? await retryGroq.clean(raw) { return (text, 2) }
+    } catch {}
     let deadline = max(2.5, 0.8 + Double(raw.count) / 4 / 45)
     var local = TranscriptCleaner(transport: URLSessionTransport(timeout: deadline),
         endpoint: TranscriptCleaner.ollamaEndpoint, model: TranscriptCleaner.localModel,
@@ -458,9 +467,10 @@ case "stt-groq-chunked":
         print("BENCH_TAIL_MS must be an integer from 0 to 60000")
         exit(2)
     }
-    let cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5),
+    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5),
                                     endpoint: TranscriptCleaner.groqEndpoint, model: TranscriptCleaner.defaultModel,
                                     vocabulary: benchPrompt, apiKey: { try environmentKey("GROQ_API_KEY") })
+    cleaner.onGroqRateLimit = { GroqQuotaStore.shared.record($0) }
     let singleCleaner: TranscriptCleaner = {
         var copy = cleaner
         copy.includeExamples = !shortPrompt
@@ -479,7 +489,8 @@ case "stt-groq-chunked":
                                            onChunkText: { index, text in
                                                if showChunks { rawChunkTexts.append(index: index, text: text) }
                                                incremental?.append(index: index, text: text)
-                                           })
+                                           },
+                                           onGroqRateLimit: { GroqQuotaStore.shared.record($0) })
         let started = DispatchTime.now().uptimeNanoseconds
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
@@ -527,9 +538,27 @@ case "stt-groq-chunked":
                         single: { fullRaw in
                             // Match the app's Groq → local → raw fallback, and
                             // stop before local if the incremental path wins.
-                            if let (text, stats) = try? await singleCleaner.cleanWithStats(fullRaw) {
+                            do {
+                                let (text, stats) = try await singleCleaner.cleanWithStats(fullRaw)
                                 return .init(text: text, label: "ok", model: cleaner.model, stats: stats, calls: 1)
-                            }
+                            } catch TranscriptionError.client(429) {
+                                var retryGroq = TranscriptCleaner(
+                                    transport: singleCleaner.transport,
+                                    endpoint: singleCleaner.endpoint,
+                                    model: TranscriptCleaner.retryModel,
+                                    vocabulary: singleCleaner.vocabulary,
+                                    includeExamples: singleCleaner.includeExamples,
+                                    apiKey: singleCleaner.apiKey,
+                                    onGroqRateLimit: singleCleaner.onGroqRateLimit
+                                )
+                                retryGroq.hintsSentence = singleCleaner.hintsSentence
+                                retryGroq.reloadVocabularyFromHints = singleCleaner.reloadVocabularyFromHints
+                                retryGroq.timeoutInterval = singleCleaner.timeoutInterval
+                                if let (text, stats) = try? await retryGroq.cleanWithStats(fullRaw) {
+                                    return .init(text: text, label: "cleanup_model_fallback=\(TranscriptCleaner.retryModel)",
+                                                 model: TranscriptCleaner.retryModel, stats: stats, calls: 2)
+                                }
+                            } catch {}
                             if Task.isCancelled {
                                 return .init(text: fullRaw, label: "skipped:cancelled", model: cleaner.model, stats: nil, calls: 1)
                             }
@@ -560,7 +589,7 @@ case "stt-groq-chunked":
                 let pasteMs = ms(since: finish)
                 results.append(pasteMs)
                 lastText = cleaned
-                print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : ""))
+                print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : "") + " script_exact=\(ShadowScore.scriptExact(cleaned))")
                 if showText { print("   raw: \(joined.text)\n   out: \(cleaned)") }
             } else {
                 results.append(elapsed)

@@ -6,6 +6,7 @@ import Foundation
 public struct TranscriptCleaner: Sendable {
     public static let endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
     public static let defaultModel = "qwen/qwen3.8-27b"
+    public static let retryModel = "openai/gpt-oss-20b"
     public static let ollamaEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
     public static let localModel = "llama3.2:3b-instruct-q4_K_M"
     public static let deadline: TimeInterval = 2.5
@@ -130,8 +131,15 @@ public struct TranscriptCleaner: Sendable {
             "temperature": 0,
             "messages": Self.messages(system: systemPrompt(), text: text, includeExamples: includeExamples),
         ]
-        if !isLocal, let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
-        if !isLocal { body["max_completion_tokens"] = min(1024, 2 * (text.count / 4) + 64) }
+        if !isLocal {
+            if model.contains("gpt-oss") {
+                body["reasoning_effort"] = (reasoningEffort == "none" || reasoningEffort == nil) ? "low" : reasoningEffort!
+                body["max_completion_tokens"] = max(512, min(2048, 2 * (text.count / 4) + 512))
+            } else {
+                if let reasoningEffort { body["reasoning_effort"] = reasoningEffort }
+                body["max_completion_tokens"] = min(1024, 2 * (text.count / 4) + 64)
+            }
+        }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return request
     }
