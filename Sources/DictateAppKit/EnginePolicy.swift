@@ -8,14 +8,16 @@ struct EnginePolicy: Sendable {
     /// Per-endpoint quota exhaustion (< 10 % requests left), sampled once at recording start.
     var sttQuotaLow = false
     var cleanupQuotaLow = false
-    var usesGroqSTT: Bool { fallback != .quota && !sttQuotaLow }
-    var usesGroqCleanup: Bool { fallback != .quota && !cleanupQuotaLow }
+    /// The Groq key could not be read (denied / prompt suppressed): Apple STT + local cleanup.
+    var keyUnavailable = false
+    var usesGroqSTT: Bool { fallback != .quota && !sttQuotaLow && !keyUnavailable }
+    var usesGroqCleanup: Bool { fallback != .quota && !cleanupQuotaLow && !keyUnavailable }
     var usesCleanup: Bool { mode == .dictate }
     var usesPaste: Bool { mode == .dictate }
     var fallbackLabel: String? { fallback == .quota || sttQuotaLow || cleanupQuotaLow ? "quota" : nil }
     /// Log/timeline text after `fallback=`; automatic quota adds which endpoint ran low.
     var fallbackFields: String? {
-        guard let label = fallbackLabel else { return nil }
+        guard let label = fallbackLabel else { return keyUnavailable ? "no_key" : nil }
         guard fallback == nil else { return label }
         return label + " quota_low=" + (sttQuotaLow && cleanupQuotaLow ? "both" : sttQuotaLow ? "stt" : "cleanup")
     }
