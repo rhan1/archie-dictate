@@ -31,3 +31,15 @@ enum BluetoothProfile {
         }
     }
 }
+
+/// Names a foreign mic holder: the headset sits in HFP while Dictate is idle
+/// with its engine released. One note per episode; leaving HFP re-arms it.
+struct ForeignHFPLatch {
+    private var noted = false
+    mutating func observe(profile: String, engineAllocated: Bool, idle: Bool) -> Bool {
+        guard profile == "hfp" else { noted = false; return false }
+        guard idle, !engineAllocated, !noted else { return false }
+        noted = true
+        return true
+    }
+}

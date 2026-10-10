@@ -29,6 +29,9 @@ import DictateAppKit
 `cancel()` and `escape()` cancel capture/transcription or dismiss an outcome.
 `pasteHeld()` recovers held text once; `copyHeld()` copies its current preview.
 The host can drive these methods itself without creating a hotkey monitor.
+Call `engine.recoverStaleMute()` once at host launch: if a previous host run quit or
+crashed while output was muted, it restores the mute flag and returns the event
+(`mute_recovered=1` or `restore_failed`); nil when nothing was pending.
 
 Set `engine.mode = .captureOnly` for chunked STT with the raw joined transcript
 in `onTranscript`, without cleanup or clipboard changes. Completion returns to
