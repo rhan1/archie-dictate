@@ -80,7 +80,8 @@ struct AppPathsTests {
             let muter = OutputMuter(device: device, stateFile: AppPaths(home: home).mutedStateURL)
             #expect(muter.recoverIfNeeded() == .unmuteRecovered)
             #expect(device.mute["headset"] == false)
-            #expect(!FileManager.default.fileExists(atPath: AppPaths(home: home).mutedStateURL.path))
+            // v1.5.3 (BT2): the crash record is kept until the 5 s settle window passes clean.
+            #expect(FileManager.default.fileExists(atPath: AppPaths(home: home).mutedStateURL.path))
             #expect(try String(contentsOf: legacy, encoding: .utf8) == "headset\t0")
         }
     }
