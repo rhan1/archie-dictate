@@ -7,6 +7,8 @@ public struct TranscriptCleaner: Sendable {
     public static let endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
     public static let defaultModel = "qwen/qwen3.8-27b"
     public static let retryModel = "openai/gpt-oss-20b"
+    /// Log name for the 429 retry model: open weights served by Groq on the same key.
+    public static let retryModelLogName = "groq:gpt-oss-20b"
     public static let ollamaEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
     public static let localModel = "llama3.2:3b-instruct-q4_K_M"
     public static let deadline: TimeInterval = 2.5
