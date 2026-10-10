@@ -18,6 +18,7 @@ import DictateAppKit
 }
 
 import Testing
+import Foundation
 
 @Suite("HostingExampleTests") @MainActor
 struct HostingExampleTests {
@@ -26,5 +27,17 @@ struct HostingExampleTests {
         #expect(host.engine.surface == .none)
         #expect(host.engine.mode == .dictate)
         #expect(host.engine.forceFallback == nil)
+    }
+
+    // docs/HOSTING.md shows exactly the example compiled above.
+    @Test func docExampleMatchesCompiledExample() throws {
+        let here = URL(fileURLWithPath: #filePath)
+        let root = here.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let doc = try String(contentsOf: root.appendingPathComponent("docs/HOSTING.md"), encoding: .utf8)
+        let source = try String(contentsOf: here, encoding: .utf8)
+        let block = doc.components(separatedBy: "```swift\n").dropFirst().first?.components(separatedBy: "```").first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let compiled = source.components(separatedBy: "\nimport Testing").first?.trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(block != nil && block == compiled)
     }
 }

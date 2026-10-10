@@ -77,6 +77,9 @@ public struct DictationTimeline: Sendable, Equatable {
 
     public func start() { controller.engineStart() }
     public func finish() { controller.engineFinish() }
+    /// Undoes a mute left by a host that quit or crashed mid-dictation; call once at host launch.
+    /// Returns the event (`mute_recovered=1`, `restore_failed`) or nil when nothing was pending.
+    @discardableResult public func recoverStaleMute() -> String? { controller.engineRecoverStaleMute() }
     public func cancel() { controller.engineCancel() }
     public func escape() { controller.engineEscape() }
     public func pasteHeld() { controller.enginePasteHeld() }
