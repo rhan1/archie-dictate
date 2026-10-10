@@ -605,4 +605,115 @@ struct IncrementalCleanupTests {
         let user = (body["messages"] as! [[String: String]]).last!["content"]!
         #expect(user.contains("<context>" + String(repeating: "x", count: 600) + "</context>"))
     }
+
+    @Test func tpmBudgetSkipsMidsAndSpendsOneFinalCallWithoutFewShot() async throws {
+        let transport = IncrementalTransport()
+        let cl = cleaner(transport)
+        let response = HTTPURLResponse(
+            url: TranscriptCleaner.groqEndpoint, statusCode: 200, httpVersion: nil,
+            headerFields: [
+                "x-ratelimit-remaining-tokens": "500",
+                "x-ratelimit-reset-tokens": "30s",
+                "x-ratelimit-limit-tokens": "8000",
+            ]
+        )!
+        let quota = GroqQuota().merging(GroqRateLimit(response: response, endpoint: .cleanup), at: Date())
+        let incremental = IncrementalCleaner(cleaner: cl, quotaProvider: { quota })
+
+        incremental.append(index: 0, text: "Chunk zero.")
+        incremental.append(index: 1, text: "Chunk one.")
+        incremental.append(index: 2, text: "Chunk two.")
+
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let countBeforeFinish = await transport.count
+        #expect(countBeforeFinish == 0)
+
+        let finishTask = Task {
+            await incremental.finish(totalChunks: 3, rawText: "Chunk zero. Chunk one. Chunk two.")
+        }
+
+        try await transport.wait(1)
+        let countAfterFinish = await transport.count
+        #expect(countAfterFinish == 1)
+
+        let body = try await transport.body(0)
+        let messages = body["messages"] as? [[String: String]] ?? []
+        #expect(messages.count == 2)
+
+        try await transport.respond(0, "Cleaned full sentence.")
+        let result = await finishTask.value
+
+        #expect(result.mode == "single")
+        #expect(result.skippedReason == "tpm")
+        #expect(result.calls == 1)
+        #expect(result.text == "Cleaned full sentence.")
+    }
+
+    @Test func tpmBudgetWithSinglePathUsesFewShotFreeFinalCall() async throws {
+        let transport = IncrementalTransport()
+        let cl = cleaner(transport)
+        let response = HTTPURLResponse(
+            url: TranscriptCleaner.groqEndpoint, statusCode: 200, httpVersion: nil,
+            headerFields: [
+                "x-ratelimit-remaining-tokens": "500",
+                "x-ratelimit-reset-tokens": "30s",
+                "x-ratelimit-limit-tokens": "8000",
+            ]
+        )!
+        let quota = GroqQuota().merging(GroqRateLimit(response: response, endpoint: .cleanup), at: Date())
+        let incremental = IncrementalCleaner(cleaner: cl, quotaProvider: { quota })
+
+        incremental.append(index: 0, text: "Chunk zero.")
+        incremental.append(index: 1, text: "Chunk one.")
+        incremental.append(index: 2, text: "Chunk two.")
+
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let countBeforeFinish = await transport.count
+        #expect(countBeforeFinish == 0)
+
+        let finishTask = Task {
+            await incremental.finish(totalChunks: 3, rawText: "Chunk zero. Chunk one. Chunk two.",
+                                     single: { _ in
+                                         .init(text: "From single probe", label: "ok", model: "fake", stats: nil, calls: 1)
+                                     })
+        }
+
+        try await transport.wait(1)
+        let countAfterFinish = await transport.count
+        #expect(countAfterFinish == 1)
+        let body = try await transport.body(0)
+        let messages = body["messages"] as? [[String: String]] ?? []
+        #expect(messages.count == 2)
+
+        try await transport.respond(0, "Cleaned full sentence.")
+        let result = await finishTask.value
+
+        #expect(result.mode == "single")
+        #expect(result.skippedReason == "tpm")
+        #expect(result.calls == 1)
+        #expect(result.text == "Cleaned full sentence.")
+    }
+
+    @Test func tpmSufficientTokensDoesNotSkipMids() async throws {
+        let transport = IncrementalTransport()
+        let cl = cleaner(transport)
+        let response = HTTPURLResponse(
+            url: TranscriptCleaner.groqEndpoint, statusCode: 200, httpVersion: nil,
+            headerFields: [
+                "x-ratelimit-remaining-tokens": "5000",
+                "x-ratelimit-reset-tokens": "30s",
+                "x-ratelimit-limit-tokens": "8000",
+            ]
+        )!
+        let quota = GroqQuota().merging(GroqRateLimit(response: response, endpoint: .cleanup), at: Date())
+        let incremental = IncrementalCleaner(cleaner: cl, quotaProvider: { quota })
+
+        incremental.append(index: 0, text: "Chunk zero.")
+        incremental.append(index: 1, text: "Chunk one.")
+
+        try await transport.wait(1)
+        let count = await transport.count
+        #expect(count == 1)
+    }
 }
+

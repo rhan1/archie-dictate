@@ -8,6 +8,7 @@ public struct GroqQuota: Codable, Sendable, Equatable {
         public var limitTokens: Int?
         public var remainingTokens: Int?
         public var resetRequestsAt: Date?
+        public var resetTokensAt: Date?
         public var updatedAt: Date?
         public init() {}
     }
@@ -26,17 +27,31 @@ public struct GroqQuota: Codable, Sendable, Equatable {
     public func merging(_ limits: GroqRateLimit, at date: Date) -> GroqQuota {
         var s = snapshot(limits.endpoint)
         let contributed = [limits.limitRequests, limits.remainingRequests, limits.limitTokens, limits.remainingTokens].contains { $0 != nil }
-            || limits.resetRequests != nil
+            || limits.resetRequests != nil || limits.resetTokens != nil
         guard contributed else { return self }   // a header-less response must not refresh staleness
         s.limitRequests = limits.limitRequests ?? s.limitRequests
         s.remainingRequests = limits.remainingRequests ?? s.remainingRequests
         s.limitTokens = limits.limitTokens ?? s.limitTokens
         s.remainingTokens = limits.remainingTokens ?? s.remainingTokens
         if let reset = limits.resetRequests { s.resetRequestsAt = date.addingTimeInterval(reset) }
+        if let resetTokens = limits.resetTokens { s.resetTokensAt = date.addingTimeInterval(resetTokens) }
         s.updatedAt = date
         var copy = self
         if limits.endpoint == .stt { copy.stt = s } else { copy.cleanup = s }
         return copy
+    }
+
+    /// Remaining tokens are fresh within the reset window (or within 60s if no reset time).
+    public func freshRemainingTokens(_ endpoint: GroqRateLimit.Endpoint, at now: Date = Date()) -> Int? {
+        let s = snapshot(endpoint)
+        guard let remaining = s.remainingTokens else { return nil }
+        if let reset = s.resetTokensAt {
+            guard now < reset else { return nil }
+            return remaining
+        }
+        guard let updated = s.updatedAt else { return nil }
+        guard now.timeIntervalSince(updated) < 60 else { return nil }
+        return remaining
     }
 
     /// Under 10 % of the request window left and the counts are still current. Counts expire at
