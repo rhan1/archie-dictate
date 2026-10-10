@@ -41,6 +41,13 @@ in `onTranscript`, without cleanup or clipboard changes. Completion returns to
 to use Apple on-device STT and local Ollama cleanup. Mode and fallback are sampled
 at recording start. Quota sessions add `fallback=quota` to the timeline and log.
 
+`KeyStore()` reads the Groq key through `/usr/bin/security` (the keychain ACL names that
+tool, so a rebuilt or re-signed host never raises a keychain dialog). The in-process
+SecItem path is opt-in (`KeyStore(reader: { try KeychainAPIKey.read(service: $0) })`) and
+runs with user interaction disabled. A key that cannot be read logs
+`keys=groq:denied key_unavailable=prompt_suppressed` (if a dialog would have been needed)
+and the session falls back to Apple STT + local cleanup (`fallback=no_key`).
+
 `onDiagnostic` receives every diagnostic line the standalone app writes to
 `dictate.stderr.log` (`timeline:` with `mic=`, `fmt=`, `bridge_src`, `first_buffer_ms`,
 `peak_dbfs`; `keys=`; `media=`), on any thread, counts only. In a host those lines

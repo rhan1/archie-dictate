@@ -291,6 +291,17 @@ struct DictationEngineTests {
         #expect(!forced.usesGroqSTT && !forced.usesGroqCleanup && forced.fallbackFields == "quota")
     }
 
+    // No key (denied / prompt suppressed): straight to Apple STT + local cleanup, no Groq attempts.
+    @Test func unavailableKeyRoutesToAppleAndLocal() {
+        var policy = EnginePolicy(mode: .dictate, fallback: nil)
+        policy.keyUnavailable = true
+        #expect(!policy.usesGroqSTT && !policy.usesGroqCleanup)
+        #expect(policy.fallbackFields == "no_key")
+        var forced = EnginePolicy(mode: .dictate, fallback: .quota)
+        forced.keyUnavailable = true
+        #expect(forced.fallbackFields == "quota")
+    }
+
     @Test func lowSTTQuotaRoutesSessionToAppleAndRecordsCounts() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-d3-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }

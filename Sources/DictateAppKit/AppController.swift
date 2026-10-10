@@ -348,7 +348,7 @@ public final class AppController {
 
     private func logKeyStates() {
         let state = keyStore.missing(for: "groq-api")?.rawValue ?? "ok"
-        Self.note("keys=groq:\(state)")
+        Self.note("keys=groq:\(state)" + (keyStore.failureReason(for: "groq-api").map { " key_unavailable=\($0)" } ?? ""))
     }
 
     func showOutcome(_ kind: PillOutcome.Kind, text: String? = nil) {
@@ -543,6 +543,7 @@ public final class AppController {
         clearOutcome()
         logKeyStates()
         sessionPolicy = EnginePolicy(mode: engineMode, fallback: forceFallback, quota: quotaStore.current, now: Date())
+        sessionPolicy.keyUnavailable = fakeTranscript == nil && keyStore.missing(for: "groq-api") == .denied
         if let dependencies { recordingTarget = dependencies.frontmostTarget() }
         else { recordingTarget = Self.frontmostTarget() }
         generation = CaptureEpoch()

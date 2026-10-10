@@ -9,8 +9,11 @@ public final class KeyStore: @unchecked Sendable {
     private let reader: @Sendable (String) throws -> String
     private let clock: @Sendable () -> TimeInterval
     private var entries: [String: Entry] = [:]
+    private var reasons: [String: String] = [:]
 
-    public init(reader: @escaping @Sendable (String) throws -> String = { try KeychainAPIKey.read(service: $0) },
+    /// The default reader: `/usr/bin/security` (never a keychain dialog). SecItem is opt-in via `KeychainAPIKey.read`.
+    public static let defaultReaderName = "security-tool"
+    public init(reader: @escaping @Sendable (String) throws -> String = { try KeychainToolReader().read(service: $0) },
                 clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.reader = reader
         self.clock = clock
@@ -38,6 +41,8 @@ public final class KeyStore: @unchecked Sendable {
         if retry { readInBackground(service) }
         return key
     }
+    /// `prompt_suppressed` when the last failed read would have needed a keychain dialog.
+    public func failureReason(for service: String) -> String? { lock.withLock { reasons[service] } }
     public func missing(for service: String) -> Missing? {
         lock.withLock {
             switch entries[service] {
@@ -49,10 +54,13 @@ public final class KeyStore: @unchecked Sendable {
     }
     private func readInBackground(_ service: String) {
         queue.async { [self] in
-            let value = (try? reader(service))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            var reason: String?
+            let value: String?
+            do { value = try reader(service).trimmingCharacters(in: .whitespacesAndNewlines) }
+            catch { value = nil; reason = error as? KeyReadError == .promptSuppressed ? "prompt_suppressed" : nil }
             lock.withLock {
-                if let value, !value.isEmpty { entries[service] = .available(value) }
-                else { entries[service] = .denied(at: clock()) }
+                if let value, !value.isEmpty { entries[service] = .available(value); reasons[service] = nil }
+                else { entries[service] = .denied(at: clock()); reasons[service] = reason }
             }
         }
     }

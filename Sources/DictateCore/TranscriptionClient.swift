@@ -146,7 +146,10 @@ public struct TranscriptionClient: Sendable {
 }
 
 public enum KeychainAPIKey {
+    /// Opt-in in-process read. User interaction is disabled first, so a changed code identity
+    /// fails with `errSecInteractionNotAllowed` instead of putting a password dialog on screen.
     public static func read(service: String = "groq-api", account: String = NSUserName()) throws -> String {
+        SecKeychainSetUserInteractionAllowed(false)
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -155,7 +158,9 @@ public enum KeychainAPIKey {
             kSecMatchLimit: kSecMatchLimitOne,
         ]
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecInteractionNotAllowed { throw KeyReadError.promptSuppressed }
+        guard status == errSecSuccess,
               let data = result as? Data,
               let value = String(data: data, encoding: .utf8) else { throw TranscriptionError.missingKey }
         let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
