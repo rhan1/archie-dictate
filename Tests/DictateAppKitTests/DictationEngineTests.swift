@@ -379,7 +379,7 @@ struct DictationEngineTests {
         let result = await AppController.cleanUp("raw text to clean", groq: groq, local: local)
 
         #expect(result.text == "Groq retry winner.")
-        #expect(result.label == "cleanup_model_fallback=\(TranscriptCleaner.retryModel)")
+        #expect(result.label == "cleanup_model_fallback=groq:gpt-oss-20b")
         #expect(result.model == TranscriptCleaner.retryModel)
         #expect(result.calls == 2)
 

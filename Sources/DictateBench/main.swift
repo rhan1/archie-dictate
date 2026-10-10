@@ -555,7 +555,7 @@ case "stt-groq-chunked":
                                 retryGroq.reloadVocabularyFromHints = singleCleaner.reloadVocabularyFromHints
                                 retryGroq.timeoutInterval = singleCleaner.timeoutInterval
                                 if let (text, stats) = try? await retryGroq.cleanWithStats(fullRaw) {
-                                    return .init(text: text, label: "cleanup_model_fallback=\(TranscriptCleaner.retryModel)",
+                                    return .init(text: text, label: "cleanup_model_fallback=\(TranscriptCleaner.retryModelLogName)",
                                                  model: TranscriptCleaner.retryModel, stats: stats, calls: 2)
                                 }
                             } catch {}
