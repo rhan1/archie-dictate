@@ -112,6 +112,8 @@ public final class AppController {
             warmLocalModel()
             Task { await AppleTranscriber.ensureAssets() }
         }
+        // Verified settle events can occur after the dictation timeline is emitted.
+        muter.onEvent = { event in AppController.note(event.rawValue) }
         // A run that crashed while muted is undone at launch.
         if let event = muter.recoverIfNeeded() { AppController.note("media=\(event.rawValue) (at launch)") }
         installTerminationRestore()

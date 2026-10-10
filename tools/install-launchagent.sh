@@ -1,6 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
+# Safe check-only mode exits before sourcing config or touching launchd/processes.
+FORCE=0
+CHECK_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --force) FORCE=1 ;;
+        --check-only) CHECK_ONLY=1 ;;
+        *) echo "unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
+check_mute_pending() {
+    local state_path="${DICTATE_MUTED_STATE_FILE:-$HOME/Library/Application Support/Dictate/muted.state}"
+    if [[ "$FORCE" != 1 && -e "$state_path" ]]; then
+        echo "dictation in progress or mute pending — retry in a few seconds" >&2
+        return 3
+    fi
+}
+check_mute_pending || exit 3
+if [[ "$CHECK_ONLY" == 1 ]]; then exit 0; fi
+
 # Existing installations can keep their identifiers outside the checkout.
 BUILD_ENV="$HOME/Library/Application Support/Dictate/build.env"
 if [[ -f "$BUILD_ENV" ]]; then
@@ -53,6 +73,7 @@ PLIST
 plutil -lint "$PLIST"
 
 # Re-bootstrap cleanly if an older copy is loaded.
+check_mute_pending || exit 3
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 for ((i = 0; i < 25; i++)); do
     if ! launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
