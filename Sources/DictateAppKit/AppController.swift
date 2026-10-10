@@ -348,7 +348,7 @@ public final class AppController {
 
     private func logKeyStates() {
         let state = keyStore.missing(for: "groq-api")?.rawValue ?? "ok"
-        Self.note("keys=groq:\(state)" + (keyStore.failureReason(for: "groq-api").map { " key_unavailable=\($0)" } ?? ""))
+        Self.note("keys=groq:\(state) reader=\(keyStore.readerName)" + (keyStore.failureReason(for: "groq-api").map { " key_unavailable=\($0)" } ?? ""))
     }
 
     func showOutcome(_ kind: PillOutcome.Kind, text: String? = nil) {

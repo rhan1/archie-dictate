@@ -37,6 +37,8 @@ struct KeychainToolReaderTests {
 
     @Test func keyStoreDefaultsToTheSecurityTool() {
         #expect(KeyStore.defaultReaderName == "security-tool")
+        #expect(KeyStore().readerName == "security-tool")
+        #expect(KeyStore(reader: { _ in "x" }).readerName == "custom")
     }
 }
 
