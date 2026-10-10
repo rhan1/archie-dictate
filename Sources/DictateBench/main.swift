@@ -92,7 +92,7 @@ func benchCleanUp(_ raw: String, groq: TranscriptCleaner) async -> (text: String
         let text = try await groq.clean(raw)
         return (text, 1)
     } catch TranscriptionError.client(429) {
-        var retryGroq = TranscriptCleaner(
+        let retryGroq = TranscriptCleaner(
             transport: groq.transport, endpoint: groq.endpoint, model: TranscriptCleaner.retryModel,
             vocabulary: groq.vocabulary, apiKey: groq.apiKey
         )
@@ -711,12 +711,12 @@ case "eval", "eval-incremental":
                     else { out = try await cleaner.clean(c.input) }
                 } else { out = try await cleaner.cleanWithStats(c.input).text }
                 break
-            } catch TranscriptionError.client(429) {
+            } catch TranscriptionError.client(let code) {
                 if attempt == 1 {
                     print("case \(i + 1) received 429, waiting 70s courtesy cooldown...")
                     try await Task.sleep(nanoseconds: 70_000_000_000)
                 } else {
-                    print("case \(i + 1) ERROR \(error)")
+                    print("case \(i + 1) ERROR HTTP \(code)")
                     if c.mustPass { print("MUSTPASS FAIL case \(i + 1)") }
                 }
             } catch {
