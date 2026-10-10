@@ -286,6 +286,9 @@ public final class AppController {
         if pillOutcome?.isRecoverable == true, machine.state == .idle {
             switch signal {
             case .tap:
+                // The tap may be the first of a new ⌥⌥: pre-start capture so that dictation is not cold.
+                // A lone recovery tap simply lets the pre-start lapse (lone-tap release).
+                prewarmEngine()
                 recoveryTap?.cancel()
                 let work = DispatchWorkItem { [weak self] in self?.outcomeEvent(.singleOptionTap) }
                 recoveryTap = work
