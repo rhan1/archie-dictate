@@ -74,6 +74,76 @@ struct DictationEngineTests {
         throw URLError(.timedOut)
     }
 
+    /// v1.7 H1 end-to-end on the production controller: the injected WAV is the built-in mic
+    /// and the headset delivers only digital zeros. Network: Groq whisper only (capture-only =
+    /// no cleanup, no paste); fakes for panel, Apple, pasteboard, permission; media untouched.
+    /// Skipped unless DICTATE_E2E_WAV (24 kHz mono 16-bit speech of ShadowScore.script) and
+    /// GROQ_API_KEY are set. DICTATE_E2E_SCENARIO=plain runs the same WAV without the headset.
+    /// Prints counts only, never the transcript.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["DICTATE_E2E_WAV"] != nil))
+    func e2eHeadsetZerosBuiltinSpeech() async throws {
+        let env = ProcessInfo.processInfo.environment
+        let wav = URL(fileURLWithPath: env["DICTATE_E2E_WAV"] ?? "")
+        let key = try #require(env["GROQ_API_KEY"])
+        let scenario = WAVInjectedRecorder.Scenario(rawValue: env["DICTATE_E2E_SCENARIO"] ?? "headset_zeros") ?? .headsetZeros
+        let seconds = Double(try WAVInjectedRecorder.parseWAV(at: wav).count) / 24_000
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-e2e-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(home: root)
+        // DICTATE_E2E_HINTS: the user's vocab-hints.txt, the whisper prompt production uses.
+        if let hints = env["DICTATE_E2E_HINTS"] {
+            try FileManager.default.createDirectory(at: paths.vocabularyURL.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: hints), to: paths.vocabularyURL)
+        }
+        let keys = KeyStore(reader: { _ in key })
+        keys.prefetch(services: ["groq-api"])
+        try await waitFor { keys.key(for: "groq-api") != nil }
+        let clipboard = NSPasteboard(name: .init("dictate-e2e-\(UUID().uuidString)"))
+        defer { clipboard.releaseGlobally() }
+        let recorder = WAVInjectedRecorder(url: wav, pace: 1.0, scenario: scenario)
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { TestApple("") },
+            sttTransport: URLSessionTransport(timeout: 30), groqCleanupTransport: TestHTTP(""),
+            localCleanupTransport: TestHTTP(""), inserter: TextInserter(pasteboard: clipboard, postKeystroke: {}),
+            panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.e2e") }, manageMedia: false)
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .captureOnly,
+                                       dependencies: dependencies)
+        let engine = DictationEngine(controller: controller)
+        final class Notes: @unchecked Sendable { let lock = NSLock(); var lines: [String] = [] }
+        let sink = Notes()
+        engine.onDiagnostic = { line in sink.lock.withLock { sink.lines.append(line) } }
+        defer { engine.onDiagnostic = nil }
+        var deliveries: [(String, DictationTimeline)] = []
+        engine.onTranscript = { deliveries.append(($0, $1)) }
+        engine.start()
+        try await Task.sleep(nanoseconds: UInt64((seconds + 1.0) * 1_000_000_000))
+        engine.finish()
+        let deadline = ContinuousClock.now + .seconds(45)
+        while ContinuousClock.now < deadline, deliveries.isEmpty || !FileManager.default.fileExists(atPath: paths.logURL.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let log = (try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? ""
+        let outcome = log.split(separator: "\n").last { $0.contains("outcome=") }.map(String.init) ?? "no outcome line"
+        let all = sink.lock.withLock { sink.lines }
+        let timeline = all.last { $0.contains("timeline:") } ?? ""
+        let bridge = timeline.split(separator: " ").filter {
+            $0.hasPrefix("bridge_src=") || $0.hasPrefix("bridge_reason=") || $0.hasPrefix("headset_restart")
+        }.joined(separator: " ")
+        let text = deliveries.first?.0 ?? ""
+        let names = ShadowScore.nameCount(text)
+        let fields = outcome.split(separator: " ").filter { field in
+            ["duration=", "outcome=", "path=", "chars="].contains { field.hasPrefix($0) }
+        }.joined(separator: " ")
+        print("E2E scenario=\(scenario.rawValue) \(fields) \(bridge) names=\(names)/4 " +
+              String(format: "overlap=%.2f", ShadowScore.overlap(text)) +
+              " matched=\(ShadowScore.names.filter { text.contains($0) }.joined(separator: ","))" +
+              " hints=\(env["DICTATE_E2E_HINTS"] == nil ? 0 : 1) fallback_note=\(all.contains { $0.contains("bridge_src=builtin_fallback reason=headset_digital_silence") } ? 1 : 0)")
+        #expect(outcome.contains("outcome=ok"))
+        #expect(names == 4)
+        if scenario == .headsetZeros { #expect(bridge.contains("bridge_src=builtin_fallback")) }
+    }
+
     @Test func outcomeWordsMatchPill() {
         let cases: [(PillOutcome.Kind, String)] = [(.error("mic_denied"), "no mic"), (.error("mic_start"), "no mic"),
             (.error("missing_key"), "no key"), (.error("network_-1009"), "offline"), (.error("network_timedOut"), "timeout"),

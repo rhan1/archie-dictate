@@ -4,6 +4,12 @@ import Testing
 
 @Suite("CaptureBridge")
 struct CaptureBridgeTests {
+    /// v1.7: the headset takes over only after 150 ms of signal. 110 ms of earlier
+    /// headset signal (never fed: the built-in carries it) lets the next buffer switch.
+    private func prime(_ b: inout CaptureBridge, before time: TimeInterval) {
+        #expect(!b.buffer(source: .headset, at: time - 0.11, frames: 2640).releaseBuiltin)
+    }
+
     private func bridge(_ input: CaptureBridge.DefaultInput = .bluetooth,
                         builtin: Bool = true) -> CaptureBridge {
         var bridge = CaptureBridge()
@@ -17,6 +23,7 @@ struct CaptureBridgeTests {
         #expect(b.state == .builtinOnly)
         let first = b.buffer(source: .builtin, at: 10, frames: 2400)
         #expect(first.framesToFeed == 2400 && !first.releaseBuiltin)
+        prime(&b, before: 10.1)
         let headset = b.buffer(source: .headset, at: 10.1, frames: 2400)
         #expect(headset.framesToFeed == 2400 && headset.releaseBuiltin)
         #expect(b.state == .switched && b.bridgeMs == 100 && b.bridgeSource == "builtin")
@@ -25,6 +32,7 @@ struct CaptureBridgeTests {
     @Test func switchAtBufferBoundaryNoGapNoDuplicateBeyond100ms() {
         var b = bridge()
         #expect(b.buffer(source: .builtin, at: 10, frames: 2400).framesToFeed == 2400)
+        prime(&b, before: 10.05)
         let overlap = b.buffer(source: .headset, at: 10.05, frames: 2400)
         #expect(overlap.dropFrames == 1200 && overlap.framesToFeed == 1200)
         #expect(overlap.releaseBuiltin)
@@ -36,6 +44,7 @@ struct CaptureBridgeTests {
         try builtin.start(device: .builtIn)
         var b = bridge()
         #expect(builtin.isAllocated && builtin.isRunning)
+        prime(&b, before: 10.1)
         let decision = b.buffer(source: .headset, at: 10.1, frames: 2400)
         if decision.releaseBuiltin { builtin.release() }
         #expect(!builtin.isAllocated && !builtin.isRunning && builtin.taps == 0)
@@ -77,6 +86,7 @@ struct CaptureBridgeTests {
     @Test func lateBuiltinBufferAfterSwitchIgnored() {
         var b = bridge()
         #expect(b.buffer(source: .builtin, at: 10, frames: 2400).framesToFeed > 0)
+        prime(&b, before: 10.1)
         _ = b.buffer(source: .headset, at: 10.1, frames: 2400)
         #expect(b.buffer(source: .builtin, at: 10.2, frames: 2400).framesToFeed == 0)
     }
@@ -112,6 +122,7 @@ struct CaptureBridgeTests {
     @Test func headsetFlowingBeforeRecordingNeedsNoBridge() {
         var b = CaptureBridge()
         b.start(defaultInput: .bluetooth, hasBuiltin: true)
+        prime(&b, before: 9)
         #expect(b.buffer(source: .headset, at: 9, frames: 2400).releaseBuiltin)
         b.recordingStarted(at: 10)
         #expect(b.bridgeMs == 0)
@@ -134,6 +145,7 @@ struct CaptureBridgeTests {
     @Test func wholeHeadsetOverlapIsDroppedBeforeFreshBufferFeeds() {
         var b = bridge()
         #expect(b.buffer(source: .builtin, at: 10, frames: 2400).framesToFeed == 2400)
+        prime(&b, before: 10)
         let overlap = b.buffer(source: .headset, at: 10, frames: 2400)
         #expect(overlap.releaseBuiltin && overlap.dropFrames == 2400 && overlap.framesToFeed == 0)
         #expect(b.buffer(source: .headset, at: 10.1, frames: 2400).framesToFeed == 2400)
@@ -151,6 +163,7 @@ struct CaptureBridgeTests {
         var b = bridge()
         #expect(b.buffer(source: .builtin, at: 10, frames: 2400).framesToFeed == 2400)
         // Headset input timestamp can precede delivery; warm time is arrival time.
+        prime(&b, before: 10.08)
         let switched = b.buffer(source: .headset, at: 10.08, frames: 1024, arrivedAt: 11)
         #expect(b.bridgeMs == 1000)
         #expect(switched.dropFrames == 480 && switched.framesToFeed == 544)
@@ -166,6 +179,7 @@ struct CaptureBridgeTests {
         let first = b.buffer(source: .builtin, at: 9.0, frames: 2400)
         #expect(first.framesToFeed == 0 && first.framesToRing == 2400)
         // Headset already flowing before the second tap: overlap trimmed, rest ringed.
+        prime(&b, before: 9.05)
         let headset = b.buffer(source: .headset, at: 9.05, frames: 2400)
         #expect(headset.releaseBuiltin && headset.dropFrames == 1200 && headset.framesToRing == 1200)
         #expect(b.buffer(source: .builtin, at: 9.1, frames: 2400).framesToRing == 0)
@@ -179,6 +193,7 @@ struct CaptureBridgeTests {
         let straddling = b.buffer(source: .builtin, at: 9.8, frames: 2400) // 9.80 ..< 9.90
         #expect(straddling.dropFrames == 1200 && straddling.framesToFeed == 1200)
         // bridge_ms still counts from the second tap, not from the pre-roll point.
+        prime(&b, before: 9.9)
         _ = b.buffer(source: .headset, at: 9.9, frames: 2400, arrivedAt: 11.2)
         #expect(b.bridgeMs == 1200)
     }
@@ -190,6 +205,7 @@ struct CaptureBridgeTests {
         b.recordingStarted(at: 9.95, preRoll: 0.15, keptFrames: 2400)
         #expect(b.firstKeptMs == 0)
         // An overlapping live headset buffer is trimmed against the ring's end, not the keep point.
+        prime(&b, before: 9.95)
         let headset = b.buffer(source: .headset, at: 9.95, frames: 2400)
         #expect(headset.dropFrames == 1200 && headset.framesToFeed == 1200)
     }
@@ -203,6 +219,141 @@ struct CaptureBridgeTests {
         _ = real.buffer(source: .headset, at: 10.1, frames: 2400)
         #expect(real.reason == nil && real.builtinFrames == 2400)
         #expect(bridge(.builtin).reason == "default_builtin")
+    }
+
+    // MARK: v1.7 H1 — content-aware arbitration (eSCO drop → injected digital zeros)
+
+    private func feedStarted() -> CaptureFeed {
+        var feed = CaptureFeed()
+        feed.start(defaultInput: .bluetooth, hasBuiltin: true)
+        _ = feed.recordingStarted(at: 10, preRoll: 0)
+        return feed
+    }
+    private func tone(_ amplitude: Float, frames: Int = 2400) -> [Float] {
+        (0..<frames).map { amplitude * Float(sin(Double($0) * 0.13)) }
+    }
+    private let zeros = [Float](repeating: 0, count: 2400)
+
+    @Test func digitalZeroHeadsetBufferDoesNotReleaseTheBuiltin() {
+        var feed = feedStarted()
+        #expect(feed.accept(tone(0.05), source: .builtin, at: 10).frames.count == 2400)
+        let headset = feed.accept(zeros, source: .headset, at: 10.1)
+        #expect(!headset.releaseBuiltin)
+        #expect(headset.frames.isEmpty)
+        #expect(feed.accept(tone(0.05), source: .builtin, at: 10.1).frames.count == 2400)
+    }
+
+    @Test func headsetSignalTakesOverOnlyAfter150ms() {
+        var feed = feedStarted()
+        _ = feed.accept(tone(0.05), source: .builtin, at: 10)
+        _ = feed.accept(tone(0.05), source: .builtin, at: 10.1)
+        let first = feed.accept(tone(0.05), source: .headset, at: 10.1)      // 100 ms of signal
+        #expect(!first.releaseBuiltin && first.frames.isEmpty)
+        let second = feed.accept(tone(0.05), source: .headset, at: 10.2)     // 200 ms ≥ 150 ms
+        #expect(second.releaseBuiltin && second.frames.count == 2400)
+        #expect(feed.bridge.state == .switched && feed.bridge.bridgeSource == "builtin")
+    }
+
+    @Test func zerosFor1500msKeepTheBuiltinForTheWholeDictation() {
+        var feed = feedStarted()
+        var fed = 0, events: [CaptureBridge.Event] = []
+        for i in 0..<40 {                                                   // 4 s of both sources
+            let t = 10 + Double(i) * 0.1
+            let b = feed.accept(tone(0.05), source: .builtin, at: t)
+            let h = feed.accept(i < 25 ? zeros : tone(0.05), source: .headset, at: t)  // signal from 12.5 s
+            fed += b.frames.count + h.frames.count
+            events += [b.event, h.event].compactMap { $0 }
+            #expect(!h.releaseBuiltin && h.frames.isEmpty)
+        }
+        #expect(events == [.fallback])
+        #expect(feed.bridge.state == .fallback && feed.bridge.bridgeSource == "builtin_fallback")
+        #expect(feed.bridge.reason == "headset_digital_silence")
+        #expect(fed == 40 * 2400)                                          // no gap, no duplicate
+    }
+
+    @Test func midDictationZerosSwitchBackToTheBuiltinWithoutGapOrDuplicate() {
+        var feed = feedStarted()
+        var timeline: [(CaptureBridge.Source, Int)] = [], events: [CaptureBridge.Event] = []
+        for i in 0..<30 {
+            let t = 10 + Double(i) * 0.1
+            let b = feed.accept(tone(0.05), source: .builtin, at: t)
+            // Headset: signal 10.0–11.0, then the link drops to zeros.
+            let h = feed.accept(i < 10 ? tone(0.05) : zeros, source: .headset, at: t + 0.03)
+            if !b.frames.isEmpty { timeline.append((.builtin, b.frames.count)) }
+            if !h.frames.isEmpty { timeline.append((.headset, h.frames.count)) }
+            events += [b.event, h.event].compactMap { $0 }
+        }
+        #expect(events == [.switchback])
+        #expect(feed.bridge.switchbacks == 1 && feed.bridge.state == .fallback)
+        #expect(feed.bridge.bridgeSource == "builtin")
+        // 10.00 → 13.00 contiguous: the built-in buffer that crossed the switch is replayed.
+        let total = timeline.reduce(0) { $0 + $1.1 }
+        #expect(total == 3 * 24_000)
+        #expect(timeline.last?.0 == .builtin)
+    }
+
+    @Test func switchbackNeedsALiveBuiltin() {
+        var feed = feedStarted()
+        _ = feed.accept(tone(0.05), source: .headset, at: 10)
+        _ = feed.accept(tone(0.05), source: .headset, at: 10.1)
+        #expect(feed.bridge.state == .switched)
+        feed.builtinFailed()
+        for i in 2..<12 { _ = feed.accept(zeros, source: .headset, at: 10 + Double(i) * 0.1) }
+        #expect(feed.bridge.state == .switched && feed.bridge.switchbacks == 0)
+    }
+
+    // MARK: v1.7 H2 — one headset restart per dictation
+
+    @Test func silentHeadsetRequestsExactlyOneRestart() {
+        var feed = feedStarted()
+        var restarts: [Double] = []
+        for i in 0..<60 {                                                   // 6 s of zeros
+            let t = 10 + Double(i) * 0.1
+            _ = feed.accept(tone(0.05), source: .builtin, at: t)
+            if feed.accept(zeros, source: .headset, at: t).restartHeadset { restarts.append(t) }
+            if i == 9 { feed.headsetRestarted() }                          // restart done at 10.9 s
+        }
+        #expect(restarts == [10.6])                                         // 700 ms after the first zero
+        #expect(feed.bridge.restart?.result == "still_silent")
+    }
+
+    @Test func restartThatBringsSignalBackReportsIt() {
+        var feed = feedStarted()
+        var restarted = false
+        for i in 0..<30 {
+            let t = 10 + Double(i) * 0.1
+            _ = feed.accept(tone(0.05), source: .builtin, at: t)
+            let h = feed.accept(restarted ? tone(0.05) : zeros, source: .headset, at: t)
+            if h.restartHeadset { feed.headsetRestarted(); restarted = true }
+        }
+        #expect(feed.bridge.restart?.result == "signal")
+        #expect(feed.bridge.state == .switched)          // signal inside the 1.5 s window: headset takes over
+    }
+
+    @Test func secondSilentWindowAfterSwitchbackDoesNotRestartAgain() {
+        var feed = feedStarted()
+        var restarts = 0
+        // zeros 0.8 s (restart #1) → signal 0.3 s → zeros 1 s
+        let pattern = Array(repeating: false, count: 8) + Array(repeating: true, count: 3) + Array(repeating: false, count: 10)
+        for (i, signal) in pattern.enumerated() {
+            let t = 10 + Double(i) * 0.1
+            _ = feed.accept(tone(0.05), source: .builtin, at: t)
+            if feed.accept(signal ? tone(0.05) : zeros, source: .headset, at: t).restartHeadset { restarts += 1 }
+        }
+        #expect(restarts == 1)
+    }
+
+    @Test func noRestartWhenTheHeadsetIsTheOnlySource() {
+        var feed = CaptureFeed()
+        feed.start(defaultInput: .bluetooth, hasBuiltin: false)
+        _ = feed.recordingStarted(at: 10, preRoll: 0)
+        var restarts = 0, fed = 0
+        for i in 0..<20 {
+            let h = feed.accept(zeros, source: .headset, at: 10 + Double(i) * 0.1)
+            if h.restartHeadset { restarts += 1 }
+            fed += h.frames.count
+        }
+        #expect(restarts == 0 && fed == 20 * 2400)
     }
 
     // MARK: D-a — built-in selection keeps the headset's client format

@@ -3,9 +3,15 @@ import DictateCore
 
 /// Replaces the microphone with a 24 kHz mono 16-bit WAV for unattended end-to-end runs:
 /// 100 ms chunks paced in real time, then silence until stop(). Timeline: `bridge_src=inject`.
+///
+/// Scenario `headsetZeros` (v1.7, `DICTATE_INJECT_SCENARIO=headset_zeros`): the WAV is the
+/// built-in microphone and a Bluetooth headset delivers only digital zeros (a dropped eSCO
+/// link); both run through the production CaptureFeed arbitration.
 public final class WAVInjectedRecorder: EngineRecorder {
+    public enum Scenario: String, Sendable { case plain, headsetZeros = "headset_zeros" }
     public let url: URL
     public let pace: Double
+    public let scenario: Scenario
 
     public var onLevel: ((Double) -> Void)?
     public var onPCMChunk: (([Int16]) -> Void)?
@@ -26,15 +32,25 @@ public final class WAVInjectedRecorder: EngineRecorder {
     private var buffer: [Float] = []
     private var firstBufferFired: Bool = false
     private var meter = WisprLevel()
+    private var feed = CaptureFeed()
+    private var pendingPCM: [Int16] = []
+    /// Media clock of the scenario feed: 0.1 s per chunk whatever the pace.
+    private var mediaTime: TimeInterval = 0
 
-    public init(url: URL, pace: Double = 1.0) {
+    public init(url: URL, pace: Double = 1.0, scenario: Scenario = .plain) {
         self.url = url
         self.pace = max(0.0001, pace)
+        self.scenario = scenario
         var s = AudioRecorder.CaptureStats()
         s.device = "injected:\(url.lastPathComponent)"
         s.startFormat = "24000Hz/1ch"
         s.bridgeSource = "inject"
         self.stats = s
+    }
+
+    /// The scenario named by `DICTATE_INJECT_SCENARIO`; plain when unset or unknown.
+    public static func scenario(environment: [String: String]) -> Scenario {
+        environment["DICTATE_INJECT_SCENARIO"].flatMap(Scenario.init(rawValue:)) ?? .plain
     }
 
     public static func parseWAV(at url: URL) throws -> [Int16] {
@@ -114,6 +130,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
         firstBufferFired = false
         buffer.removeAll()
         meter.clearBatch()
+        pendingPCM.removeAll()
+        if scenario == .headsetZeros {
+            feed.start(defaultInput: .bluetooth, hasBuiltin: true)
+            mediaTime = 1_000
+            _ = feed.recordingStarted(at: mediaTime, preRoll: 0)
+        }
 
         let timerSource = DispatchSource.makeTimerSource(queue: queue)
         let intervalSeconds = 0.1 * pace
@@ -154,7 +176,26 @@ public final class WAVInjectedRecorder: EngineRecorder {
             chunk = [Int16](repeating: 0, count: AudioRecorder.chunkSamples)
         }
 
-        let floatChunk = chunk.map { Float($0) / 32768.0 }
+        var floatChunk = chunk.map { Float($0) / 32768.0 }
+        var notes: [String] = []
+        if scenario == .headsetZeros {
+            // Built-in = the WAV, headset = digital zeros, same 100 ms window.
+            let time = mediaTime
+            mediaTime += Double(chunk.count) / AudioRecorder.sampleRate
+            let builtin = feed.accept(floatChunk, source: .builtin, at: time)
+            let headset = feed.accept([Float](repeating: 0, count: chunk.count), source: .headset, at: time)
+            for out in [builtin, headset] {
+                if out.event == .fallback { notes.append("bridge_src=builtin_fallback reason=headset_digital_silence") }
+                if out.event == .switchback { notes.append("bridge_switchback=1") }
+                if out.restartHeadset { feed.headsetRestarted(); notes.append("headset_restart=1 simulated=1") }
+            }
+            floatChunk = builtin.frames + headset.frames
+            // Exact inverse of the /32768 above: the WAV's samples arrive unchanged.
+            pendingPCM += floatChunk.map { Int16(max(-32768, min(32767, ($0 * 32768).rounded()))) }
+            let whole = pendingPCM.count / AudioRecorder.chunkSamples * AudioRecorder.chunkSamples
+            chunk = Array(pendingPCM.prefix(whole))
+            pendingPCM.removeFirst(whole)
+        }
         buffer.append(contentsOf: floatChunk)
 
         let shouldFireFirst = !firstBufferFired
@@ -170,8 +211,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
         let levelCb = onLevel
         lock.unlock()
 
+        for note in notes { AppController.note(note) }
         // Same threads as AudioRecorder: PCM from the capture queue, first-buffer and level on main.
-        pcmCb?(chunk)
+        if !chunk.isEmpty { pcmCb?(chunk) }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isRunning else { return }   // dropped after stop(), like the real epoch check
             firstCb?()
@@ -189,7 +231,19 @@ public final class WAVInjectedRecorder: EngineRecorder {
         let captured = buffer
         buffer.removeAll()
         firstBufferFired = false
+        var remainder: [Int16] = []
+        if scenario == .headsetZeros {
+            stats.bridgeSource = feed.bridge.bridgeSource
+            stats.bridgeReason = feed.bridge.reason
+            stats.headsetRestart = feed.bridge.restart?.result
+            stats.bridgeSwitchback = feed.bridge.switchbacks
+            feed.cancel()
+            remainder = pendingPCM
+            pendingPCM.removeAll()
+        }
+        let pcmCb = onPCMChunk
         lock.unlock()
+        if !remainder.isEmpty { pcmCb?(remainder) }
         return captured
     }
 
@@ -207,6 +261,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
             sampleCursor = 0
             firstBufferFired = false
             meter.clearBatch()
+            pendingPCM.removeAll()
+            if scenario == .headsetZeros {
+                _ = feed.recordingStarted(at: mediaTime, preRoll: 0)
+            }
         }
     }
 }

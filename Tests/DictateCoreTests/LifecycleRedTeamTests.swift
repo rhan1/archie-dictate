@@ -569,9 +569,12 @@ struct LifecycleRedTeamTests {
         #expect(engine.feed.bridge.firstKeptMs == 0)
         #expect(lifecycle.warmup.phase == .warming) // honest: the headset is not live yet
         engine.deliver(.builtin, at: 0.35, frames: frames(6000, 1200))
+        // v1.7: 110 ms of earlier headset signal (not fed) qualifies the takeover.
+        engine.deliver(.headset, at: 0.27, frames: Array(repeating: -1, count: 2640))
         engine.deliver(.headset, at: 0.38, frames: Array(repeating: -1, count: 1200), arrivedAt: 1.4)
         lifecycle.bufferArrived(at: 1.4)
-        #expect(lifecycle.warmup.phase == .live && !engine.builtin.isAllocated)
+        // The built-in keeps running as the switchback source until the dictation stops.
+        #expect(lifecycle.warmup.phase == .live && engine.builtin.isAllocated)
         engine.deliver(.headset, at: 0.43, frames: Array(repeating: -2, count: 1200))
         // 0.20 ..< 0.48: no duplicate at the handover, no gap.
         #expect(engine.samples.count == 6720)
@@ -605,18 +608,26 @@ struct LifecycleRedTeamTests {
         lifecycle.note = { notes.append($0) }
         engine.builtinWedged = wedgeAtStart
         lifecycle.firstTap()
-        engine.builtinWedged = true // otherwise its handover teardown is the call that never returns
+        engine.builtinWedged = true // otherwise its stop-time teardown is the call that never returns
         clock.advance(0.3)
         engine.resetCapture(at: 0.3)
         #expect(lifecycle.beginRecording(at: 0.3))
+        engine.deliver(.headset, at: 0.89, frames: frames(1, 2640))
         engine.deliver(.headset, at: 1.0, frames: frames(0, 1200), arrivedAt: 1.1)
         lifecycle.bufferArrived(at: 1.1)
         clock.advance(20)
         #expect(engine.builtin.isAllocated && engine.abandoned == 0) // positive control: v1.5.4 stays here
         lifecycle.end(.finished(.ok))
-        #expect(engine.abandoned == 1 && !engine.isAllocated) // at the finish, well inside 2 s
+        if wedgeAtStart {
+            #expect(engine.abandoned == 1 && !engine.isAllocated) // wedged since start: abandoned at the finish
+        } else {
+            // v1.7: the built-in's first teardown is the stop-time one; a fresh wedge
+            // is abandoned by the idle guard ≤ 2 s later.
+            clock.advance(2.0)
+            #expect(engine.abandoned == 1 && !engine.isAllocated)
+        }
         clock.advance(30)
-        #expect(!engine.isAllocated && !notes.contains("engine_idle_release"))
+        #expect(!engine.isAllocated && notes.contains("engine_idle_release") == !wedgeAtStart)
         next(engine.headset, lifecycle, clock) // the next dictation gets a fresh bridge executor
         #expect(engine.abandoned == 1)
     }

@@ -25,6 +25,8 @@ public struct CaptureRing {
 
     /// Host time of the oldest stored frame.
     public var oldestTime: TimeInterval? { runs.first?.time }
+    /// Host time just past the newest stored frame.
+    public var newestEnd: TimeInterval? { runs.last.map { $0.time + Double($0.count) / Self.sampleRate } }
 
     public mutating func append(_ frames: [Float], at time: TimeInterval) {
         guard !frames.isEmpty else { return }
@@ -92,9 +94,15 @@ public struct CaptureFeed {
         public var releaseBuiltin = false
         /// These are the first kept frames after the second tap (cold start).
         public var firstKept = false
+        public var restartHeadset = false
+        public var event: CaptureBridge.Event?
     }
     public private(set) var bridge = CaptureBridge()
     public private(set) var ring: CaptureRing
+    /// While the headset carries, the built-in's latest frames wait here so a switchback
+    /// resumes exactly where the headset stopped (the buffer that crossed the switch
+    /// arrived before the decision).
+    private var standby = CaptureRing(capacity: 12_000)
 
     public init(ringCapacity: Int = CaptureRing.defaultCapacity) {
         ring = CaptureRing(capacity: ringCapacity)
@@ -104,20 +112,33 @@ public struct CaptureFeed {
                                epoch: CaptureEpoch = CaptureEpoch()) {
         bridge.start(defaultInput: defaultInput, hasBuiltin: hasBuiltin, epoch: epoch)
         ring.removeAll()
+        standby.removeAll()
     }
 
     public mutating func accept(_ frames: [Float], source: CaptureBridge.Source, at time: TimeInterval,
                                 arrivedAt: TimeInterval? = nil, epoch: CaptureEpoch? = nil) -> Output {
         let hadKept = bridge.firstKeptMs != nil
+        let peak = frames.reduce(Float(0)) { max($0, abs($1)) }
         let decision = bridge.buffer(source: source, at: time, frames: frames.count,
-                                     arrivedAt: arrivedAt, epoch: epoch)
-        var output = Output(releaseBuiltin: decision.releaseBuiltin)
+                                     arrivedAt: arrivedAt, epoch: epoch, peak: peak)
+        var output = Output(releaseBuiltin: decision.releaseBuiltin,
+                            restartHeadset: decision.restartHeadset, event: decision.event)
         let trimmed = frames.dropFirst(decision.dropFrames)
         if decision.framesToRing > 0 {
             ring.append(Array(trimmed.prefix(decision.framesToRing)),
                         at: time + Double(decision.dropFrames) / CaptureRing.sampleRate)
         }
         output.frames = Array(trimmed.prefix(decision.framesToFeed))
+        if source == .builtin, bridge.canSwitchBack { standby.append(frames, at: time) }
+        if decision.event == .switchback {
+            let end = standby.newestEnd
+            let resumed = standby.drain(from: bridge.fedThroughTime ?? 0)
+            if let end, !resumed.isEmpty {
+                bridge.resumedBuiltin(frames: resumed.count, through: end)
+                if bridge.isRecording { output.frames += resumed }
+                else { ring.append(resumed, at: end - Double(resumed.count) / CaptureRing.sampleRate) }
+            }
+        }
         output.firstKept = !hadKept && bridge.firstKeptMs != nil
         return output
     }
@@ -134,8 +155,10 @@ public struct CaptureFeed {
     /// Returns true when the bridge still owned the built-in input.
     @discardableResult public mutating func cancel() -> Bool {
         ring.removeAll()
+        standby.removeAll()
         return bridge.cancel()
     }
 
     public mutating func builtinFailed() { bridge.builtinFailed() }
+    public mutating func headsetRestarted() { bridge.headsetRestarted() }
 }

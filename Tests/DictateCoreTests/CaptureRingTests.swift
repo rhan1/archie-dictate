@@ -97,7 +97,9 @@ struct CaptureFeedTests {
         pipeline += feed.recordingStarted(at: 0.35)
         pipeline += feed.accept(frames(6000, 1200), source: .builtin, at: 0.35).frames
         pipeline += feed.accept(frames(7200, 1200), source: .builtin, at: 0.40).frames
-        // Headset first buffer overlaps the last 30 ms of built-in audio (0.42 ..< 0.47).
+        // v1.7: 110 ms of earlier headset signal (not fed) qualifies the takeover.
+        #expect(feed.accept(Array(repeating: -1, count: 2640), source: .headset, at: 0.31).frames.isEmpty)
+        // The switching headset buffer overlaps the last 30 ms of built-in audio (0.42 ..< 0.47).
         let switched = feed.accept(Array(repeating: -1, count: 1200), source: .headset, at: 0.42, arrivedAt: 1.5)
         #expect(switched.releaseBuiltin && switched.frames.count == 480)
         pipeline += switched.frames

@@ -147,6 +147,61 @@ struct WAVInjectedRecorderTests {
         }
     }
 
+    // Host order (archie-v32 "So So" run): tap() pre-starts with no transcriber attached, then
+    // start() resets the boundary and attaches. The WAV must reach the transcriber exactly once.
+    @Test func preStartThenBoundaryDeliversTheWAVOnce() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let samples = makeSineSamples(duration: 1.0)
+        let wavURL = tempDir.appendingPathComponent("sine24k.wav")
+        try WAVEncoder.encode(samples: samples, sampleRate: 24_000, channels: 1).write(to: wavURL)
+        let recorder = WAVInjectedRecorder(url: wavURL, pace: 1.0)
+        let lock = NSLock()
+        var delivered: [Int16] = []
+
+        try recorder.start()                                   // first ⌥: pre-start, nothing attached
+        try await Task.sleep(nanoseconds: 350_000_000)         // pre-roll plays (≈ "So")
+        recorder.resetCapture()                                // ⌥⌥ boundary
+        recorder.onPCMChunk = { chunk in lock.withLock { delivered.append(contentsOf: chunk) } }
+        try recorder.start()                                   // already running: must not restart
+        for _ in 0..<300 where lock.withLock({ delivered.count < samples.count }) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        _ = recorder.stop()
+
+        let got = lock.withLock { delivered }
+        #expect(got.count >= samples.count)
+        #expect(Array(got.prefix(samples.count)) == samples)   // starts at sample 0, no pre-roll repeat
+        #expect(got.dropFirst(samples.count).allSatisfy { $0 == 0 })   // only silence padding after the WAV
+    }
+
+    // v1.7 H1: headset = digital zeros, built-in = the WAV, through the production CaptureFeed.
+    @Test func headsetZerosScenarioKeepsTheBuiltinAndDeliversTheWAVOnce() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let samples = makeSineSamples(duration: 2.5)
+        let wavURL = tempDir.appendingPathComponent("sine24k.wav")
+        try WAVEncoder.encode(samples: samples, sampleRate: 24_000, channels: 1).write(to: wavURL)
+        let recorder = WAVInjectedRecorder(url: wavURL, pace: 0.05, scenario: .headsetZeros)
+        let lock = NSLock()
+        var delivered: [Int16] = []
+        recorder.onPCMChunk = { chunk in lock.withLock { delivered.append(contentsOf: chunk) } }
+        try recorder.start()
+        recorder.resetCapture()
+        for _ in 0..<400 where lock.withLock({ delivered.count < samples.count + 4_800 }) {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        _ = recorder.stop()
+        let got = lock.withLock { delivered }
+        #expect(Array(got.prefix(samples.count)) == samples)                  // built-in carried every frame
+        #expect(got.dropFirst(samples.count).allSatisfy { $0 == 0 })
+        #expect(recorder.stats.bridgeSource == "builtin_fallback")
+        #expect(recorder.stats.bridgeReason == "headset_digital_silence")
+        #expect(recorder.stats.headsetRestart == "still_silent")
+        #expect(WAVInjectedRecorder.scenario(environment: ["DICTATE_INJECT_SCENARIO": "headset_zeros"]) == .headsetZeros)
+        #expect(WAVInjectedRecorder.scenario(environment: [:]) == .plain)
+    }
+
     @Test func dictationEngineConstructsWithInjectedAudioURL() async throws {
         let tempDir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tempDir) }

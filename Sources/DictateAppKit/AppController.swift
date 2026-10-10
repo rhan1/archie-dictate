@@ -96,7 +96,7 @@ public final class AppController {
         rateLimitRelay = EngineRateLimitRelay(store: quotaStore)
         let injectURL = Self.injectedAudioURL(injectedAudioURL, environment: ProcessInfo.processInfo.environment)
         if let injectURL { AppController.note("inject_wav=\(injectURL.lastPathComponent)") }
-        recorder = dependencies?.recorder ?? injectURL.map { WAVInjectedRecorder(url: $0) } ?? AudioRecorder()
+        recorder = dependencies?.recorder ?? injectURL.map { WAVInjectedRecorder(url: $0, scenario: WAVInjectedRecorder.scenario(environment: ProcessInfo.processInfo.environment)) } ?? AudioRecorder()
         inserter = dependencies?.inserter ?? TextInserter()
         self.keyStore = keyStore
         self.paths = paths
@@ -948,6 +948,8 @@ public final class AppController {
                 fields.append("incremental_skipped=\(incrementalSkipped)")
             }
             if let reason = capture.bridgeReason { fields.append("bridge_reason=\(reason)") }
+            if capture.bridgeSwitchback > 0 { fields.append("bridge_switchback=\(capture.bridgeSwitchback)") }
+            if let restart = capture.headsetRestart { fields.append("headset_restart=1 headset_restart_result=\(restart)") }
             if micFallback { fields.append("mic_fallback=builtin") }
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
