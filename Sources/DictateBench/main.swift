@@ -693,30 +693,44 @@ case "eval", "eval-incremental":
     var passed = 0
     let cases = isIncremental ? evalCases + [incrementalLongCase] : evalCases
     for (i, c) in cases.enumerated() {
-        if i > 0 { try await Task.sleep(nanoseconds: isIncremental ? 20_000_000_000 : 8_000_000_000) }
-        do {
-            let out: String
-            if isIncremental {
-                let incremental = IncrementalCleaner(cleaner: cleaner)
-                let chunks = i == evalCases.count
-                    ? pseudoChunks(incrementalLongInput) + [incrementalCorrection] : pseudoChunks(c.input)
-                for (index, text) in chunks.enumerated() {
-                    incremental.append(index: index, text: text)
-                    await incremental.waitForPending()
+        let sleepSeconds = ProcessInfo.processInfo.environment["BENCH_EVAL_SLEEP_S"].flatMap(Double.init) ?? (isIncremental ? 20.0 : 12.0)
+        if i > 0 { try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000)) }
+        var out: String?
+        for attempt in 1...2 {
+            do {
+                if isIncremental {
+                    let incremental = IncrementalCleaner(cleaner: cleaner)
+                    let chunks = i == evalCases.count
+                        ? pseudoChunks(incrementalLongInput) + [incrementalCorrection] : pseudoChunks(c.input)
+                    for (index, text) in chunks.enumerated() {
+                        incremental.append(index: index, text: text)
+                        await incremental.waitForPending()
+                    }
+                    let output = await incremental.finish(totalChunks: chunks.count)
+                    if let text = output.text { out = text }
+                    else { out = try await cleaner.clean(c.input) }
+                } else { out = try await cleaner.cleanWithStats(c.input).text }
+                break
+            } catch TranscriptionError.client(429) {
+                if attempt == 1 {
+                    print("case \(i + 1) received 429, waiting 70s courtesy cooldown...")
+                    try await Task.sleep(nanoseconds: 70_000_000_000)
+                } else {
+                    print("case \(i + 1) ERROR \(error)")
+                    if c.mustPass { print("MUSTPASS FAIL case \(i + 1)") }
                 }
-                let output = await incremental.finish(totalChunks: chunks.count)
-                if let text = output.text { out = text }
-                else { out = try await cleaner.clean(c.input) }
-            } else { out = try await cleaner.cleanWithStats(c.input).text }
-            let misses = score(c, out)
-            if misses.isEmpty { passed += 1 }
-            print("case \(i + 1) \(misses.isEmpty ? "PASS" : "FAIL") \(misses.joined(separator: "; "))")
-            if c.mustPass, !misses.isEmpty { print("MUSTPASS FAIL case \(i + 1)") }
-            if !misses.isEmpty, ProcessInfo.processInfo.environment["EVAL_SHOW"] == "1" { print("   out: \(out)") }
-        } catch {
-            print("case \(i + 1) ERROR \(error)")
-            if c.mustPass { print("MUSTPASS FAIL case \(i + 1)") }
+            } catch {
+                print("case \(i + 1) ERROR \(error)")
+                if c.mustPass { print("MUSTPASS FAIL case \(i + 1)") }
+                break
+            }
         }
+        guard let out else { continue }
+        let misses = score(c, out)
+        if misses.isEmpty { passed += 1 }
+        print("case \(i + 1) \(misses.isEmpty ? "PASS" : "FAIL") \(misses.joined(separator: "; "))")
+        if c.mustPass, !misses.isEmpty { print("MUSTPASS FAIL case \(i + 1)") }
+        if !misses.isEmpty, ProcessInfo.processInfo.environment["EVAL_SHOW"] == "1" { print("   out: \(out)") }
     }
     print("\(isIncremental ? "EVAL-INCREMENTAL" : "EVAL") \(args[2]) \(model) \(passed)/\(cases.count)")
     exit(0)
