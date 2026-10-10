@@ -51,13 +51,21 @@ private actor RaceIncrementalTransport: HTTPTransport {
     private var count = 0
     private var started = false
     private var cancelled = false
+    private var anchorAt: ContinuousClock.Instant?
     init(midMs: Int) { self.midMs = midMs }
+    func anchor(_ instant: ContinuousClock.Instant) { anchorAt = instant }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         count += 1
         let mid = count == 1
         started = true
-        do { try await Task.sleep(for: .milliseconds(mid ? midMs : 1)) }
-        catch { cancelled = true; throw error }
+        // The mid call's delay counts from the test's finish() anchor, not from its own start,
+        // so suite load between start and finish cannot shrink the race margin.
+        do {
+            if mid {
+                while anchorAt == nil { try await Task.sleep(for: .milliseconds(1)) }
+                try await Task.sleep(until: anchorAt! + .milliseconds(midMs))
+            } else { try await Task.sleep(for: .milliseconds(1)) }
+        } catch { cancelled = true; throw error }
         let content = mid ? "Send the updated report to the team." :
             "Send the updated report to the team. Send the updated report to the team. Send the updated report to the team."
         let data = try JSONSerialization.data(withJSONObject: ["choices": [["finish_reason": "stop", "message": ["content": content]]]])
@@ -136,6 +144,7 @@ struct IncrementalCleanupTests {
         incremental.append(index: 2, text: chunkText)
         let single = SingleProbe(delayMs: singleWins ? 5 : 1_000)
         let start = ContinuousClock.now
+        await transport.anchor(start)
         let result = await incremental.finish(totalChunks: 3, rawText: chunkText + " " + chunkText + " " + chunkText,
             single: { raw in await single.clean(raw) })
         #expect(result.mode == (singleWins ? "race_single" : "race_incremental"))
@@ -206,6 +215,52 @@ struct IncrementalCleanupTests {
             entry.incrementalSkipped = result.skippedReason
             #expect(entry.formatted().contains("incremental_skipped=" + result.skippedReason!))
         }
+    }
+
+    @Test func replacementOfUncleanedChunksOverwritesRaw() async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        incremental.append(index: 0, text: chunkText)
+        incremental.append(index: 1, text: "and,")
+        try await transport.wait(1)
+        try await transport.respond(0, chunkText)
+        await incremental.waitForPending()
+        incremental.seal()
+        incremental.append(index: 2, text: "other screenshots.")
+        incremental.append(index: 1, text: "and, uh, the screenshots.")  // rejoin: joined text on index-1, "" on index
+        incremental.append(index: 2, text: "")
+        let finish = Task { await incremental.finish(totalChunks: 3) }
+        try await transport.wait(2)
+        #expect(try await transport.user(1) == "<context></context>\n<dictation>" + chunkText + " and, uh, the screenshots.</dictation>")
+        try await transport.respond(1, chunkText + " and, uh, the screenshots.")
+        let result = await finish.value
+        #expect(result.mode == "incremental")
+        #expect(result.text == chunkText + " and, uh, the screenshots.")
+    }
+
+    @Test(arguments: [true, false]) func replacementOfCleanedChunkForcesFullRawSingle(midDone: Bool) async throws {
+        let transport = IncrementalTransport()
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport))
+        incremental.append(index: 1, text: "and,")
+        incremental.append(index: 2, text: chunkText)
+        incremental.append(index: 0, text: chunkText)   // contiguous 3: the mid batch covers chunks 0 and 1
+        try await transport.wait(1)
+        if midDone {
+            try await transport.respond(0, chunkText + " and,")
+            await incremental.waitForPending()
+        }
+        incremental.seal()
+        incremental.append(index: 1, text: "and, uh, the screenshots.")
+        incremental.append(index: 2, text: "")
+        if !midDone { try await transport.respond(0, chunkText + " and,") }  // stale result must be ignored
+        let single = SingleProbe(delayMs: 0)
+        let result = await incremental.finish(totalChunks: 3, rawText: "FULL RAW", single: { raw in await single.clean(raw) })
+        #expect(result.mode == "single")
+        #expect(result.skippedReason == "rejoin_replaced")
+        #expect(result.text == "Single winner.")
+        #expect(await single.raw == "FULL RAW")
+        #expect(await transport.count == 1)  // no final tail call from the stale prefix
+        #expect(incremental.needsFallback == false)
     }
 
     @Test func finishAfterFailedMidIsImmediate() async throws {
