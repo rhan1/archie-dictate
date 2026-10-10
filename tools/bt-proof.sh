@@ -178,8 +178,230 @@ main() {
     analyse "$STDERR_SECTION" "$PROBE_LOG"
 }
 
+esco_usage() {
+    echo "Usage: $0 [--log <minutes> | --log-window '<start>' '<end>' | --from-file <coreaudio.log> [<notes.log>] | analyse <stderr> <probe>]" >&2
+    exit 2
+}
+
+esco_analyse() {
+    local ca_file="$1"
+    local notes_file="${2:-/dev/null}"
+
+    /usr/bin/awk '
+    function days_from_civil(y, m, d,   era, yoe, m_adj, doy, doe) {
+        if (m <= 2) {
+            y = y - 1
+            m_adj = m + 9
+        } else {
+            m_adj = m - 3
+        }
+        era = int(y / 400)
+        yoe = y - era * 400
+        doy = int((153 * m_adj + 2) / 5) + d - 1
+        doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+        return era * 146097 + doe
+    }
+
+    function parse_time(d_str, t_str,   d_parts, t_parts, s_parts, y, m, d, h, min, s, ms_str, ms) {
+        if (split(d_str, d_parts, "-") != 3) return -1
+        y = d_parts[1] + 0
+        m = d_parts[2] + 0
+        d = d_parts[3] + 0
+        if (split(t_str, t_parts, ":") != 3) return -1
+        h = t_parts[1] + 0
+        min = t_parts[2] + 0
+        if (split(t_parts[3], s_parts, ".") == 2) {
+            s = s_parts[1] + 0
+            ms_str = s_parts[2]
+            while (length(ms_str) < 3) ms_str = ms_str "0"
+            ms = substr(ms_str, 1, 3) + 0
+        } else {
+            s = t_parts[3] + 0
+            ms = 0
+        }
+        return days_from_civil(y, m, d) * 86400000 + h * 3600000 + min * 60000 + s * 1000 + ms
+    }
+
+    {
+        t = parse_time($1, $2)
+        if (t < 0) next
+
+        if (index($0, "Dropping eSCO creation") > 0) {
+            n_drops++
+            drop_time[n_drops] = t
+            drop_raw[n_drops] = $2
+        } else if (index($0, "type = Creation") > 0) {
+            n_creations++
+            creation_time[n_creations] = t
+        } else if (index($0, "type = Disconnection") > 0) {
+            n_disconns++
+            disconn_time[n_disconns] = t
+        }
+        if (index($0, "bridge_src=builtin_fallback") > 0) {
+            n_fallbacks++
+            fallback_time[n_fallbacks] = t
+        }
+    }
+
+    END {
+        recovered_cnt = 0
+        fallback_cnt = 0
+        failed_cnt = 0
+        earliest_fail_raw = ""
+        earliest_fail_time = ""
+
+        for (i = 1; i <= n_drops; i++) {
+            td = drop_time[i]
+            c_found = 0
+            min_tc = 0
+            for (j = 1; j <= n_creations; j++) {
+                if (creation_time[j] > td) {
+                    if (!c_found || creation_time[j] < min_tc) {
+                        c_found = 1
+                        min_tc = creation_time[j]
+                    }
+                }
+            }
+
+            d_found = 0
+            min_tdisc = 0
+            for (j = 1; j <= n_disconns; j++) {
+                if (disconn_time[j] > td && (!c_found || disconn_time[j] < min_tc)) {
+                    if (!d_found || disconn_time[j] < min_tdisc) {
+                        d_found = 1
+                        min_tdisc = disconn_time[j]
+                    }
+                }
+            }
+            anchor = (d_found ? min_tdisc : td)
+
+            if (c_found && min_tc <= anchor + 1500) {
+                drop_status[i] = "recovered"
+                recovered_cnt++
+            } else {
+                fb_found = 0
+                for (j = 1; j <= n_fallbacks; j++) {
+                    if (fallback_time[j] >= td - 2000 && fallback_time[j] <= td + 5000) {
+                        fb_found = 1
+                        break
+                    }
+                }
+                if (fb_found) {
+                    drop_status[i] = "fallback"
+                    fallback_cnt++
+                } else {
+                    drop_status[i] = "FAIL"
+                    failed_cnt++
+                    if (earliest_fail_time == "" || td < earliest_fail_time) {
+                        earliest_fail_time = td
+                        earliest_fail_raw = drop_raw[i]
+                    }
+                }
+            }
+        }
+
+        n = (n_drops + 0)
+        print "drops=" n " recovered=" recovered_cnt " fallback=" fallback_cnt " failed=" failed_cnt
+        for (i = 1; i <= n_drops; i++) {
+            print "drop " drop_raw[i] " -> " drop_status[i]
+        }
+
+        if (failed_cnt == 0) {
+            print "BT-PROOF: PASS"
+            exit 0
+        } else {
+            print "BT-PROOF: FAIL " earliest_fail_raw
+            exit 1
+        }
+    }
+    ' "$ca_file" "$notes_file"
+}
+
+esco_log_window() {
+    local start="$1"
+    local end="$2"
+
+    local start_clean="${start%%.*}"
+    local end_clean="${end%%.*}"
+    local start_sec
+    local end_sec
+    start_sec=$(date -j -f '%Y-%m-%d %H:%M:%S' "$start_clean" '+%s' 2>/dev/null || true)
+    end_sec=$(date -j -f '%Y-%m-%d %H:%M:%S' "$end_clean" '+%s' 2>/dev/null || true)
+    if [ -z "$start_sec" ] || [ -z "$end_sec" ] || [ "$start_sec" -gt "$end_sec" ]; then
+        esco_usage
+    fi
+
+    local coreaudio_tmp
+    local notes_tmp
+    coreaudio_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-ca.XXXXXX")
+    notes_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-notes.XXXXXX")
+    trap 'rm -f "$coreaudio_tmp" "$notes_tmp"' EXIT
+
+    /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
+        --predicate 'process == "coreaudiod" AND subsystem == "com.apple.bluetooth"' 2>/dev/null \
+        | grep -E 'Dropping eSCO creation|Injecting silent Audio started|operation completed operaton type = (Creation|Disconnection)' \
+        > "$coreaudio_tmp"
+    local status_ca=${PIPESTATUS[0]}
+
+    /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
+        --predicate 'subsystem == "com.razakhan.archie" AND category == "voice"' 2>/dev/null \
+        | grep -F 'bridge_src=builtin_fallback' \
+        > "$notes_tmp"
+    local status_notes=${PIPESTATUS[0]}
+
+    if [ "$status_ca" -ne 0 ] || [ "$status_notes" -ne 0 ]; then
+        echo "BT-PROOF: FAIL log_show_error"
+        exit 2
+    fi
+
+    local dictate_stderr="$HOME/Library/Logs/Dictate/dictate.stderr.log"
+    if [ -f "$dictate_stderr" ]; then
+        local line
+        local stamp
+        local l_sec
+        local local_ts
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\[([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+                stamp="${BASH_REMATCH[1]}Z"
+                l_sec=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$stamp" '+%s' 2>/dev/null || true)
+                if [ -n "$l_sec" ] && [ "$l_sec" -ge "$start_sec" ] && [ "$l_sec" -le "$end_sec" ]; then
+                    local_ts=$(date -r "$l_sec" '+%Y-%m-%d %H:%M:%S.000')
+                    echo "$local_ts $line" >> "$notes_tmp"
+                fi
+            fi
+        done < <(grep -F 'bridge_src=builtin_fallback' "$dictate_stderr" 2>/dev/null || true)
+    fi
+
+    esco_analyse "$coreaudio_tmp" "$notes_tmp"
+    local rc=$?
+    rm -f "$coreaudio_tmp" "$notes_tmp"
+    trap - EXIT
+    exit "$rc"
+}
+
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    if [[ "${1:-}" == "analyse" ]]; then
+    if [[ "${1:-}" == "--log" ]]; then
+        if [ $# -ne 2 ] || ! [[ "${2:-}" =~ ^[0-9]+$ ]] || [ "${2:-0}" -le 0 ]; then
+            esco_usage
+        fi
+        start=$(date -v-"${2}"M '+%Y-%m-%d %H:%M:%S')
+        end=$(date '+%Y-%m-%d %H:%M:%S')
+        esco_log_window "$start" "$end"
+    elif [[ "${1:-}" == "--log-window" ]]; then
+        if [ $# -ne 3 ] || [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            esco_usage
+        fi
+        esco_log_window "$2" "$3"
+    elif [[ "${1:-}" == "--from-file" ]]; then
+        if [ $# -lt 2 ] || [ $# -gt 3 ] || [ ! -f "${2:-}" ]; then
+            esco_usage
+        fi
+        if [ $# -eq 3 ] && [ ! -f "${3:-}" ]; then
+            esco_usage
+        fi
+        esco_analyse "$2" "${3:-/dev/null}"
+        exit $?
+    elif [[ "${1:-}" == "analyse" ]]; then
         analyse "${2:-}" "${3:-}"
         exit $?
     elif [[ $# -eq 2 ]]; then

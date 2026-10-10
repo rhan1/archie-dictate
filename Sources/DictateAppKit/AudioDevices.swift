@@ -62,6 +62,31 @@ enum AudioDevices {
         try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                                       kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)))
     }
+    static func currentDevice(of unit: AudioUnit) throws -> AudioDeviceID {
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        try check(AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size))
+        return device
+    }
+    static func setCurrentDevice(_ device: AudioDeviceID, on unit: AudioUnit) throws {
+        var device = device
+        try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                      kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)))
+    }
+    /// H2: whether any client (any process) still runs IO on the default input device; nil if unreadable.
+    static func defaultInputIsRunningSomewhere() -> Bool? {
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr
+        else { return nil }
+        var running: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &running) == noErr else { return nil }
+        return running != 0
+    }
     /// D-a: after CurrentDevice changes, AUHAL keeps the previous default device's
     /// client (output-scope) format, and its input element does no sample-rate
     /// conversion, so the tap guard saw 48 kHz hardware vs a 44.1 kHz client on
