@@ -29,6 +29,13 @@ struct HostingExampleTests {
         #expect(host.engine.forceFallback == nil)
     }
 
+    // A host can drive OutputMuter itself (own state file); constructing touches no device.
+    @Test func systemOutputMuteIsPublic() {
+        let device: OutputMuteDevice = SystemOutputMute()
+        _ = OutputMuter(device: device, stateFile: FileManager.default.temporaryDirectory
+            .appendingPathComponent("dictate-host-mute-\(UUID().uuidString)"))
+    }
+
     // docs/HOSTING.md shows exactly the example compiled above.
     @Test func docExampleMatchesCompiledExample() throws {
         let here = URL(fileURLWithPath: #filePath)

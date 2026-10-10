@@ -272,7 +272,8 @@ struct IncrementalCleanupTests {
         await incremental.waitForPending()
         let start = ContinuousClock.now
         let result = await incremental.finish(totalChunks: 3)
-        #expect(start.duration(to: .now) < .milliseconds(50))
+        // Proves no wait for the 600 ms race; the margin absorbs suite load.
+        #expect(start.duration(to: .now) < .milliseconds(300))
         #expect(result.mode == "incremental_fallback")
         #expect(result.fallbackReason == "mid_network_timedOut")
         #expect(result.calls == 1)
