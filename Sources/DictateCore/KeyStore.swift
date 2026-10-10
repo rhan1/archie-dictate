@@ -13,10 +13,18 @@ public final class KeyStore: @unchecked Sendable {
 
     /// The default reader: `/usr/bin/security` (never a keychain dialog). SecItem is opt-in via `KeychainAPIKey.read`.
     public static let defaultReaderName = "security-tool"
-    public init(reader: @escaping @Sendable (String) throws -> String = { try KeychainToolReader().read(service: $0) },
-                clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+    /// Logged on the `keys=` line: `security-tool` for `KeyStore()`, `custom` for an injected reader.
+    public let readerName: String
+
+    public convenience init(clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.init(reader: { try KeychainToolReader().read(service: $0) }, clock: clock, readerName: Self.defaultReaderName)
+    }
+    public init(reader: @escaping @Sendable (String) throws -> String,
+                clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                readerName: String = "custom") {
         self.reader = reader
         self.clock = clock
+        self.readerName = readerName
     }
     public func prefetch(services: [String]) {
         for service in services {
