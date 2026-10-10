@@ -41,6 +41,10 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private var sealedAt: ContinuousClock.Instant?
     private var cancelled = false
     private var pending: Task<Void, Never>?
+    private var pendingEnd = 0
+    /// Bumped when a rejoin replaces text already (being) cleaned; stale batch results are dropped.
+    private var epoch = 0
+    private var invalidated = false
     private var finalTask: Task<Result, Never>?
 
     /// The final tail call omits the few-shot pairs by default (v1.5.1: ~80 ms faster on the
@@ -54,9 +58,25 @@ public final class IncrementalCleaner: @unchecked Sendable {
     public var callCount: Int { lock.withLock { calls + singleCalls } }
     public var fallbackReason: String? { lock.withLock { failure } }
 
+    /// A second arrival for an index is a replacement (the rejoin guard re-emits joined text on
+    /// index-1 and "" on index). Anything already cleaned from the old text is dropped; the final
+    /// call then re-cleans from raw, so the replaced text, not the stale chunk, reaches the paste.
     public func append(index: Int, text: String) {
         lock.withLock {
-            guard !closed, !failed, index >= 0, chunks[index] == nil else { return }
+            guard !closed, !failed, index >= 0 else { return }
+            if let old = chunks[index] {
+                guard old != text else { return }
+                chunks[index] = text
+                if index < max(covered, pending == nil ? 0 : pendingEnd), !invalidated {
+                    invalidated = true
+                    epoch += 1
+                    pending?.cancel()
+                    pending = nil
+                    prefix = ""
+                    covered = 0
+                }
+                return
+            }
             chunks[index] = text
             while chunks[contiguous] != nil { contiguous += 1 }
             schedule()
@@ -67,15 +87,18 @@ public final class IncrementalCleaner: @unchecked Sendable {
     // chunk; subsequent batches require at least two more.
     private func schedule() {
         let end = max(0, contiguous - 1)
-        guard !closed, !sealed, !failed, pending == nil,
+        guard !closed, !sealed, !failed, !invalidated, pending == nil,
               end - covered >= (covered == 0 ? 1 : 2) else { return }
         let text = raw(from: covered, to: end)
         let context = prefix
         calls += 1
+        pendingEnd = end
+        let mine = epoch
         pending = Task.detached { [self] in
             do {
                 let output = try await cleaner.cleanIncrementalWithStats(text, context: context, final: false)
                 lock.withLock {
+                    guard mine == epoch else { return }
                     if !cancelled {
                         prefix = (prefix + " " + output.text).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
                         covered = end
@@ -85,6 +108,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
                 }
             } catch {
                 lock.withLock {
+                    guard mine == epoch else { return }
                     if !cancelled {
                         failed = true
                         failure = failure ?? "mid_" + ((error as? TranscriptionError)?.logReason ?? "error")
@@ -219,6 +243,9 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private func finishIncremental(totalChunks: Int, inFlight: Task<Void, Never>?) async -> Result {
         await inFlight?.value
         if Task.isCancelled { return snapshot(text: nil, stats: nil) }
+        if lock.withLock({ invalidated && !cancelled && !failed }) {
+            return snapshot(text: nil, stats: nil, skipped: "rejoin_replaced")
+        }
         let tail: (String, String)? = lock.withLock {
             guard !failed, !cancelled, contiguous == totalChunks, !prefix.isEmpty else {
                 if !cancelled, contiguous != totalChunks { failed = true; failure = failure ?? "gap_\(contiguous)of\(totalChunks)" }
