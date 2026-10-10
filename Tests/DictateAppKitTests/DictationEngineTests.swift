@@ -118,6 +118,28 @@ struct DictationEngineTests {
         #expect(states.last == .idle)
     }
 
+    @Test func keepWarmIsNeverScheduledWithFakeDependenciesAndSharesTheSTTSession() async throws {
+        let recorder = TestRecorder()
+        let stt = TestHTTP("x"), groq = TestHTTP("x"), local = TestHTTP("x")
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { TestApple("x") }, sttTransport: stt,
+            groqCleanupTransport: groq, localCleanupTransport: local, inserter: TextInserter(),
+            panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { nil }, manageMedia: false)
+        let fake = AppController(keyStore: KeyStore(reader: { _ in "fixture" }),
+            paths: AppPaths(home: URL(fileURLWithPath: "/unused")), surface: .none, mode: .dictate, dependencies: dependencies)
+        fake.configureEngine()
+        fake.engineHotkey(.tap)   // the first-tap warm-up path
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(!fake.keepWarmScheduled && fake.keepWarmPings == 0)
+        let sttRequests = await stt.requests.count
+        #expect(sttRequests == 0)
+        // Positive control: the production wiring (no injected fakes) does own a scheduler. Nothing is pinged until activity.
+        let real = AppController(keyStore: KeyStore(reader: { _ in "fixture" }),
+            paths: AppPaths(home: URL(fileURLWithPath: "/unused")), surface: .none, mode: .dictate)
+        #expect(real.keepWarmScheduled == (GroqKeepWarm.isEnabled() && ProcessInfo.processInfo.environment["DICTATE_FAKE_TRANSCRIPT"] == nil))
+        #expect(real.keepWarmPings == 0)
+    }
+
     @Test func captureOnlyAndQuotaRunThroughFacadeWithFakes() async throws {
         // Three positive controls: ordinary Groq+cleanup+paste; Groq capture-only;
         // quota Apple+local+paste. Every HTTP/insertion counter is exercised.
