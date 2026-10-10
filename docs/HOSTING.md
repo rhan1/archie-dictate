@@ -17,7 +17,7 @@ import DictateAppKit
         engine.onState = { print($0) }
         engine.onTranscript = { text, timeline in print(text, timeline) }
         hotkeys.onDoubleTap = { [weak self] in self?.engine.start() }
-        hotkeys.onTap = { [weak self] in self?.engine.finish() }
+        hotkeys.onTap = { [weak self] in self?.engine.tap() }
         hotkeys.onEscape = { [weak self] in self?.engine.escape() }
     }
     func enableHotkeys() -> Bool { hotkeys.start() }
@@ -26,6 +26,8 @@ import DictateAppKit
 ```
 
 `start()` begins a dictation; `finish()` finishes a recording (or pastes held text).
+`tap()` is the single-⌥ handler: while idle it pre-starts the microphone so it is live
+by the second tap (no lost first words); otherwise it behaves like `finish()`.
 `cancel()` and `escape()` cancel capture/transcription or dismiss an outcome.
 `pasteHeld()` recovers held text once; `copyHeld()` copies its current preview.
 The host can drive these methods itself without creating a hotkey monitor.

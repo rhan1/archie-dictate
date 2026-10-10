@@ -164,23 +164,13 @@ struct WAVInjectedRecorderTests {
         #expect(engine.surface == .none)
     }
 
-    @Test func envDictateInjectWAVConstructs() async throws {
-        let tempDir = try makeTempDir()
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-        let samples = makeSineSamples()
-        let wavData = WAVEncoder.encode(samples: samples, sampleRate: 24_000, channels: 1)
-        let wavURL = tempDir.appendingPathComponent("env_sine24k.wav")
-        try wavData.write(to: wavURL)
-
-        setenv("DICTATE_INJECT_WAV", wavURL.path, 1)
-        defer { unsetenv("DICTATE_INJECT_WAV") }
-
-        let engine = DictationEngine(
-            keyStore: KeyStore(),
-            paths: AppPaths(home: tempDir),
-            surface: .none
-        )
-        #expect(engine.surface == .none)
+    // Never setenv in tests: parallel suites read ProcessInfo.environment concurrently.
+    @Test func envDictateInjectWAVResolves() {
+        let explicit = URL(fileURLWithPath: "/tmp/explicit.wav")
+        #expect(AppController.injectedAudioURL(nil, environment: ["DICTATE_INJECT_WAV": "/tmp/env.wav"])?.path == "/tmp/env.wav")
+        #expect(AppController.injectedAudioURL(explicit, environment: ["DICTATE_INJECT_WAV": "/tmp/env.wav"]) == explicit)
+        #expect(AppController.injectedAudioURL(nil, environment: ["DICTATE_INJECT_WAV": ""]) == nil)
+        #expect(AppController.injectedAudioURL(nil, environment: [:]) == nil)
     }
 
     // AppController/CaptureLifecycle expect first-buffer and level on main, like AudioRecorder.

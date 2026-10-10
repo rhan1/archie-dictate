@@ -64,13 +64,13 @@ private actor TestHTTP: HTTPTransport {
 @Suite("DictationEngineTests") @MainActor
 struct DictationEngineTests {
     // Wall-clock deadline: under suite load 2000 × 1 ms polls ran out before the fake pipeline finished.
-    private func waitFor(_ condition: () -> Bool) async throws {
+    private func waitFor(_ condition: () -> Bool, sourceLocation: SourceLocation = #_sourceLocation) async throws {
         let deadline = ContinuousClock.now + .seconds(10)
         while ContinuousClock.now < deadline {
             if condition() { return }
             try await Task.sleep(nanoseconds: 1_000_000)
         }
-        Issue.record("Timed out waiting for fake pipeline")
+        Issue.record("Timed out waiting for fake pipeline", sourceLocation: sourceLocation)
         throw URLError(.timedOut)
     }
 
@@ -118,6 +118,24 @@ struct DictationEngineTests {
         #expect(states.last == .error(word: "no key"))
         engine.cancel()
         #expect(states.last == .idle)
+    }
+
+    // A host's single ⌥ tap must pre-start capture like the standalone app (BT3/D0b), not be a no-op finish.
+    @Test func hostTapPrestartsCaptureWhenIdle() async throws {
+        let recorder = TestRecorder()
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { TestApple("x") }, sttTransport: TestHTTP("x"),
+            groqCleanupTransport: TestHTTP("x"), localCleanupTransport: TestHTTP("x"), inserter: TextInserter(),
+            panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { nil }, manageMedia: false)
+        let controller = AppController(keyStore: KeyStore(reader: { _ in "fixture" }),
+            paths: AppPaths(home: URL(fileURLWithPath: "/unused")), surface: .none, mode: .dictate, dependencies: dependencies)
+        let engine = DictationEngine(controller: controller)
+        engine.finish()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(recorder.starts == 0)   // finish() stays a no-op while idle
+        engine.tap()
+        try await waitFor { recorder.starts == 1 }
+        engine.cancel()
     }
 
     @Test func keepWarmIsNeverScheduledWithFakeDependenciesAndSharesTheSTTSession() async throws {
@@ -178,7 +196,7 @@ struct DictationEngineTests {
             engine.onGroqRateLimit = { limits.append($0) }
             engine.start()
             // BT3 resets pre-roll before the asynchronous start; wait for the start itself.
-            try await waitFor { recorder.ready && recorder.starts > 0 }
+            try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending }
             recorder.onLevel?(2); recorder.onLevel?(-1)
             #expect(states.contains(.warming) && states.contains(.recording(level: 0)))
             #expect(states.contains(.recording(level: 1)))
@@ -284,7 +302,7 @@ struct DictationEngineTests {
         var deliveries: [(String, DictationTimeline)] = []
         engine.onTranscript = { deliveries.append(($0, $1)) }
         engine.start()
-        try await waitFor { recorder.ready && recorder.starts > 0 }
+        try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending }
         recorder.onLevel?(2); recorder.onLevel?(-1)
         engine.finish()
         try await waitFor { !deliveries.isEmpty }

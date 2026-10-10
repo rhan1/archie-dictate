@@ -10,7 +10,7 @@ import DictateAppKit
         engine.onState = { print($0) }
         engine.onTranscript = { text, timeline in print(text, timeline) }
         hotkeys.onDoubleTap = { [weak self] in self?.engine.start() }
-        hotkeys.onTap = { [weak self] in self?.engine.finish() }
+        hotkeys.onTap = { [weak self] in self?.engine.tap() }
         hotkeys.onEscape = { [weak self] in self?.engine.escape() }
     }
     func enableHotkeys() -> Bool { hotkeys.start() }

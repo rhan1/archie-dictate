@@ -88,6 +88,9 @@ public struct DictationTimeline: Sendable, Equatable {
 
     public func start() { controller.engineStart() }
     public func finish() { controller.engineFinish() }
+    /// Wire a host's single ⌥ tap here (not to finish()): while idle it pre-starts capture so the
+    /// microphone is live by the second tap; while recording it finishes; with held text it pastes.
+    public func tap() { controller.engineTap() }
     /// Undoes a mute left by a host that quit or crashed mid-dictation; call once at host launch.
     /// Returns the event (`mute_recovered=1`, `restore_failed`) or nil when nothing was pending.
     @discardableResult public func recoverStaleMute() -> String? { controller.engineRecoverStaleMute() }
