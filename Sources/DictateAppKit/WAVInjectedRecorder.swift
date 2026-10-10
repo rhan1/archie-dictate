@@ -12,6 +12,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public let url: URL
     public let pace: Double
     public let scenario: Scenario
+    /// Diagnostics sink (the engine's notes by default); tests keep their notes local.
+    public var note: (String) -> Void = { AppController.note($0) }
 
     public var onLevel: ((Double) -> Void)?
     public var onPCMChunk: (([Int16]) -> Void)?
@@ -211,7 +213,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
         let levelCb = onLevel
         lock.unlock()
 
-        for note in notes { AppController.note(note) }
+        let sink = note
+        for line in notes { sink(line) }
         // Same threads as AudioRecorder: PCM from the capture queue, first-buffer and level on main.
         if !chunk.isEmpty { pcmCb?(chunk) }
         DispatchQueue.main.async { [weak self] in

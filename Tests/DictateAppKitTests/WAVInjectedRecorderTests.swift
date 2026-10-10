@@ -185,6 +185,8 @@ struct WAVInjectedRecorderTests {
         let recorder = WAVInjectedRecorder(url: wavURL, pace: 0.05, scenario: .headsetZeros)
         let lock = NSLock()
         var delivered: [Int16] = []
+        var notes: [String] = []
+        recorder.note = { line in lock.withLock { notes.append(line) } }   // never the process-wide sink
         recorder.onPCMChunk = { chunk in lock.withLock { delivered.append(contentsOf: chunk) } }
         try recorder.start()
         recorder.resetCapture()
@@ -198,6 +200,7 @@ struct WAVInjectedRecorderTests {
         #expect(recorder.stats.bridgeSource == "builtin_fallback")
         #expect(recorder.stats.bridgeReason == "headset_digital_silence")
         #expect(recorder.stats.headsetRestart == "still_silent")
+        #expect(lock.withLock { notes }.contains("bridge_src=builtin_fallback reason=headset_digital_silence"))
         #expect(WAVInjectedRecorder.scenario(environment: ["DICTATE_INJECT_SCENARIO": "headset_zeros"]) == .headsetZeros)
         #expect(WAVInjectedRecorder.scenario(environment: [:]) == .plain)
     }
