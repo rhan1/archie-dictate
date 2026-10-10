@@ -193,4 +193,89 @@ struct DictationEngineTests {
             }
         }
     }
+
+    @Test func quotaPolicyChoosesFallbackPerEndpoint() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func quota(stt: Int, cleanup: Int) -> GroqQuota {
+            func r(_ n: Int, _ e: GroqRateLimit.Endpoint) -> GroqRateLimit {
+                GroqRateLimit(response: HTTPURLResponse(url: URL(string: "https://api.groq.com")!, statusCode: 200, httpVersion: nil,
+                    headerFields: ["x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "\(n)",
+                                   "x-ratelimit-reset-requests": "2m0s"])!, endpoint: e)
+            }
+            return GroqQuota().merging(r(stt, .stt), at: now).merging(r(cleanup, .cleanup), at: now)
+        }
+        let ok = EnginePolicy(mode: .dictate, fallback: nil, quota: quota(stt: 50, cleanup: 50), now: now)
+        #expect(ok.usesGroqSTT && ok.usesGroqCleanup && ok.fallbackLabel == nil && ok.fallbackFields == nil)
+        let stt = EnginePolicy(mode: .dictate, fallback: nil, quota: quota(stt: 9, cleanup: 50), now: now)
+        #expect(!stt.usesGroqSTT && stt.usesGroqCleanup && stt.fallbackLabel == "quota")
+        #expect(stt.fallbackFields == "quota quota_low=stt")
+        let cleanup = EnginePolicy(mode: .dictate, fallback: nil, quota: quota(stt: 50, cleanup: 9), now: now)
+        #expect(cleanup.usesGroqSTT && !cleanup.usesGroqCleanup && cleanup.fallbackLabel == "quota")
+        #expect(cleanup.fallbackFields == "quota quota_low=cleanup")
+        let both = EnginePolicy(mode: .dictate, fallback: nil, quota: quota(stt: 1, cleanup: 1), now: now)
+        #expect(!both.usesGroqSTT && !both.usesGroqCleanup && both.fallbackFields == "quota quota_low=both")
+        // Capture-only never cleans up, so a low cleanup quota is not a fallback.
+        let capture = EnginePolicy(mode: .captureOnly, fallback: nil, quota: quota(stt: 50, cleanup: 1), now: now)
+        #expect(capture.usesGroqSTT && capture.fallbackLabel == nil)
+        // Expired counts no longer force a fallback.
+        let expired = EnginePolicy(mode: .dictate, fallback: nil, quota: quota(stt: 1, cleanup: 1), now: now.addingTimeInterval(121))
+        #expect(expired.usesGroqSTT && expired.usesGroqCleanup && expired.fallbackLabel == nil)
+        // The manual override still means both, without a quota_low field.
+        let forced = EnginePolicy(mode: .dictate, fallback: .quota, quota: quota(stt: 50, cleanup: 50), now: now)
+        #expect(!forced.usesGroqSTT && !forced.usesGroqCleanup && forced.fallbackFields == "quota")
+    }
+
+    @Test func lowSTTQuotaRoutesSessionToAppleAndRecordsCounts() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-d3-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(home: root)
+        let quotaFile = root.appendingPathComponent("host/groq-quota.json")
+        // Seed a host-relocated file: STT at 5/100 with a reset an hour away.
+        GroqQuotaStore(fileURL: quotaFile).record(GroqRateLimit(response: HTTPURLResponse(
+            url: URL(string: "https://api.groq.com")!, statusCode: 200, httpVersion: nil,
+            headerFields: ["x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "5",
+                           "x-ratelimit-reset-requests": "1h0m0s"])!, endpoint: .stt))
+        let keys = KeyStore(reader: { _ in "fixture" })
+        keys.prefetch(services: ["groq-api"])
+        try await waitFor { keys.key(for: "groq-api") != nil }
+        let raw = "please send the whole report on Tuesday"
+        let clean = "Please send the whole report on Tuesday."
+        let recorder = TestRecorder()
+        let apple = TestApple(raw)
+        let stt = TestHTTP(raw), groq = TestHTTP(clean), local = TestHTTP(clean)
+        let panel = TestPanel()
+        let clipboard = NSPasteboard(name: .init("dictate-d3-\(UUID().uuidString)"))
+        defer { clipboard.releaseGlobally() }
+        var pastes = 0
+        let inserter = TextInserter(pasteboard: clipboard, postKeystroke: { pastes += 1 })
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { apple }, sttTransport: stt,
+            groqCleanupTransport: groq, localCleanupTransport: local, inserter: inserter,
+            panelFactory: { panel }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate,
+                                       dependencies: dependencies, quotaFileURL: quotaFile)
+        let engine = DictationEngine(controller: controller)
+        #expect(engine.quotaFileURL == quotaFile)
+        #expect(engine.groqQuota.stt.remainingRequests == 5)
+        var deliveries: [(String, DictationTimeline)] = []
+        engine.onTranscript = { deliveries.append(($0, $1)) }
+        engine.start()
+        try await waitFor { recorder.ready && recorder.starts > 0 }
+        recorder.onLevel?(2); recorder.onLevel?(-1)
+        engine.finish()
+        try await waitFor { !deliveries.isEmpty }
+        try await waitFor { FileManager.default.fileExists(atPath: paths.logURL.path) }
+        #expect(deliveries[0].1.path == "apple" && deliveries[0].1.fallback == "quota")
+        #expect(await stt.requests.isEmpty)                    // STT low: no Groq STT
+        let groqCleanups = await groq.requests.filter { $0.url!.path.hasSuffix("/chat/completions") }.count
+        let localCalls = await local.requests.count
+        #expect(groqCleanups == 1 && localCalls == 0)          // cleanup still on Groq (warm-up GET /models aside)
+        let line = try String(contentsOf: paths.logURL, encoding: .utf8)
+        #expect(line.contains("fallback=quota quota_low=stt"))
+        // The cleanup response's counts were recorded; the STT counts were not disturbed.
+        #expect(engine.groqQuota.cleanup.remainingRequests == 42)
+        #expect(engine.groqQuota.stt.remainingRequests == 5)
+        let file = try String(contentsOf: quotaFile, encoding: .utf8)
+        #expect(!file.contains("gsk_") && !file.contains("Bearer") && !file.contains(raw))
+    }
 }

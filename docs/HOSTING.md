@@ -44,6 +44,15 @@ the standalone behavior. Audio and transcript text remain in memory only; paths
 select the existing count-only log, mute-recovery file, and vocabulary location.
 The example prints text only to demonstrate delivery; the engine never stores it.
 
+Groq quota: every Groq response (STT and cleanup, including errors, hedges and warm-up)
+is recorded as counts and dates only in `~/Library/Application Support/Dictate/groq-quota.json`
+(atomic writes; pass `DictationEngine(..., quotaFileURL:)` to relocate it, and `quotaFileURL`
+reads it back). `engine.groqQuota` (or `GroqQuota.current` for the default file) has the
+per-endpoint limits, remaining counts and reset time. At recording start, an endpoint with
+under 10 % of its requests left (until its reset, or 15 min without one) falls back
+automatically: STT to Apple on-device, cleanup to local Ollama. The session logs
+`fallback=quota quota_low=stt|cleanup|both`; `forceFallback = .quota` still means both.
+
 On macOS, microphone access is needed for capture, Apple Speech assets must already
 be installed for quota fallback, and Accessibility/Input Monitoring is needed for
 hotkeys and insertion. Engine construction performs no asset download. The existing
