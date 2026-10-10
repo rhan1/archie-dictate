@@ -67,8 +67,8 @@ public struct DictationTimeline: Sendable, Equatable {
     private let ownedController: AppController?
 
     public init(keyStore: KeyStore, paths: AppPaths, surface: Surface = .pill, mode: Mode = .dictate,
-                quotaFileURL: URL? = nil) {
-        let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode, quotaFileURL: quotaFileURL)
+                quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil) {
+        let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode, quotaFileURL: quotaFileURL, injectedAudioURL: injectedAudioURL)
         self.controller = controller
         ownedController = controller
         bind()
