@@ -5,6 +5,7 @@ import DictateObjC
 final class RedTeamEngine: CaptureEngine {
     enum Fault { case none, swift, exception, tapException, missingBuiltIn }
     var faults: [Fault] = []
+    var isAllocated = true
     var isRunning = false
     var taps = 0
     var attempts: [MicChoice] = []
@@ -13,6 +14,7 @@ final class RedTeamEngine: CaptureEngine {
     var rebuildRaises = false
     var onStart: (() -> Void)?
     func start(device: MicChoice) throws {
+        isAllocated = true
         attempts.append(device)
         taps += 1
         let fault = faults.isEmpty ? .none : faults.removeFirst()
@@ -35,13 +37,19 @@ final class RedTeamEngine: CaptureEngine {
         taps = 0
         return []
     }
+    func release() {
+        // Release remains possible when stop/removeTap has poisoned an engine.
+        isRunning = false; taps = 0; isAllocated = false
+    }
     func rebuild() {
+        release()
         rebuilds += 1
         if rebuildRaises {
             rebuildRaises = false
             NSException(name: .internalInconsistencyException, reason: "rebuild", userInfo: nil).raise()
         }
         _ = stop()
+        isAllocated = true
     }
 }
 

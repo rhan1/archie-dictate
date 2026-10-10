@@ -4,6 +4,8 @@ public enum MicChoice: Equatable, Sendable { case `default`, builtIn }
 
 public protocol CaptureEngine: AnyObject {
     var isRunning: Bool { get }
+    var isAllocated: Bool { get }
+    func release()
     func start(device: MicChoice) throws
     @discardableResult func stop() -> [Float]
     func rebuild() throws
@@ -30,6 +32,8 @@ public final class CaptureLifecycle {
     public var note: ((String) -> Void)?
     public var dropHooks: (() -> Void)?
     private let scheduler: CaptureScheduler
+    public let idleReleaseSeconds: TimeInterval
+    private var idleGuard: CaptureCancellation?
     private var expiry: CaptureCancellation?
     private var firstBufferDeadline: CaptureCancellation?
     private var cap: CaptureCancellation?
@@ -38,9 +42,37 @@ public final class CaptureLifecycle {
     private var failureReported = false
     private var prewarmStarting = false
 
-    public init(engine: CaptureEngine, scheduler: CaptureScheduler = CaptureDispatchScheduler()) {
+    public init(engine: CaptureEngine, scheduler: CaptureScheduler = CaptureDispatchScheduler(),
+                idleReleaseSeconds: TimeInterval = 2.0) {
+        precondition(idleReleaseSeconds > 0)
         self.engine = engine
         self.scheduler = scheduler
+        self.idleReleaseSeconds = idleReleaseSeconds
+        armIdleGuard()
+    }
+
+    private var isIdle: Bool {
+        warmup.phase == .off && !recordingRequested && !hasPendingPrewarmExpiry && !prewarmStarting
+    }
+    private func cancelIdleGuard() { idleGuard?.cancel(); idleGuard = nil }
+    private func armIdleGuard() {
+        cancelIdleGuard()
+        guard isIdle else { return }
+        let token = epoch
+        idleGuard = scheduler.schedule(after: idleReleaseSeconds) { [weak self] in
+            guard let self, self.epoch === token, self.isIdle else { return }
+            self.idleGuard = nil
+            if self.engine.isAllocated {
+                self.releaseEngine()
+                self.note?("engine_idle_release")
+            }
+            // Keep watching for an allocation left by a late recovery operation.
+            self.armIdleGuard()
+        }
+    }
+    private func releaseEngine() {
+        do { try captureObjC { engine.release() } }
+        catch { logError(error) }
     }
 
     private func armExpiry() {
@@ -61,6 +93,7 @@ public final class CaptureLifecycle {
 
     public func firstTap() {
         guard warmup.phase == .off, !recordingRequested, !prewarmStarting else { return }
+        cancelIdleGuard()
         let token = CaptureEpoch()
         epoch = token
         prewarmStarting = true
@@ -81,6 +114,7 @@ public final class CaptureLifecycle {
     @MainActor public func firstTapAsync(start: (MicChoice) async throws -> Void,
                               isCancelled: () -> Bool) async {
         guard warmup.phase == .off, !recordingRequested, !prewarmStarting, !isCancelled() else { return }
+        cancelIdleGuard()
         let token = CaptureEpoch()
         epoch = token
         prewarmStarting = true
@@ -101,6 +135,7 @@ public final class CaptureLifecycle {
     }
 
     private func prepareRecording(at time: TimeInterval) -> CaptureEpoch {
+        cancelIdleGuard()
         let token = CaptureEpoch()
         epoch = token
         prewarmStarting = false
@@ -143,7 +178,11 @@ public final class CaptureLifecycle {
     private func cleanLateStart() {
         // A replaced operation may already own the running engine. The recorder's
         // epoch rejects stale hardware work; only clean idle here.
-        if !recordingRequested, warmup.phase == .off { _ = stopEngine() }
+        if !recordingRequested, warmup.phase == .off {
+            _ = stopEngine()
+            releaseEngine()
+            armIdleGuard()
+        }
     }
     private func stopEngine() -> [Float] {
         do { return try captureObjC { engine.stop() } }
@@ -285,8 +324,10 @@ public final class CaptureLifecycle {
         recordingRequested = false
         prewarmStarting = false
         let samples = stopEngine()
+        releaseEngine()
         warmup.stopped()
         cancelPrewarm()
+        armIdleGuard()
         dropHooks?()
         return samples
     }
