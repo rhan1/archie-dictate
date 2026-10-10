@@ -8,6 +8,7 @@ let package = Package(
     name: "Dictate",
     platforms: [.macOS("26.0")],
     products: [
+        .library(name: "DictateKit", targets: ["DictateCore", "DictateAppKit"]),
         .executable(name: "Dictate", targets: ["DictateApp"]),
     ],
     targets: [
