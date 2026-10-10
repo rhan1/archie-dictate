@@ -12,12 +12,12 @@ struct KeychainToolReaderTests {
     // The default read goes through /usr/bin/security (stable identity across rebuilds: no keychain dialog).
     @Test func readsThroughTheSecurityTool() throws {
         let calls = Calls()
-        let reader = KeychainToolReader(account: "razakhan") { exe, args in
+        let reader = KeychainToolReader(account: "dictate-user") { exe, args in
             calls.add(exe, args); return KeychainToolReader.Output(status: 0, stdout: "gsk_fixture\n")
         }
         #expect(try reader.read(service: "groq-api") == "gsk_fixture")
         #expect(calls.items.first?.0 == "/usr/bin/security")
-        #expect(calls.items.first?.1 == ["find-generic-password", "-s", "groq-api", "-a", "razakhan", "-w"])
+        #expect(calls.items.first?.1 == ["find-generic-password", "-s", "groq-api", "-a", "dictate-user", "-w"])
     }
 
     @Test func failureOrEmptyIsMissingKey() {

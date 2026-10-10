@@ -125,6 +125,9 @@ analyse() {
 main() {
     local REPO
     REPO="$(cd "$(dirname "$0")/.." && pwd)"
+    # Same pinned toolchain as make-app.sh / bench.sh; plain `swift` only if it is missing.
+    SW="$HOME/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift"
+    [[ -x "$SW" ]] || SW=swift
 
     local LOG="$HOME/Library/Logs/Dictate/dictate.stderr.log"
     local START_LINES=0
@@ -135,7 +138,7 @@ main() {
 
     local PROBE_LOG="/tmp/bt-proof.probe.log"
     local PID=""
-    swift "$REPO/tools/probes/bt-probe.swift" 75 > "$PROBE_LOG" 2>/dev/null &
+    "$SW" "$REPO/tools/probes/bt-probe.swift" 75 > "$PROBE_LOG" 2>/dev/null &
     PID=$!
     trap 'kill $PID 2>/dev/null' EXIT
 
