@@ -63,6 +63,8 @@ public final class AppController {
     private var recordingStarted: Date?
     private var btStart = "none"
     private var btEndNotePending = false
+    private var foreignHFP = ForeignHFPLatch()
+    private var foreignHFPPoll: Timer?
     private var recordingTarget: InsertionTarget?
     private var lastDictation: String?
     private var lastDictationTimer: Timer?
@@ -143,7 +145,11 @@ public final class AppController {
 
         let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         let tapOK = hotkeys.start()
-        AppController.note("started pid=\(getpid()) accessibility=\(trusted) eventTap=\(tapOK) promptChars=\(prompt.count) fake=\(fakeTranscript != nil)")
+        AppController.note("started pid=\(getpid()) accessibility=\(trusted) eventTap=\(tapOK) promptChars=\(prompt.count) fake=\(fakeTranscript != nil) bt_profile=\(BluetoothProfile.sample())")
+        // Property reads only; never opens a device.
+        foreignHFPPoll = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkForeignHFP(BluetoothProfile.sample()) }
+        }
         if !tapOK {
             // Without the grant there is no tap; retry quietly until the user approves.
             retryTapUntilGranted()
@@ -195,6 +201,11 @@ public final class AppController {
         doubleTap()
     }
     func engineFinish() { finishButton() }
+    func engineRecoverStaleMute() -> String? {
+        guard let event = muter.recoverIfNeeded() else { return nil }
+        AppController.note("media=\(event.rawValue) (host launch)")
+        return event.rawValue
+    }
     func engineCancel() { cancel() }
     func engineEscape() { escape() }
     func engineHotkey(_ signal: TapSignal) { hotkey(signal) }
@@ -323,6 +334,12 @@ public final class AppController {
         }
     }
 
+    private func checkForeignHFP(_ profile: String) {
+        if foreignHFP.observe(profile: profile, engineAllocated: recorder.isAllocated, idle: machine.state == .idle) {
+            Self.note("bt_hfp_foreign=1 bt_profile=\(profile) engine_allocated=false")
+        }
+    }
+
     private func configureCapture() {
         capture.note = { AppController.note($0) }
         capture.dropHooks = { [weak self] in
@@ -332,7 +349,9 @@ public final class AppController {
             self.btEndNotePending = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self else { return }
-                Self.note("bt_after3s=\(BluetoothProfile.sample()) engine_allocated=\(self.recorder.isAllocated)")
+                let profile = BluetoothProfile.sample()
+                Self.note("bt_after3s=\(profile) bt_profile=\(profile) engine_allocated=\(self.recorder.isAllocated)")
+                self.checkForeignHFP(profile)
             }
         }
         capture.onEpochChanged = { [weak self] token in
