@@ -59,12 +59,12 @@ struct CaptureHealthTests {
 
     // MARK: builtin_dies_headset_zeros (10-12 21:33)
 
-    @Test func builtinDiesHeadsetZerosFailsWithin2sOfLastDelivery() {
+    @Test func builtinDiesHeadsetZerosFailsWithin2sOfLastDelivery() throws {
         var rig = Rig()
         for i in 0..<40 { rig.step(builtin: i < 5 ? Self.tone() : nil, headset: Self.zeros) }
         // Last useful delivery: the 5th built-in buffer, arriving at 10.5.
         #expect(rig.failures.count == 1)
-        let (at, failure) = rig.failures[0]
+        let (at, failure) = try #require(rig.failures.first)
         #expect(at <= 10.5 + CaptureHealth.failAfter + 0.0001)
         #expect(failure.reason == .micDead && failure.health == .staleBuiltin)
         // Real bytes so far (the built-in's speech, then the headset's zeros it fell back to), never 0.
@@ -96,7 +96,7 @@ struct CaptureHealthTests {
         for i in 0..<10 { rig.step(builtin: Self.tone(), headset: i < 10 ? Self.tone() : nil) }
         for _ in 0..<40 { rig.step() }                                   // no buffers at all: ticks only
         #expect(rig.failures.count == 1)
-        #expect(rig.failures[0].0 <= 11.0 + CaptureHealth.failAfter + 0.0001)
+        #expect((rig.failures.first?.0 ?? 99) <= 11.0 + CaptureHealth.failAfter + 0.0001)
     }
 
     @Test func freshBuffersEvery100msKeepCaptureHealthyGreen() {
@@ -110,8 +110,8 @@ struct CaptureHealthTests {
         var rig = Rig()
         for _ in 0..<40 { rig.step() }
         #expect(rig.failures.count == 1)
-        #expect(abs(rig.failures[0].0 - (10 + CaptureHealth.failAfter)) < 0.0001)
-        #expect(rig.failures[0].1.health == .noInput && rig.failures[0].1.bytes == 44)
+        #expect(abs((rig.failures.first?.0 ?? 99) - (10 + CaptureHealth.failAfter)) < 0.0001)
+        #expect(rig.failures.first?.1.health == .noInput && rig.failures.first?.1.bytes == 44)
         #expect(rig.warns.first?.1 == .noInput)
     }
 
@@ -126,8 +126,8 @@ struct CaptureHealthTests {
     @Test func builtinExactZerosWithHeadsetZerosFails() {
         var rig = Rig()
         for i in 0..<40 { rig.step(builtin: i < 5 ? Self.tone() : Self.zeros, headset: Self.zeros) }
-        #expect(rig.failures.count == 1 && rig.failures[0].1.health == .zeros)
-        #expect(rig.failures[0].0 <= 10.5 + CaptureHealth.failAfter + 0.0001)
+        #expect(rig.failures.count == 1 && rig.failures.first?.1.health == .zeros)
+        #expect((rig.failures.first?.0 ?? 99) <= 10.5 + CaptureHealth.failAfter + 0.0001)
     }
 
     @Test func quietSpeechAndATwoSecondPauseAreNeverAFaultGreen() {
@@ -191,6 +191,16 @@ struct CaptureHealthTests {
         #expect(rig.feed.bridge.builtinFramesAfterFallback == 0)
     }
 
+    @Test func fallbackOntoABuiltinSilentFor400msIsRefusedRed() {
+        // Not dead yet (stale needs 600 ms) but not fresh (300 ms): the 1.5 s fallback decision
+        // falls exactly in that gap, so only the freshness gate can refuse it.
+        var rig = Rig()
+        for i in 0..<15 { rig.step(builtin: i < 11 ? Self.tone() : nil, headset: Self.zeros) }
+        #expect(rig.stopBuiltin.isEmpty)                                 // the clock has not called it dead
+        #expect(!rig.events.contains(.fallback) && rig.refused == 1 && rig.fallbackFresh == [false])
+        #expect(rig.feed.bridge.bridgeSource == "builtin")
+    }
+
     @Test func fallbackOntoAFreshBuiltinIsTakenGreen() {
         var rig = Rig()
         for _ in 0..<20 { rig.step(builtin: Self.tone(), headset: Self.zeros) }
@@ -217,7 +227,7 @@ struct CaptureHealthTests {
             let headset = i == 20 ? Array(Self.tone().prefix(1_200)) + Array(Self.zeros.prefix(1_200)) : Self.zeros
             rig.step(builtin: i < 20 ? Self.tone() : nil, headset: headset)
         }
-        #expect(rig.failures.count == 1 && rig.failures[0].1.reason == .micDead)
+        #expect(rig.failures.count == 1 && rig.failures.first?.1.reason == .micDead)
     }
 
     // MARK: framework_stops_before_notification
