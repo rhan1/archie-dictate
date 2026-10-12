@@ -1,0 +1,11 @@
+# Archived failure 213310_213346
+2026-10-12 21:33:10.695 Df Archie[95017:235c292d] [com.razakhan.archie:voice] dict_start host=archie mic_auth=authorized ax_trusted=true
+2026-10-12 21:33:11.180 Df coreaudiod[409:36484432] [com.apple.bluetooth:BTAudio] [58:18:62:21:1C:6A-output ]  tsco, Profile Transport operation completed operaton type = Creation
+2026-10-12 21:33:11.180 Df coreaudiod[409:36484432] [com.apple.bluetooth:BTAudio] [58:18:62:21:1C:6A-output ]  tsco, Profile Transport operation completed operaton type = Creation
+2026-10-12 21:33:11.381 Df coreaudiod[409:364844b5] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-12 21:33:11.392 Df coreaudiod[409:364844b7] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-12 21:33:11.410 Df coreaudiod[409:364843fc] [com.apple.bluetooth:BTAudio] [58:18:62:21:1C:6A-output ]  tsco, Profile Transport operation completed operaton type = Disconnection
+2026-10-12 21:33:13.094 Df Archie[95017:36484417] [com.razakhan.archie:voice] dk [2026-10-12T13:33:13Z] dictate: bridge_src=builtin_fallback reason=headset_digital_silence
+2026-10-12 21:33:44.000 duration=33.9s bytes=13786 latency_ms=0 chars=0 app=dev.warp.Warp-Stable outcome=error:silence
+2026-10-12 21:33:44.652 Df Archie[95017:235c292d] [com.razakhan.archie:voice] dict_levels n=3 max=0.0490 mean=0.0163 outcome=error:no speech
+2026-10-12 21:33:44.652 Df Archie[95017:235c292d] [com.razakhan.archie:voice] dict_bridge bridge_src=builtin_fallback reason=headset_digital_silence headset_restart=1 result=still_silent bridge_device_check=ok
