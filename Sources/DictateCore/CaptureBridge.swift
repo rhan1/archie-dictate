@@ -27,6 +27,9 @@ public struct CaptureBridge {
         /// H2: the headset has been digitally silent long enough to restart it once.
         public var restartHeadset = false
         public var event: Event?
+        /// v1.8: the headset gave up but the built-in was not fresh, so no fallback was taken
+        /// (a dead built-in cannot be a fallback; the health clock decides what happens next).
+        public var fallbackRefused = false
     }
     /// A 24 kHz batch whose peak is below this is digital silence (an eSCO drop injects zeros).
     public static let silencePeak: Float = 1e-4
@@ -49,6 +52,8 @@ public struct CaptureBridge {
     /// Built-in frames accepted (ring or dictation); 0 means the bridge carried nothing.
     public private(set) var builtinFrames = 0
     public private(set) var switchbacks = 0
+    /// v1.8: built-in frames fed while in `.fallback` (bt-proof: `builtin_frames_after_fallback`).
+    public private(set) var builtinFramesAfterFallback = 0
     /// H2: nil until a restart was requested, then whether the headset delivered signal after it.
     public private(set) var restart: HeadsetRestartState?
     private var recordingStart: TimeInterval?
@@ -68,6 +73,7 @@ public struct CaptureBridge {
     private var staleSwitchback = false
     private var headsetSignalFrames = 0
     private var headsetSilentFrames = 0
+    private var fallbackRefusedNoted = false
     public init() {}
 
     /// Timeline reason: a skip, a fallback, or a bridge whose built-in engine delivered no audio.
@@ -102,14 +108,16 @@ public struct CaptureBridge {
     }
 
     /// `peak` is the buffer's largest absolute sample; the default treats it as signal.
+    /// `builtinFresh` (v1.8): the built-in delivered recently with signal (CaptureHealth); a
+    /// fallback or switchback to a built-in that is not fresh is refused.
     public mutating func buffer(source: Source, at time: TimeInterval, frames: Int,
                                 arrivedAt: TimeInterval? = nil, epoch token: CaptureEpoch? = nil,
-                                peak: Float = 1) -> Decision {
+                                peak: Float = 1, builtinFresh: Bool = true) -> Decision {
         if let token, token !== epoch { return Decision() }
         guard state != .off, frames > 0 else { return Decision() }
         var result = Decision()
         if source == .headset, bluetooth { arbitrate(&result, at: time, frames: frames,
-                                                     arrivedAt: arrivedAt, peak: peak) }
+                                                     arrivedAt: arrivedAt, peak: peak, builtinFresh: builtinFresh) }
         let end = time + Double(frames) / Self.rate
         if source == .builtin, state == .builtinOnly, let first = firstHeadsetTime, end - first >= Self.fallbackAfter {
             fallBack(&result)
@@ -133,6 +141,7 @@ public struct CaptureBridge {
         if accepted > 0 {
             fedThrough = max(boundary ?? time, time + Double(frames) / Self.rate)
             if source == .builtin { builtinFrames += accepted }
+            if source == .builtin, state == .fallback, recordingStart != nil { builtinFramesAfterFallback += accepted }
         }
         guard recordingStart != nil else { result.framesToRing = accepted; return result }
         result.framesToFeed = accepted
@@ -144,7 +153,7 @@ public struct CaptureBridge {
 
     /// Headset content decides takeover, fallback, switchback and the one restart.
     private mutating func arbitrate(_ result: inout Decision, at time: TimeInterval, frames: Int,
-                                    arrivedAt: TimeInterval?, peak: Float) {
+                                    arrivedAt: TimeInterval?, peak: Float, builtinFresh: Bool) {
         if firstHeadsetTime == nil { firstHeadsetTime = time }
         lastHeadsetEnd = time + Double(frames) / Self.rate
         if peak >= Self.silencePeak {
@@ -168,10 +177,12 @@ public struct CaptureBridge {
                 }
             } else if let first = firstHeadsetTime,
                       time + Double(frames) / Self.rate - first >= Self.fallbackAfter {
-                fallBack(&result)
+                if builtinFresh { fallBack(&result) }
+                else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
             }
         case .switched where builtinAlive && silent > Self.switchbackAfter:
-            switchBack(&result)
+            if builtinFresh { switchBack(&result) }
+            else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
         case .fallback where staleSwitchback && signal >= Self.takeoverSignal:
             state = .switched                    // the recovered headset carries again
             staleSwitchback = false
@@ -213,6 +224,36 @@ public struct CaptureBridge {
         case .off: return nil
         }
         return result.event
+    }
+
+    /// v1.8 (L2): the health clock found the carrying built-in dead or transport-silent and the
+    /// headset fresh with signal: the headset carries (either direction; `.fallback` no longer latches).
+    public mutating func takeOver() {
+        guard state == .builtinOnly || state == .fallback else { return }
+        state = .switched
+        staleSwitchback = false
+        if bridgeMs == nil, let tap = tapTime, let last = lastHeadsetEnd { bridgeMs = max(0, Int(((last - tap) * 1000).rounded())) }
+    }
+
+    /// v1.8 (L2): the carrying headset went stale or transport-silent on the health clock and a
+    /// fresh built-in takes over. A stale (not zero) headset may take over again when it returns.
+    public mutating func headsetStalled(stale: Bool) {
+        guard canSwitchBack else { return }
+        var result = Decision()
+        switchBack(&result)
+        staleSwitchback = stale
+    }
+
+    /// v1.8: the built-in died mid-dictation (stale, drift, device lost). Unlike a failed
+    /// start, the bridge label stays: it did carry this dictation.
+    public mutating func builtinDied() {
+        builtinAlive = false
+        switch state {
+        case .builtinOnly, .fallback:
+            state = .switched
+            skipReason = skipReason ?? "builtin_dead"
+        default: break
+        }
     }
 
     /// The headset carries and the built-in could take over again.
