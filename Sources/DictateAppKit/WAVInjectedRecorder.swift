@@ -49,6 +49,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public let url: URL
     public let pace: Double
     public let scenario: Scenario
+    /// Test harness (v1.10): media time after the boundary at which the media clock stops (no more
+    /// frames, health ticks or notes). A starved test thread can no longer let the clock run past
+    /// the WAV into zeros (10-13: `health=warn reason=zeros` at media 7.4–13.1 s of a 7 s WAV).
+    public var mediaLimit: TimeInterval?
     /// Diagnostics sink (the engine's notes by default); tests keep their notes local.
     public var note: (String) -> Void = { AppController.note($0) }
 
@@ -58,6 +62,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public var onCaptureFailure: ((CaptureFailure) -> Void)?
 
     public private(set) var stats: AudioRecorder.CaptureStats
+    /// The evidence's RMS series at the last stop (counts-only levels; tests replay it).
+    public private(set) var levelEnvelope: [Float] = []
     public var bridgeHasAudio: Bool { false }
 
     public var isRunning: Bool { lock.withLock { timer != nil } }
@@ -319,7 +325,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     private func tick() {
         lock.lock()
-        guard timer != nil else {
+        guard timer != nil, mediaLimit.map({ mediaTime - boundary < $0 - 1e-9 }) ?? true else {
             lock.unlock()
             return
         }
@@ -444,6 +450,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             }
             stats.captureIntervals = feed.evidence.intervalsNote
             stats.speechSections = feed.evidence.finalSpeechSections
+            levelEnvelope = feed.evidence.levelEnvelope
             stats.recordingMs = max(0, Int(((mediaTime - boundary) * 1000).rounded()))
             if scenario == .scoTornDown250ms {
                 advanceIO(to: mediaTime - boundary)
