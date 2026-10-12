@@ -86,6 +86,12 @@ public final class AppController {
     private var captureFailure: CaptureFailure?
     /// v1.8 (L4): `session=<id>` correlates this dictation's notes with its outcome in bt-proof.
     private var openSession: (id: String, stats: AudioRecorder.CaptureStats?)?
+    /// Tests: this controller's session/failure notes (the process-wide note sink is shared).
+    var onSessionNote: ((String) -> Void)?
+    private func sessionNote(_ line: String) {
+        Self.note(line)
+        onSessionNote?(line)
+    }
 
     public convenience init() {
         self.init(keyStore: KeyStore(), paths: AppPaths(), surface: .pill, mode: .dictate)
@@ -445,7 +451,7 @@ public final class AppController {
             self.captureFailure = nil
             // v1.8 (L2): the health clock heard nothing: `error:mic_dead` with what was really kept.
             if let failure, failure.reason == .micDead {
-                Self.note(failure.note)
+                self.sessionNote(failure.note)
                 self.fail(reason: CaptureFailure.Reason.micDead.rawValue, duration: failure.durationSeconds,
                           bytes: failure.bytes, latencyMs: 0)
                 return
@@ -573,7 +579,7 @@ public final class AppController {
         if let stale = openSession { noteSessionEnd(id: stale.id, stats: stale.stats ?? recorder.stats, outcome: "abandoned", entry: nil) }
         let session = String(UUID().uuidString.prefix(8)).lowercased()
         openSession = (session, nil)
-        Self.note("session=\(session) event=start")
+        sessionNote("session=\(session) event=start")
         btStart = BluetoothProfile.sample()
         btEndNotePending = true
         recordingStarted = Date()
@@ -1077,7 +1083,7 @@ public final class AppController {
         line += " recording_ms=\(stats.recordingMs) capture_intervals=\(stats.captureIntervals)"
         line += " speech_sections=\(stats.speechSections) builtin_frames_after_fallback=\(stats.builtinFramesAfterFallback)"
         if let backend = stats.builtinBackend { line += " builtin_backend=\(backend)" }
-        Self.note(line)
+        sessionNote(line)
     }
 
     private func traceFocus(_ event: String) {
