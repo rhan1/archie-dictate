@@ -122,4 +122,50 @@ struct HeadsetRecoveryTests {
         #expect(admissions == [.now, .now, .now, .now])
         #expect(episode.attempts == 4)
     }
+
+    // MARK: v1.9 L1 — win the SCO race
+
+    @Test func autostopThenImmediateReattach() {
+        // 10-13 01:53:08: AVAudioEngine auto-stopped; v1.8 debounced the re-attach 200 ms and lost
+        // the race with coreaudiod's idle-route teardown (~250 ms after SCO connected).
+        var episode = BluetoothRecoveryEpisode(bluetooth: true)
+        episode.formatChanged(at: 10)
+        #expect(episode.request(.configuration, at: 10, engineStopped: true) == .now)
+        #expect(episode.immediateAttempts == 1)
+        let first = episode.begin(at: 10)
+        #expect(first)
+        episode.settled(.silentFrames)
+        // The second attempt keeps the debounce and the one-restart-per-window rule.
+        episode.formatChanged(at: 10.3)
+        guard case .after(let wait) = episode.request(.configuration, at: 10.3, engineStopped: true) else {
+            Issue.record("second attempt not debounced"); return
+        }
+        #expect(abs(wait - 1.2) < 1e-9)                                     // next window opens at 11.5
+        #expect(episode.immediateAttempts == 1)
+    }
+
+    @Test func aRunningEngineKeepsTheDebounce() {
+        var episode = BluetoothRecoveryEpisode(bluetooth: true)
+        episode.formatChanged(at: 10)
+        guard case .after(let wait) = episode.request(.configuration, at: 10, engineStopped: false) else {
+            Issue.record("running engine not debounced"); return
+        }
+        #expect(abs(wait - BluetoothRecoveryEpisode.stableFor) < 1e-9)
+        var other = BluetoothRecoveryEpisode(bluetooth: true)       // other paths never take the fast path
+        other.formatChanged(at: 10)
+        guard case .after(let restartWait) = other.request(.restart, at: 10, engineStopped: true) else {
+            Issue.record("restart path not debounced"); return
+        }
+        #expect(abs(restartWait - BluetoothRecoveryEpisode.stableFor) < 1e-9)
+        #expect(other.immediateAttempts == 0)
+    }
+
+    @Test func zerosAreNotFrames() {
+        let v = BluetoothRecoveryEpisode.verdict
+        #expect(v(10, 10.1, nil) == .silentFrames)                   // buffers, all digital zeros
+        #expect(v(10, 10.1, 10.4) == .frames)
+        #expect(v(10, 10.1, 11.2) == .silentFrames)                  // signal too late for this attempt
+        #expect(v(10, nil, nil) == .noFrames)
+        #expect(BluetoothRecoveryEpisode.Outcome.silentFrames.rawValue == "silent_frames")
+    }
 }

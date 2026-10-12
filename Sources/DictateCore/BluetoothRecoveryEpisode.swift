@@ -28,6 +28,12 @@ public enum RecoveryAdmission: Equatable, Sendable {
 /// stable for `stableFor` (that debounce is bounded by the window, so a notification storm
 /// cannot defer it forever). A restart succeeds when frames arrive within `successWithin`,
 /// not when `start()` returns. Configuration notifications only record state.
+///
+/// v1.9 (L1): when the configuration notification finds the engine already stopped (AVAudioEngine
+/// auto-stopped it on the A2DP→HFP switch), the episode's FIRST attempt is immediate: the idle
+/// SCO route is torn down ~250 ms after it connects unless a client is doing IO (10-13 01:53:08:
+/// connected .501, our notification .542, "Sco route is disabled" .755; v1.8's 200 ms debounce
+/// put IO back only at .876). Every later attempt keeps the debounce and the window.
 public struct BluetoothRecoveryEpisode: Sendable {
     public static let window: TimeInterval = 1.5
     public static let stableFor: TimeInterval = 0.2
@@ -46,7 +52,17 @@ public struct BluetoothRecoveryEpisode: Sendable {
         case exhausted
     }
     public enum Outcome: String, Sendable {
-        case frames, noFrames = "no_frames", skipped, failed, externalBusy = "external_busy"
+        /// `silentFrames` (v1.9): buffers arrived, but all digital zeros (an idle SCO route
+        /// injects silence) — not a recovered headset; the episode treats it like `noFrames`.
+        case frames, silentFrames = "silent_frames", noFrames = "no_frames", skipped, failed, externalBusy = "external_busy"
+    }
+
+    /// v1.9 (L1): an attempt succeeded only if a buffer with signal (peak ≥
+    /// `CaptureBridge.silencePeak`) arrived within `successWithin` of `since`; zeros never count.
+    public static func verdict(since: TimeInterval, firstFrame: TimeInterval?, firstSignal: TimeInterval?) -> Outcome {
+        if let firstSignal, firstSignal <= since + successWithin { return .frames }
+        if let firstFrame, firstFrame <= since + successWithin { return .silentFrames }
+        return .noFrames
     }
 
     public let bluetooth: Bool
@@ -54,6 +70,8 @@ public struct BluetoothRecoveryEpisode: Sendable {
     public private(set) var requests = 0
     public private(set) var outcomes: [Outcome] = []
     public private(set) var externalBusySeen = false
+    /// v1.9: first attempts admitted without the debounce (engine auto-stopped).
+    public private(set) var immediateAttempts = 0
     private var attemptsAfterBusy = 0
     private var windowStart: TimeInterval?
     private var usedInWindow = false
@@ -67,11 +85,19 @@ public struct BluetoothRecoveryEpisode: Sendable {
     /// A configuration notification: recorded, never acted on directly.
     public mutating func formatChanged(at time: TimeInterval) { lastFormatChange = time }
 
-    public mutating func request(_ path: RecoveryPath, at now: TimeInterval) -> Admission {
+    /// `engineStopped` (v1.9): a configuration notification found the headset engine no longer
+    /// running; the episode's first attempt is then admitted now, without the debounce.
+    public mutating func request(_ path: RecoveryPath, at now: TimeInterval, engineStopped: Bool = false) -> Admission {
         requests += 1
         guard bluetooth else { attempts += 1; return .now }
         if pendingDue != nil || running { return .coalesced }
         if attempts >= Self.maxAttempts || (externalBusySeen && attemptsAfterBusy >= 1) { return .exhausted }
+        if path == .configuration, engineStopped, attempts == 0, windowStart == nil {
+            immediateAttempts += 1
+            windowStart = now
+            pendingDue = now
+            return .now
+        }
         if let start = windowStart, now >= start + Self.window { windowStart = nil; usedInWindow = false }
         let stable = lastFormatChange.map { $0 + Self.stableFor } ?? now
         let due: TimeInterval

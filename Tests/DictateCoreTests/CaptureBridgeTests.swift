@@ -254,7 +254,10 @@ struct CaptureBridgeTests {
         #expect(feed.bridge.state == .switched && feed.bridge.bridgeSource == "builtin")
     }
 
-    @Test func zerosFor1500msKeepTheBuiltinForTheWholeDictation() {
+    /// v1.7 latched the fallback for the whole dictation (this test asserted signal from 12.5 s was
+    /// ignored). v1.9 (L1, decision D7): a headset that recovers carries again — tonight's runs
+    /// recovered ~0.4 s after the fallback and the distant built-in carried everything anyway.
+    @Test func zerosFor1500msFallBackThenARecoveredHeadsetCarriesAgain() {
         var feed = feedStarted()
         var fed = 0, events: [CaptureBridge.Event] = []
         for i in 0..<40 {                                                   // 4 s of both sources
@@ -263,10 +266,11 @@ struct CaptureBridgeTests {
             let h = feed.accept(i < 25 ? zeros : tone(0.05), source: .headset, at: t)  // signal from 12.5 s
             fed += b.frames.count + h.frames.count
             events += [b.event, h.event].compactMap { $0 }
-            #expect(!h.releaseBuiltin && h.frames.isEmpty)
+            #expect(!h.releaseBuiltin)
+            if i < 26 { #expect(h.frames.isEmpty) }                        // 150 ms of signal before it carries
         }
-        #expect(events == [.fallback])
-        #expect(feed.bridge.state == .fallback && feed.bridge.bridgeSource == "builtin_fallback")
+        #expect(events == [.fallback, .recovered])
+        #expect(feed.bridge.state == .switched && feed.bridge.bridgeSource == "builtin_fallback")
         #expect(feed.bridge.reason == "headset_digital_silence")
         #expect(fed == 40 * 2400)                                          // no gap, no duplicate
     }
@@ -500,4 +504,28 @@ struct CaptureBridgeTests {
         }
         #expect(node.aligns == 0 && node.rebuilds == 1)
     }
+
+    /// v1.9 L1: tonight the headset's second recovery delivered signal ~0.4 s after the 1.5 s
+    /// digital-silence fallback (R1 10.321 → 10.785); v1.8 kept the distant built-in to the end.
+    @Test func recoveredHeadsetRetakesADigitalSilenceFallback() {
+        var b = bridge()
+        var time = 10.0
+        var events: [CaptureBridge.Event] = []
+        func step(headsetPeak: Float) {
+            if let e = b.buffer(source: .builtin, at: time, frames: 2400).event { events.append(e) }
+            if let e = b.buffer(source: .headset, at: time, frames: 2400, peak: headsetPeak).event { events.append(e) }
+            time += 0.1
+        }
+        for _ in 0..<16 { step(headsetPeak: 0) }
+        #expect(events == [.fallback] && b.state == .fallback)
+        for _ in 0..<2 { step(headsetPeak: 0.2) }
+        #expect(events == [.fallback, .recovered])
+        #expect(b.state == .switched && b.headsetRetakes == 1)
+        let fed = b.buffer(source: .headset, at: time, frames: 2400, peak: 0.2)
+        #expect(fed.framesToFeed == 2400)                            // the headset carries
+        time += 0.1
+        for _ in 0..<7 { step(headsetPeak: 0) }                      // zeros again: the built-in takes over
+        #expect(events == [.fallback, .recovered, .switchback])
+    }
+
 }
