@@ -22,10 +22,12 @@ private final class Apple: EngineAppleSession, @unchecked Sendable {
 }
 private actor HTTP: HTTPTransport {
     let text: String
+    let delay: UInt64
     private(set) var requests = 0
-    init(_ text: String) { self.text = text }
+    init(_ text: String, delayMs: UInt64 = 0) { self.text = text; self.delay = delayMs * 1_000_000 }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         requests += 1
+        if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
         let payload: [String: Any] = request.url!.path.contains("transcriptions") ? ["text": text] :
             ["choices": [["finish_reason": "stop", "message": ["content": text]]]]
         return (try JSONSerialization.data(withJSONObject: payload),
@@ -251,6 +253,44 @@ struct MicDeadTests {
                 #expect(last == "BT-PROOF: PASS")
             }
         }
+    }
+
+    /// N3 (re-review): Escape while the outcome is still transcribing closes that session exactly
+    /// once (as `cancel`); the abandoned transcription closes nothing.
+    @Test func cancelDuringTranscriptionClosesTheSessionOnce() async throws {
+        let (dir, url) = try wav(seconds: 3)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let paths = AppPaths(home: dir.appendingPathComponent("home"))
+        let keys = KeyStore(reader: { _ in "fixture" })
+        keys.prefetch(services: ["groq-api"])
+        try await waitFor { keys.key(for: "groq-api") != nil }
+        let clipboard = NSPasteboard(name: .init("dictate-cancel-\(UUID().uuidString)"))
+        defer { clipboard.releaseGlobally() }
+        let recorder = WAVInjectedRecorder(url: url, pace: 0.05)
+        recorder.note = { _ in }
+        let stt = HTTP("please send the report", delayMs: 400)
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
+            sttTransport: stt, groqCleanupTransport: HTTP(""), localCleanupTransport: HTTP(""),
+            inserter: TextInserter(pasteboard: clipboard, postKeystroke: {}),
+            panelFactory: { Panel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .captureOnly,
+                                       dependencies: dependencies)
+        let notes = Lines()
+        controller.onSessionNote = { notes.add($0) }
+        let engine = DictationEngine(controller: controller)
+        var states: [DictateAppKit.DictationState] = []
+        engine.onState = { states.append($0) }
+        engine.start()
+        try await Task.sleep(nanoseconds: 60_000_000)
+        engine.finish()
+        try await waitFor { states.contains(.transcribing) }
+        engine.cancel()                                                      // Escape while transcribing
+        try await Task.sleep(nanoseconds: 900_000_000)                       // the slow STT has returned by now
+        let ends = notes.snapshot.filter { $0.contains("event=end") }
+        #expect(ends.count == 1 && ends.first?.contains("outcome=cancel") == true)
+        let log = try String(contentsOf: paths.logURL, encoding: .utf8).split(separator: "\n")
+        #expect(log.count == 1 && log.first?.contains("outcome=cancel") == true)
     }
 
     /// mic_dead_propagates_to_host: health failure → lifecycle → controller → dictate.log + pill word,

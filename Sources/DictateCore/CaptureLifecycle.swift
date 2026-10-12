@@ -284,17 +284,20 @@ public final class CaptureLifecycle {
         return await runAsync(at: time, chain: MicStartChain(), start: start, rebuild: rebuild,
                               wait: wait, isCancelled: isCancelled, token: token)
     }
+    /// `admitted`: the engine already admitted this retry (first-buffer path); it is not asked twice.
     @MainActor private func runAsync(at time: TimeInterval, chain initial: MicStartChain,
         start: @escaping (MicChoice) async throws -> Void, rebuild: @escaping () async throws -> Void,
         wait: @escaping (TimeInterval) async -> Void, isCancelled: @escaping () -> Bool,
-        token: CaptureEpoch) async -> Bool {
+        token: CaptureEpoch, admitted: Bool = false) async -> Bool {
         var chain = initial
+        var admitted = admitted
         while chain.isAttempt {
             guard epoch === token, !isCancelled() else { cleanLateStart(); return false }
             do {
                 // v1.8 (L3): the engine admits a retry BEFORE any hardware is touched.
                 var delay = chain.delay
-                if chain.step == .retry {
+                if chain.step == .retry, admitted { admitted = false }
+                else if chain.step == .retry {
                     switch engine.recoveryAdmission(.startRetry) {
                     case .proceed(let after): delay = max(delay, after)
                     case .skip:
@@ -332,7 +335,8 @@ public final class CaptureLifecycle {
                         self.failedAttempt(self.timeoutError, chain: &next)
                         if !next.isAttempt { self.terminalFailure(); return }
                         _ = await self.runAsync(at: time, chain: next, start: start, rebuild: rebuild,
-                                               wait: wait, isCancelled: isCancelled, token: token)
+                                               wait: wait, isCancelled: isCancelled, token: token,
+                                               admitted: next.step == .retry)
                     }
                 }
                 return true
