@@ -165,6 +165,21 @@ struct CleanupTests {
         let cleaner = TranscriptCleaner(transport: CannedTransport(), vocabulary: "", apiKey: { "k" })
         #expect(cleaner.makeRequest(text: "x", apiKey: "k").timeoutInterval == 2.5)
     }
+
+    @Test func promptKeepsSentenceInitialHey() async throws {
+        let example = #""Hey, um, so for the launch" → "Hey, so for the launch""#
+        #expect(TranscriptCleaner.instructions.contains(example))
+        #expect(TranscriptCleaner.midInstructions.contains(example))
+
+        let transport = CannedTransport(body: completion("Hey, so for the launch."))
+        let cleaner = TranscriptCleaner(transport: transport, vocabulary: "", apiKey: { "k" })
+        _ = try await cleaner.clean("Hey, um, so for the launch")
+        let request = try #require(transport.last)
+        let body = try #require(try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+        let messages = try #require(body["messages"] as? [[String: String]])
+        let systemMessage = try #require(messages.first(where: { $0["role"] == "system" })?["content"])
+        #expect(systemMessage.contains("Hey, um, so for the launch"))
+    }
 }
 
 @Suite("LogLineV11")
