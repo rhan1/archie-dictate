@@ -586,4 +586,33 @@ struct CaptureHealthTests {
         #expect(engine.admissions == [.startRetry] && engine.rebuilds == 1 && engine.starts == 2 && engine.isRunning)
         lifecycle.end(.cancel)
     }
+
+    /// N1 (re-review): an admitted first-buffer retry is executed, not refused by a second admission.
+    private final class SilentHeadsetEngine: CaptureEngine {
+        var starts = 0, rebuilds = 0, admissions: [RecoveryPath] = []
+        var isRunning = false
+        var isAllocated = false
+        func release() { isRunning = false }
+        func start(device: MicChoice) throws { starts += 1; isRunning = true }      // starts, never delivers
+        func stop() -> [Float] { isRunning = false; return [] }
+        func rebuild() throws { rebuilds += 1 }
+        func recoveryAdmission(_ path: RecoveryPath) -> RecoveryAdmission {
+            admissions.append(path)
+            return path == .firstBuffer ? .proceed(after: 0) : .skip                  // a second ask would coalesce
+        }
+    }
+
+    @MainActor @Test func admittedFirstBufferRetryRunsExactlyOnce() async {
+        let engine = SilentHeadsetEngine()
+        let clock = RedTeamClock()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: clock)
+        let ready = await lifecycle.beginRecordingAsync(at: 0, start: { try engine.start(device: $0) },
+            rebuild: { try engine.rebuild() }, wait: { _ in }, isCancelled: { false })
+        #expect(ready && engine.starts == 1)
+        clock.advance(CaptureLifecycle.firstBufferTimeout + 0.1)
+        for _ in 0..<200 where engine.starts < 2 { await Task.yield() }
+        #expect(engine.admissions == [.firstBuffer])                             // asked once, not twice
+        #expect(engine.rebuilds == 1 && engine.starts == 2)                      // the admitted retry ran
+        lifecycle.end(.cancel)
+    }
 }
