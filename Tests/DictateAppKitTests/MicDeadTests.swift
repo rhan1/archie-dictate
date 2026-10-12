@@ -82,6 +82,7 @@ struct MicDeadRecorderTests {
         var pcm: [Int16] = []
         var failure: CaptureFailure?
         recorder.note = { notes.add($0) }
+        recorder.mediaLimit = mediaSeconds + 0.2          // never past the 7 s WAV, however late stop() runs
         recorder.onPCMChunk = { chunk in pcmLock.withLock { pcm += chunk } }
         recorder.onCaptureFailure = { failure = $0 }
         try recorder.start()

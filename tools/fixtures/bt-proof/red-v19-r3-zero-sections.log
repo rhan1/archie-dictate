@@ -1,0 +1,12 @@
+# Live run R3 (session c35bde97), Archie 38.0 + DictateKit v1.9, 2026-10-13 07:08:25–07:08:40 +08 — speech_sections=0 on a quiet built-in fallback (transcript-free notes; names/timeline lines omitted)
+2026-10-13 07:08:25.519 Df Archie[57913:0x3b8670d0] [com.razakhan.archie:voice] dk [2026-10-12T23:08:25.527Z] dictate: builtin_backend=auhal device=81 bridge_device_check=ok
+2026-10-13 07:08:25.618 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:08:25.626Z] dictate: keys=groq:ok reader=custom
+2026-10-13 07:08:25.618 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:08:25.626Z] dictate: session=c35bde97 event=start
+2026-10-13 07:08:25.626 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:08:25.635Z] dictate: tap2_to_first_kept_buffer_ms=0 kept_src=ring preroll_frames=2296
+2026-10-13 07:08:26.281 Df Archie[57913:0x3b878b3b] [com.razakhan.archie:voice] dk [2026-10-12T23:08:26.289Z] dictate: bt_recovery=immediate path=configuration engine_running=0 after_ms=0
+2026-10-13 07:08:26.639 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:08:26.648Z] dictate: mute_reapplied=1 uid=58-18-62-21-1C-6A:output reason=rate_changed
+2026-10-13 07:08:27.284 Df Archie[57913:0x3b878a8f] [com.razakhan.archie:voice] dk [2026-10-12T23:08:27.293Z] dictate: bt_recovery=settled path=configuration result=silent_frames
+2026-10-13 07:08:27.840 Df Archie[57913:0x3b8789e5] [com.razakhan.archie:voice] dk [2026-10-12T23:08:27.848Z] dictate: bridge_src=builtin_fallback reason=headset_digital_silence
+2026-10-13 07:08:27.840 Df Archie[57913:0x3b8789e5] [com.razakhan.archie:voice] dk [2026-10-12T23:08:27.849Z] dictate: fallback_check builtin_fresh_at_fallback=1 builtin_age_ms=0
+2026-10-13 07:08:39.981 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:08:39.989Z] dictate: mute_reasserted=1
+2026-10-13 07:08:40.226 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:08:40.234Z] dictate: session=c35bde97 event=end outcome=ok duration_ms=13834 bytes=666218 chars=212 recording_ms=13826 capture_intervals=0-13821 speech_sections=0 builtin_frames_after_fallback=277955 builtin_backend=auhal
