@@ -1,9 +1,9 @@
-# Live Protocol — DictateKit v1.8
+# Live Protocol — DictateKit v1.9
 
-This document defines the live verification protocol executed exclusively by Raza after Archie v34 pins DictateKit v1.8. Nobody else runs this protocol.
+This document defines the live verification protocol executed exclusively by Raza after Archie v36 pins DictateKit v1.9. Nobody else runs this protocol.
 
 > [!IMPORTANT]
-> DictateKit v1.8 is unproven on a Bluetooth headset until this live protocol passes. Do not claim verification on hardware beforehand.
+> DictateKit v1.9 is unproven on a Bluetooth headset until this live protocol passes. Do not claim verification on hardware beforehand.
 
 ---
 
@@ -70,6 +70,8 @@ Execute the following eight runs in order:
 | **R6** | Contention | Cold A2DP→HFP transition with Google Chrome playing background audio to the headset. |
 | **R7** | Repeat after cancel | Trigger ⌥⌥, press Esc/cancel, then immediately double-tap ⌥⌥ and dictate the passage. The cancelled session is reported `CANCELLED (excluded)` by bt-proof; the repeat must PASS. |
 | **R8** | Built-in control | Headset powered off / disconnected; recording performed solely on the physical built-in mic. |
+
+R4–R6 need v1.9's L2 (media mute held across the headset's profile flips: `mute_reapplied=` in the timeline); Chrome must be silent on the headset for the whole dictation. Cancel is **Esc** — a second ⌥⌥ finishes and pastes. For each headset run also record `bt_recovery=immediate`, the `settled … result=` word, and any `bridge_switch=headset reason=recovered`.
 
 ---
 
