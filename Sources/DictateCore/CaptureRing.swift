@@ -162,7 +162,7 @@ public struct CaptureFeed {
         let hadKept = bridge.firstKeptMs != nil
         let peak = Self.peak(frames[...])
         let signalStart = health.buffer(source, at: now, frames: frames.count, peak: peak)
-        let builtinFresh = source == .headset ? health.isFresh(.builtin, at: now) : true
+        let builtinFresh = health.isFresh(.builtin, at: now)
         let decision = bridge.buffer(source: source, at: time, frames: frames.count,
                                      arrivedAt: arrivedAt, epoch: epoch, peak: peak, builtinFresh: builtinFresh)
         var output = Output(releaseBuiltin: decision.releaseBuiltin,
@@ -217,10 +217,16 @@ public struct CaptureFeed {
 
     /// The headset engine failed for good: the built-in carries on from where the headset
     /// stopped. Returns the event (nil: nothing carries) and the frames to append.
-    public mutating func headsetFailed() -> (event: CaptureBridge.Event?, frames: [Float]) {
+    /// v1.8: with `now`, a live built-in that is not fresh is not chosen; `deferred` = the
+    /// health clock decides (a switch if it turns fresh, else `mic_dead` at the deadline).
+    public mutating func headsetFailed(at now: TimeInterval? = nil)
+        -> (event: CaptureBridge.Event?, frames: [Float], deferred: Bool) {
+        if let now, bridge.builtinIsAlive, bridge.state != .off, !health.isFresh(.builtin, at: now) {
+            return (nil, [], true)
+        }
         let switching = bridge.state == .switched
         let event = bridge.headsetFailed()
-        return (event, switching && event == .switchback ? resumeBuiltin() : [])
+        return (event, switching && event == .switchback ? resumeBuiltin() : [], false)
     }
 
     /// The second tap: keeps ring audio from `time − preRoll` and returns it.
@@ -241,7 +247,8 @@ public struct CaptureFeed {
     /// built-in, shows the warning, and ends the dictation on `failure`.
     public mutating func tick(at now: TimeInterval) -> TickOutput {
         var out = TickOutput()
-        guard bridge.state != .off else { return out }
+        // Also before the bridge is configured: the boundary's never-first-buffer deadline runs.
+        guard bridge.state != .off || bridge.isRecording else { return out }
         for action in health.tick(at: now, carrying: carrying) {
             switch action {
             case .builtinDead(let problem):

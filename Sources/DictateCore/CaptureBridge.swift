@@ -119,11 +119,11 @@ public struct CaptureBridge {
         if source == .headset, bluetooth { arbitrate(&result, at: time, frames: frames,
                                                      arrivedAt: arrivedAt, peak: peak, builtinFresh: builtinFresh) }
         let end = time + Double(frames) / Self.rate
-        if source == .builtin, state == .builtinOnly, let first = firstHeadsetTime, end - first >= Self.fallbackAfter {
+        if source == .builtin, state == .builtinOnly, builtinFresh, let first = firstHeadsetTime, end - first >= Self.fallbackAfter {
             fallBack(&result)
         }
         // A headset that stops delivering buffers altogether (IO stopped, not zeros).
-        if source == .builtin, canSwitchBack, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
+        if source == .builtin, canSwitchBack, builtinFresh, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
             switchBack(&result)
             staleSwitchback = true
             return result    // the owner replays this buffer from standby, after the frames it missed
@@ -244,17 +244,13 @@ public struct CaptureBridge {
         staleSwitchback = stale
     }
 
-    /// v1.8: the built-in died mid-dictation (stale, drift, device lost). Unlike a failed
-    /// start, the bridge label stays: it did carry this dictation.
+    /// v1.8: the built-in died mid-dictation (stale, drift, device lost). Only its liveness
+    /// changes: the carrier changes only through `takeOver()` to a source the health clock
+    /// found fresh with signal (otherwise the deadline ends the dictation).
     public mutating func builtinDied() {
         builtinAlive = false
-        switch state {
-        case .builtinOnly, .fallback:
-            state = .switched
-            skipReason = skipReason ?? "builtin_dead"
-        default: break
-        }
     }
+    public var builtinIsAlive: Bool { builtinAlive }
 
     /// The headset carries and the built-in could take over again.
     public var canSwitchBack: Bool { state == .switched && builtinAlive }
