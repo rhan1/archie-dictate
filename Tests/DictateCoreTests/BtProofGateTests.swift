@@ -74,6 +74,13 @@ struct BtProofGateTests {
         #expect(res.finalLine == "BT-PROOF: FAIL speech_sections=0 <3")
     }
 
+    /// v1.10 L2: the live v1.9 R3 notes (c35bde97) — the defect L2 fixes, still a FAIL as recorded.
+    @Test func redV19R3ZeroSectionsFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-v19-r3-zero-sections.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine == "BT-PROOF: FAIL speech_sections=0 <3")
+    }
+
     @Test func redMissingOutcomeFails() throws {
         let res = try runGate(fixturePath: fixtureURL(named: "red-missing-outcome.log"))
         #expect(res.status == 1)
