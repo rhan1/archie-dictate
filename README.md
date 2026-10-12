@@ -126,7 +126,9 @@ The unified log and `~/Library/Logs/Dictate/dictate.stderr.log` record key timel
 - `bt_external_busy=1`, `bt_recovery=requested|queued|immediate|settled`: Bluetooth recovery episode decisions (`settled … result=frames|silent_frames|no_frames`).
 - `bridge_switch=headset reason=recovered`: a recovered headset carries again after a fallback.
 - `mute_reapplied=1 uid=… reason=default_changed|devices_changed|rate_changed`: the output mute flag was reset during the dictation (a headset profile flip) and set again; the timeline's `media=muted>restored(verified) mute_reapplied=<n>` counts them. `mute_unsupported_uid=…`: that output exposes no settable mute flag (volume is never touched).
-- `speech_sections=` counts speech sections relative to the dictation's own noise floor (+12 dB, never below −60 dBFS), so a quiet built-in fallback still shows its speech.
+- `speech_sections=` counts speech sections relative to the dictation's own contrast (v1.10: the 95th-percentile window must be ≥ 6 dB over the 10th-percentile floor; a speech window is ≥ max(6 dB, half that contrast) over the floor and above −60 dBFS; −40 dBFS always counts), so a distant built-in fallback still shows its speech and constant noise shows none.
+- `io_ops=start:N stop:N rebuild:N retap:N io_held=N config_notifications=N` (session end line, v1.10): every engine operation DictateKit performed on the headset during the dictation (`stop` includes the final teardown; `align:N` appears only when a client-format alignment ran), the operations the 1.0 s hands-off window held back, and the configuration notifications the OS sent. On a Bluetooth input the first configuration change gets one re-attach, then nothing for 1.0 s; `bt_recovery=hands_off path=configuration engine_running=1` = the engine was still running, so it was left alone; `bt_reattach_converted=1 hw=… out=…` = the re-attach tapped a mismatched format and converted it instead of rebuilding.
+- `stt_dropped_low_speech_sentence=N` (timeline, v1.10): sentences dropped from a Groq chunk with < 25 % speech windows because they share no content word with the vocabulary or the next chunk (a Whisper insertion on a near-silent opening chunk). Counts only; `DICTATE_LOW_SPEECH_GUARD=0` disables it.
 - `fail reason=mic_dead kept_ms=… last_delivery_ms=… sources=…`: Failure details when no input signal arrives.
 
 ### Bluetooth proof (`tools/bt-proof.sh`)
@@ -140,7 +142,7 @@ The unified log and `~/Library/Logs/Dictate/dictate.stderr.log` record key timel
 A session achieves `BT-PROOF: PASS` only when all of the following hold:
 1. **Outcome:** `outcome=ok`, or `held` with retained characters (`chars>0`).
 2. **Coverage:** Sample-time capture coverage ≥95 % of the recording duration after a ≤1.0 s startup allowance, with no gap >600 ms (calculated from `capture_intervals=`).
-3. **Speech evidence:** At least 3 speech sections (`speech_sections>=3`, runs of ≥300 ms with RMS ≥−40 dBFS separated by ≥200 ms).
+3. **Speech evidence:** At least 3 speech sections (`speech_sections>=3`, runs of ≥300 ms of speech windows — see `speech_sections=` above — separated by ≥200 ms).
 4. **Transport recovery:** Every dropped eSCO link (`Dropping eSCO creation`) must either be re-created within 1.5 s followed by headset audio frames (`headset_signal_start=1`), or fall back onto a fresh built-in mic (`builtin_fresh_at_fallback=1`) that kept audio frames (`builtin_frames_after_fallback>0`).
 
 Missing sessions, duplicate session IDs, missing outcomes, or log errors fail (`BT-PROOF: FAIL <reason>`). Live testing on a Bluetooth headset follows the protocol in [tools/live-protocol.md](tools/live-protocol.md).

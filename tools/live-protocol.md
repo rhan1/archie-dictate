@@ -1,9 +1,9 @@
-# Live Protocol — DictateKit v1.9
+# Live Protocol — DictateKit v1.10
 
-This document defines the live verification protocol executed exclusively by Raza after Archie v36 pins DictateKit v1.9. Nobody else runs this protocol.
+This document defines the live verification protocol executed exclusively by Raza after Archie v40 pins DictateKit v1.10. Nobody else runs this protocol.
 
 > [!IMPORTANT]
-> DictateKit v1.9 is unproven on a Bluetooth headset until this live protocol passes. Do not claim verification on hardware beforehand.
+> DictateKit v1.10 is unproven on a Bluetooth headset until this live protocol passes. Do not claim verification on hardware beforehand.
 
 ---
 
@@ -65,13 +65,13 @@ Execute the following eight runs in order:
 | **R1** | Cold start | Cold A2DP→HFP transition, no competing media client running. |
 | **R2** | Cold start | Cold A2DP→HFP transition, no competing media client running. |
 | **R3** | Cold start | Cold A2DP→HFP transition, no competing media client running. |
-| **R4** | Contention | Cold A2DP→HFP transition with Google Chrome playing background audio to the headset. |
-| **R5** | Contention | Cold A2DP→HFP transition with Google Chrome playing background audio to the headset. |
-| **R6** | Contention | Cold A2DP→HFP transition with Google Chrome playing background audio to the headset. |
+| **R4** | Contention | Cold A2DP→HFP transition with a video playing to the headset (Google Chrome). The video must go quiet for the whole dictation. |
+| **R5** | Contention | Cold A2DP→HFP transition with a video playing to the headset (Google Chrome). |
+| **R6** | Contention | Cold A2DP→HFP transition with a video playing to the headset (Google Chrome). |
 | **R7** | Repeat after cancel | Trigger ⌥⌥, press Esc/cancel, then immediately double-tap ⌥⌥ and dictate the passage. The cancelled session is reported `CANCELLED (excluded)` by bt-proof; the repeat must PASS. |
 | **R8** | Built-in control | Headset powered off / disconnected; recording performed solely on the physical built-in mic. |
 
-R4–R6 need v1.9's L2 (media mute held across the headset's profile flips: `mute_reapplied=` in the timeline); Chrome must be silent on the headset for the whole dictation. Cancel is **Esc** — a second ⌥⌥ finishes and pastes. For each headset run also record `bt_recovery=immediate`, the `settled … result=` word, and any `bridge_switch=headset reason=recovered`.
+R4–R6 rely on v1.9's mute re-assert (`mute_reapplied=` in the timeline; confirmed live 10-13: the video went quiet). Cancel is **Esc** — a second ⌥⌥ finishes and pastes. For each headset run also record, from the session end line, `io_ops=` and `io_held=` (v1.10 target on a cold A2DP start: `start:2`, `rebuild:0`, in-dictation `stop:0` + the final teardown = `stop:1`), and from the raw log the count of `BTUnifiedAudioDevice: StartIO` lines for our pid in the first 3 s (v1.9: 5–7) — `io_ops` low with the HAL count unchanged means the remaining cycles are the OS's, not ours; plus `bt_recovery=immediate|hands_off`, the `settled … result=` word, any `bt_reattach_converted=1`, any `bridge_switch=headset reason=recovered`, and `stt_dropped_low_speech_sentence=` from the timeline.
 
 ---
 
