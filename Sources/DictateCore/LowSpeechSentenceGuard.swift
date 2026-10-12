@@ -5,10 +5,10 @@ public enum LowSpeechSentenceGuard {
     public static let maxSpeechRatio = 0.25
     public static let minWords = 4
 
-    /// The fraction of 50 ms sample windows that meet CaptureEvidence's speech rule.
+    /// The fraction of 50 ms sample windows that meet CaptureEvidence's speech rule (`speechWindows`).
     public static func speechRatio(of samples: [Int16]) -> Double {
         let windowFrames = CaptureEvidence.windowFrames
-        var windows: [Double] = []
+        var windows: [Float] = []
         var start = 0
         while start < samples.count {
             let end = min(start + windowFrames, samples.count)
@@ -19,18 +19,13 @@ public enum LowSpeechSentenceGuard {
                 let normalized = Double(sample) / 32_768.0
                 sum += normalized * normalized
             }
-            windows.append((sum / Double(count)).squareRoot())
+            windows.append(Float((sum / Double(count)).squareRoot()))
             start = end
         }
         guard !windows.isEmpty else { return 0 }
-        let sorted = windows.sorted()
-        let floor = sorted[Int((Double(sorted.count - 1) * 0.1).rounded(.down))]
-        let speech = windows.filter {
-            $0 >= Double(CaptureEvidence.speechRMS) ||
-            ($0 >= Double(CaptureEvidence.quietSpeechFloor) &&
-             $0 >= floor * Double(CaptureEvidence.relativeGain))
-        }
-        return Double(speech.count) / Double(windows.count)
+        // The same rule as `speech_sections` (v1.10 L2), judged within this chunk.
+        let speech = CaptureEvidence.speechWindows(windows).filter { $0 }.count
+        return Double(speech) / Double(windows.count)
     }
 
     public static func filter(_ text: String, speechRatio: Double, vocabulary: String,
