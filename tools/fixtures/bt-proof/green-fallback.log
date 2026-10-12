@@ -1,9 +1,9 @@
 # SYNTHETIC parser control — not live hardware proof
-# Shape = archived R1 (8b58cb96) with the v1.9 end line (speech_sections=5 from the relative floor); the eSCO line is synthetic.
+# Shape = archived R1 (8b58cb96) with the v1.10 end line (speech_sections=5 from the contrast-relative rule, io_ops=); the eSCO line is synthetic.
 2026-10-13 01:53:07.662 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.663Z] dictate: builtin_backend=auhal device=81 bridge_device_check=ok
 2026-10-13 01:53:07.750 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.752Z] dictate: session=8b58cb96 event=start
 2026-10-13 01:53:08.542 coreaudiod[409:12345] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
 2026-10-13 01:53:10.319 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:10.321Z] dictate: bridge_src=builtin_fallback reason=headset_digital_silence
 2026-10-13 01:53:10.319 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:10.321Z] dictate: fallback_check builtin_fresh_at_fallback=1 builtin_age_ms=0
 2026-10-13 01:53:10.783 Df Archie[64486:389f63d3] [com.razakhan.archie:voice] dk [2026-10-12T17:53:10.785Z] dictate: headset_signal_start=1
-2026-10-13 01:53:26.671 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:26.672Z] dictate: session=8b58cb96 event=end outcome=ok duration_ms=18268 bytes=877364 chars=219 recording_ms=18263 capture_intervals=0-18249 speech_sections=5 builtin_frames_after_fallback=375368 builtin_backend=auhal
+2026-10-13 01:53:26.671 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:26.672Z] dictate: session=8b58cb96 event=end outcome=ok duration_ms=18268 bytes=877364 chars=219 recording_ms=18263 capture_intervals=0-18249 speech_sections=5 builtin_frames_after_fallback=375368 builtin_backend=auhal io_ops=start:2 stop:1 rebuild:0 retap:1 io_held=0 config_notifications=1
