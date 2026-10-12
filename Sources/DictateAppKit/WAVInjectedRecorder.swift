@@ -20,7 +20,16 @@ import DictateCore
 ///   disables the idle SCO route at +450 unless IO is back by then. The re-attach is admitted by
 ///   the production `BluetoothRecoveryEpisode`; in time → the headset (the WAV) carries,
 ///   too late → it delivers only zeros. `legacyRecoveryTiming` = v1.8's debounced admission.
+///   v1.10 (L1): the scenario also counts the engine operations (`stats.ioOps`) through the
+///   production `HeadsetIOGuard`. `ioPolicy: .v19` is the RED twin: v1.9's re-attach ran
+///   `TapFormatPlan` on the auto-stopped engine, whose hardware (16 kHz HFP) and client
+///   (44.1 kHz) formats disagree, so it rebuilt — a teardown stop while the SCO link forms, which
+///   drops eSCO creation (07:08:26 `Dropping eSCO creation`): the headset then delivers zeros.
+///   `.v110` re-attaches once, converts in the tap and holds every other operation for
+///   `HeadsetIOGuard.handsOff`. Restart requests go through the production episode in both.
 public final class WAVInjectedRecorder: EngineRecorder {
+    /// Which re-attach the `sco_torn_down_250ms` IO model runs.
+    public enum IOPolicy: Sendable { case v19, v110 }
     public enum Scenario: String, Sendable {
         case plain, headsetZeros = "headset_zeros", builtinDies = "builtin_dies", builtinDrifts = "builtin_drifts"
         case scoTornDown250ms = "sco_torn_down_250ms"
@@ -34,6 +43,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public static let scoRouteDisabledAt: TimeInterval = 0.45
     /// v1.8's admission (debounced even when the engine auto-stopped): the RED twin.
     public let legacyRecoveryTiming: Bool
+    public let ioPolicy: IOPolicy
     /// When the re-attached headset IO runs (nil: not computed for this scenario).
     public private(set) var scoIOAt: TimeInterval?
     public let url: URL
@@ -70,8 +80,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
     private var builtinStopped = false
     private var failed = false
 
-    public init(url: URL, pace: Double = 1.0, scenario: Scenario = .plain, legacyRecoveryTiming: Bool = false) {
+    public init(url: URL, pace: Double = 1.0, scenario: Scenario = .plain, legacyRecoveryTiming: Bool = false,
+                ioPolicy: IOPolicy = .v110) {
         self.legacyRecoveryTiming = legacyRecoveryTiming
+        self.ioPolicy = ioPolicy
         self.url = url
         self.pace = max(0.0001, pace)
         self.scenario = scenario
@@ -194,30 +206,107 @@ public final class WAVInjectedRecorder: EngineRecorder {
         failed = false
         scoIOAt = nil
         scoNotes = []
+        ioGuard = HeadsetIOGuard(bluetooth: scenario.hasHeadset)
+        ioPending = []
+        ioSettleAt = nil
+        ioRestartAt = nil
+        scoKept = false
         if scenario == .scoTornDown250ms {
-            var episode = BluetoothRecoveryEpisode(bluetooth: true)
-            episode.formatChanged(at: Self.scoNotifyAt)
-            let admission = episode.request(.configuration, at: Self.scoNotifyAt, engineStopped: !legacyRecoveryTiming)
+            let notify = Self.scoNotifyAt
+            ioEpisode = BluetoothRecoveryEpisode(bluetooth: true)
+            ioEpisode.formatChanged(at: notify)
+            ioPending = [(0, .start)]
+            var policyNotes: [String] = []
+            if !legacyRecoveryTiming, ioPolicy == .v110,
+               case .leaveRunning = ioGuard.configurationChanged(at: notify, engineRunning: false) {
+                policyNotes.append("bt_recovery=hands_off path=configuration engine_running=1")   // never: it auto-stopped
+            }
+            let admission = ioEpisode.request(.configuration, at: notify, engineStopped: !legacyRecoveryTiming)
             var wait: TimeInterval = 0
             switch admission {
             case .now: break
             case .after(let delay): wait = delay
             case .coalesced, .exhausted: wait = .infinity
             }
-            scoIOAt = Self.scoNotifyAt + wait + Self.scoRetapLatency
-            scoNotes = episode.immediateAttempts > 0
+            let attachAt = notify + wait
+            // v1.10 asks the production guard whether the re-attach converts in the tap.
+            let rebuildsOnReattach = !legacyRecoveryTiming && (ioPolicy == .v19 || !ioGuard.convertsInTap)
+            if wait.isFinite {
+                _ = ioEpisode.begin(at: attachAt, force: true)
+                ioPending.append((attachAt, .retap))
+                if rebuildsOnReattach {
+                    // TapFormatPlan on the auto-stopped engine: mismatch → rebuild (teardown stop).
+                    ioPending += [(attachAt, .rebuild), (attachAt, .stop)]
+                }
+                ioPending.append((attachAt, .start))
+                ioSettleAt = attachAt + BluetoothRecoveryEpisode.successWithin
+            }
+            scoIOAt = attachAt + Self.scoRetapLatency
+            scoKept = !rebuildsOnReattach && scoIOAt! < Self.scoRouteDisabledAt
+            scoNotes = (ioEpisode.immediateAttempts > 0
                 ? ["bt_recovery=immediate path=configuration engine_running=0 after_ms=0"]
-                : ["bt_recovery=queued path=configuration wait_ms=\(Int((wait * 1000).rounded()))"]
+                : ["bt_recovery=queued path=configuration wait_ms=\(Int((wait * 1000).rounded()))"]) + policyNotes
         }
     }
     private var scoNotes: [String] = []
+    // v1.10 (L1) IO model of `sco_torn_down_250ms` (state under `lock`; offsets from the boundary).
+    private var ioGuard = HeadsetIOGuard(bluetooth: false)
+    private var ioEpisode = BluetoothRecoveryEpisode(bluetooth: true)
+    private var ioPending: [(at: TimeInterval, op: HeadsetIOGuard.Op)] = []
+    private var ioSettleAt: TimeInterval?
+    private var ioRestartAt: TimeInterval?
+    private var scoKept = false
+
+    /// Applies the IO model up to `offset`: due operations, the attempt's verdict, a due restart.
+    /// Caller holds `lock`.
+    private func advanceIO(to offset: TimeInterval) {
+        guard scenario == .scoTornDown250ms else { return }
+        if let settle = ioSettleAt, offset >= settle {
+            ioSettleAt = nil
+            ioEpisode.settled(scoKept ? .frames : .silentFrames)
+        }
+        if let restart = ioRestartAt, offset >= restart {
+            ioRestartAt = nil
+            runRestart(at: restart)
+        }
+        while let next = ioPending.first, next.at <= offset {
+            ioGuard.record(next.op)
+            ioPending.removeFirst()
+        }
+    }
+
+    /// The feed asked for the one headset restart (`AudioRecorder.requestHeadsetRestart`).
+    /// Caller holds `lock`.
+    private func requestRestart(at offset: TimeInterval) {
+        guard scenario == .scoTornDown250ms else { return }
+        var at = offset
+        if !legacyRecoveryTiming, ioPolicy == .v110, !ioGuard.allows(at: offset) {
+            ioGuard.deferred()
+            at = offset + ioGuard.remaining(at: offset)
+        }
+        if at > offset { ioRestartAt = at } else { runRestart(at: at) }
+    }
+
+    /// Admitted like `restartHeadset`: teardown (stop) then a fresh engine (no rebuild count) and start.
+    private func runRestart(at time: TimeInterval) {
+        switch ioEpisode.request(.restart, at: time) {
+        case .now:
+            _ = ioEpisode.begin(at: time, force: true)
+            ioPending += [(time, .stop), (time, .start)]
+            ioPending.sort { $0.at < $1.at }
+            ioSettleAt = time + BluetoothRecoveryEpisode.successWithin
+        case .after(let wait):
+            ioRestartAt = time + wait
+        case .coalesced, .exhausted: break
+        }
+    }
 
     /// The headset's buffer for the chunk at `offset` s after the boundary (nil: its engine is stopped).
     private func headsetChunk(offset: TimeInterval, wav: [Float]) -> [Float]? {
         guard scenario == .scoTornDown250ms, let io = scoIOAt else { return [Float](repeating: 0, count: wav.count) }
         guard offset + 0.1 > io else { return nil }
         // IO back before the teardown keeps the route: the headset hears the speaker.
-        return io < Self.scoRouteDisabledAt ? wav : [Float](repeating: 0, count: wav.count)
+        return scoKept ? wav : [Float](repeating: 0, count: wav.count)
     }
 
     /// Parses off the caller's actor (the controller calls this from the main actor).
@@ -269,6 +358,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             var outs: [CaptureFeed.Output] = []
             notes += scoNotes
             scoNotes = []
+            advanceIO(to: time - boundary)
             if !builtinStopped { outs.append(feed.accept(wav, source: .builtin, at: time)) }
             if let headset = headsetChunk(offset: time - boundary, wav: wav) {
                 outs.append(feed.accept(headset, source: .headset, at: time))
@@ -280,7 +370,11 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 if let fresh = out.fallbackFresh {
                     notes.append("fallback_check builtin_fresh_at_fallback=\(fresh ? 1 : 0) builtin_age_ms=\(out.builtinAgeMs.map(String.init) ?? "none")\(out.fallbackRefused ? " refused=1" : "")")
                 }
-                if out.restartHeadset { feed.headsetRestarted(); notes.append("headset_restart=1 simulated=1") }
+                if out.restartHeadset {
+                    feed.headsetRestarted()
+                    notes.append("headset_restart=1 simulated=1")
+                    requestRestart(at: time - boundary)
+                }
                 kept += out.frames
             }
         } else {
@@ -351,6 +445,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
             stats.captureIntervals = feed.evidence.intervalsNote
             stats.speechSections = feed.evidence.finalSpeechSections
             stats.recordingMs = max(0, Int(((mediaTime - boundary) * 1000).rounded()))
+            if scenario == .scoTornDown250ms {
+                advanceIO(to: mediaTime - boundary)
+                ioGuard.record(.stop)                   // the end-of-dictation teardown
+            }
+            stats.ioOps = ioGuard.note
+            stats.ioHeld = ioGuard.heldNote
             feed.cancel()
             remainder = pendingPCM
             pendingPCM.removeAll()
