@@ -49,6 +49,10 @@ public final class AudioRecorder: CaptureEngine {
         public var recordingMs = 0
         public var builtinFramesAfterFallback = 0
         public var builtinBackend: String?
+        /// v1.10 (L1): the engine operations this dictation performed on the headset, and the
+        /// ones the hands-off window held back (`HeadsetIOGuard`).
+        public var ioOps = HeadsetIOGuard(bluetooth: false).note
+        public var ioHeld = HeadsetIOGuard(bluetooth: false).heldNote
         public init() {}
     }
     public private(set) var stats = CaptureStats()
@@ -109,6 +113,8 @@ public final class AudioRecorder: CaptureEngine {
     private var healthTimer: DispatchSourceTimer?
     // v1.8 L3: one recovery episode per dictation, across engine replacements (state under `lock`).
     private var episode = BluetoothRecoveryEpisode(bluetooth: false)
+    /// v1.10 (L1): this dictation's engine operations and the hands-off window (state under `lock`).
+    private var ioGuard = HeadsetIOGuard(bluetooth: false)
     /// The headset device the dictation started on: the busy check polls it, never a re-resolved default.
     private var headsetDevice: AudioDeviceID?
     private var restarting = false
@@ -144,6 +150,7 @@ public final class AudioRecorder: CaptureEngine {
             bridgeConfigured = true
             feed.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch)
             episode = BluetoothRecoveryEpisode(bluetooth: bluetooth)
+            ioGuard = HeadsetIOGuard(bluetooth: bluetooth)
             headsetDevice = headset
             builtinDriftNoted = false
             if let captureBoundary { _ = feed.recordingStarted(at: captureBoundary) }
@@ -337,6 +344,8 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     public func rebuild() throws {
+        // Creating the first engine is not a rebuild; replacing one is.
+        lock.withLock { if engine != nil { ioGuard.record(.rebuild) } }
         teardownEngine()
         let fresh = try captureObjC { AVAudioEngine() }
         lock.withLock { engine = fresh; engineIdentity = CaptureEpoch() }
@@ -366,9 +375,15 @@ public final class AudioRecorder: CaptureEngine {
             return admission
         }
         AppController.note("bt_recovery=requested path=\(path.rawValue) admission=\(Self.word(admission))")
+        // v1.10 (L1): a lifecycle start never lands inside the hands-off window.
+        let held: TimeInterval = lock.withLock {
+            let wait = ioGuard.remaining(at: now)
+            if wait > 0 { ioGuard.deferred() }
+            return wait
+        }
         switch admission {
-        case .now: return .proceed(after: 0)
-        case .after(let wait): return .proceed(after: wait)
+        case .now: return .proceed(after: held)
+        case .after(let wait): return .proceed(after: max(wait, held))
         case .coalesced, .exhausted:
             // Refused: the episode's own queued attempt (or none) is the policy; the health clock
             // ends the dictation if nothing useful arrives. No restart outside the episode.
@@ -425,6 +440,20 @@ public final class AudioRecorder: CaptureEngine {
                     AppController.note("bt_recovery=skipped path=configuration reason=\(healthy ? "healthy" : "obsolete")")
                     return
                 }
+                // v1.10 (L1): never inside the hands-off window; it runs when the window closes.
+                let held: TimeInterval = lock.withLock {
+                    let wait = ioGuard.remaining(at: now)
+                    if wait > 0 { ioGuard.deferred() }
+                    return wait
+                }
+                if held > 0 {
+                    engineQueue.asyncAfter(deadline: .now() + held) { [weak self] in
+                        self?.onExecutor { [weak self] in
+                            self?.configurationChanged(identity: identity, epoch: epoch, queued: true)
+                        }
+                    }
+                    return
+                }
                 switch lock.withLock({ episode.beginIfStable(at: now) }) {
                 case .begun: break
                 case .notPending: return
@@ -441,6 +470,15 @@ public final class AudioRecorder: CaptureEngine {
                 // v1.9 (L1): AVAudioEngine auto-stopped on the profile switch — re-attach IO now,
                 // before coreaudiod tears the idle SCO route down (~250 ms after it connected).
                 let running = (try? captureObjC { self.engine?.isRunning ?? false }) ?? false
+                // v1.10 (L1): exactly ONE re-attach from the first notification, then hands off
+                // for `HeadsetIOGuard.handsOff`; later notifications in the window do nothing.
+                switch lock.withLock({ ioGuard.configurationChanged(at: now, engineRunning: running) }) {
+                case .handsOff: return
+                case .leaveRunning:
+                    AppController.note("bt_recovery=hands_off path=configuration engine_running=1")
+                    return
+                case .reattach, .episode: break
+                }
                 let (admission, immediate): (BluetoothRecoveryEpisode.Admission, Bool) = lock.withLock {
                     let before = episode.immediateAttempts
                     let admission = episode.request(.configuration, at: now, engineStopped: !running)
@@ -477,6 +515,7 @@ public final class AudioRecorder: CaptureEngine {
             // One admitted operation: a retap. No retap→rebuild escape inside the window; a failed
             // retap asks the episode for a full restart instead. Verification is armed first.
             verifyFrames(epoch: epoch, since: now, path: .configuration)
+            lock.withLock { ioGuard.record(.retap) }
             do {
                 try captureObjC {
                     try self.removeTap()
@@ -493,6 +532,7 @@ public final class AudioRecorder: CaptureEngine {
             result = CaptureConfigurationRecovery.run(isCurrent: {
                 self.lock.withLock { self.engineEpoch === epoch }
             }, retap: {
+                self.lock.withLock { self.ioGuard.record(.retap) }
                 try self.removeTap()
                 try self.installTapAndStart()
             }, rebuildAndStart: {
@@ -575,6 +615,7 @@ public final class AudioRecorder: CaptureEngine {
         let check = BuiltinPin.enforce(expected: expected, read: {
             try AudioDevices.currentDevice(of: self.requireEngine().inputNode.audioUnit ?? unit)
         }, write: { _ in
+            self.lock.withLock { self.ioGuard.record(.retap); self.ioGuard.record(.stop) }
             try self.removeTap()
             try captureObjC { self.engine?.stop() }
             try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
@@ -619,6 +660,18 @@ public final class AudioRecorder: CaptureEngine {
         guard current, !(queued && healthy) else {
             lock.withLock { episode.skip() }
             AppController.note("bt_recovery=skipped path=\(path.rawValue) reason=\(current ? "healthy" : "obsolete")")
+            return
+        }
+        // v1.10 (L1): a restart (stop + rebuild + start) never runs inside the hands-off window.
+        let held: TimeInterval = lock.withLock {
+            let wait = ioGuard.remaining(at: now)
+            if wait > 0 { ioGuard.deferred() }
+            return wait
+        }
+        if held > 0 {
+            engineQueue.asyncAfter(deadline: .now() + held) { [weak self] in
+                self?.onExecutor { [weak self] in self?.restartHeadset(epoch: epoch, path: path, queued: true) }
+            }
             return
         }
         switch lock.withLock({ episode.beginIfStable(at: now) }) {
@@ -705,6 +758,9 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func installTapAndStart() throws {
+        // v1.10 (L1): on Bluetooth after the first configuration notification, no rebuild and no
+        // client-format alignment: the tap takes the node's own format and `consume` converts it.
+        if lock.withLock({ ioGuard.convertsInTap }) { return try installConvertingTapAndStart() }
         try captureObjC {
             let plan = try TapFormatPlan.run(device: selectedDevice, formats: {
                 let input = try requireEngine().inputNode
@@ -712,6 +768,7 @@ public final class AudioRecorder: CaptureEngine {
                 return (TapFormatPlan.Format(sampleRate: hardware.sampleRate, channels: hardware.channelCount),
                         TapFormatPlan.Format(sampleRate: output.sampleRate, channels: output.channelCount))
             }, align: {
+                lock.withLock { ioGuard.record(.align) }
                 try AudioDevices.alignClientFormat(on: requireEngine().inputNode)
             }, rebuild: {
                 try rebuild()
@@ -733,6 +790,29 @@ public final class AudioRecorder: CaptureEngine {
                 self?.consume(buffer, time: time, epoch: token)
             }
             try requireEngine().prepare()
+            lock.withLock { ioGuard.record(.start) }
+            try requireEngine().start()
+        }
+    }
+
+    /// The hands-off re-attach: tap in the input node's current output format (nil = whatever the
+    /// bus delivers; never a format-mismatch exception), converted to 24 kHz per buffer in `consume`.
+    private func installConvertingTapAndStart() throws {
+        try captureObjC {
+            let input = try requireEngine().inputNode
+            let hardware = input.inputFormat(forBus: 0), output = input.outputFormat(forBus: 0)
+            if hardware.sampleRate != output.sampleRate || hardware.channelCount != output.channelCount {
+                AppController.note("bt_reattach_converted=1 hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch out=\(Int(output.sampleRate))Hz/\(output.channelCount)ch")
+            }
+            lock.withLock { converter = nil }      // built from the first buffer's own format
+            let token = CaptureEpoch()
+            lock.withLock { tapEpoch = token }
+            tapInstalled = true
+            input.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, time in
+                self?.consume(buffer, time: time, epoch: token)
+            }
+            try requireEngine().prepare()
+            lock.withLock { ioGuard.record(.start) }
             try requireEngine().start()
         }
     }
@@ -744,8 +824,10 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     /// Continue cleanup after any individual exception, including a partial tap install.
-    private func teardownEngine() {
+    /// `counted`: the caller already recorded this stop (`stop()` counts its own teardown).
+    private func teardownEngine(counted: Bool = false) {
         recording = false
+        lock.withLock { if engine != nil, !counted { ioGuard.record(.stop) } }
         lock.withLock { captureRunning = false; converter = nil; tapEpoch = CaptureEpoch() }
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
@@ -856,6 +938,10 @@ public final class AudioRecorder: CaptureEngine {
             stats.recordingMs = captureBoundary.map { max(0, Int(((now - $0) * 1000).rounded())) } ?? 0
             stats.builtinFramesAfterFallback = feed.bridge.builtinFramesAfterFallback
             stats.builtinBackend = feed.bridge.bridgeSource == "none" ? nil : builtin.backend
+            // v1.10 (L1): the teardown queued below is this dictation's last stop.
+            if engine != nil { ioGuard.record(.stop) }
+            stats.ioOps = ioGuard.note
+            stats.ioHeld = ioGuard.heldNote
         }
         let restartResult = live ? feed.bridge.restart?.result : nil
         feed.cancel() // a lone tap's ring is discarded here
@@ -889,7 +975,7 @@ public final class AudioRecorder: CaptureEngine {
         if !remainder.isEmpty, let callback { delivery.enqueue(remainder, to: callback) }
         delivery.drain()
         if let (unit, queue) = stopUnit, abandonedMs == nil { stopBuiltinUnit(unit, queue: queue, epoch: stoppedEpoch) }
-        onExecutor { [self] in teardownEngine() }
+        onExecutor { [self] in teardownEngine(counted: live) }
         return captured
     }
 
