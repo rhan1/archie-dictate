@@ -42,21 +42,34 @@ public enum CaptureConfigurationRecovery {
 
 /// v1.7 H2: one clean restart of the headset engine. coreaudiod re-requests a dropped
 /// eSCO link only when the device's IO count falls to zero and a client starts again.
+///
+/// v1.8 (L3): `kAudioDevicePropertyDeviceIsRunningSomewhere` is system-wide, so it is polled
+/// only on the intended headset device and only after `stop` has stopped every IO unit we own;
+/// still running then means another client (Chrome on 10-12) holds it: `externalBusy`. With
+/// `startWhenBusy == false` (a healthy built-in carries) nothing is started into a busy link.
+/// Settle is 300 ms: the observed teardown took 159 ms plus stop latency.
 public enum HeadsetRestart {
     public static let idlePoll: TimeInterval = 0.4
     public static let pollStep: TimeInterval = 0.02
-    public static let settle: TimeInterval = 0.15
+    public static let settle: TimeInterval = BluetoothRecoveryEpisode.settleAfterStop
     public struct Outcome: Equatable, Sendable {
         public var waitedMs: Int
         /// The Bluetooth input stopped running everywhere before the start.
         public var deviceIdle: Bool
         public var started: Bool
+        /// Our units were stopped and the device still ran: another client holds it.
+        public var externalBusy = false
+        public init(waitedMs: Int, deviceIdle: Bool, started: Bool, externalBusy: Bool = false) {
+            self.waitedMs = waitedMs; self.deviceIdle = deviceIdle; self.started = started
+            self.externalBusy = externalBusy
+        }
     }
     /// `isRunningSomewhere` returns nil when the property cannot be read (treated as running).
-    public static func perform(stop: () -> Void, isRunningSomewhere: () -> Bool?,
+    /// `stop` returns whether every owned IO unit is confirmed stopped (false: no busy verdict).
+    public static func perform(stop: () -> Bool, isRunningSomewhere: () -> Bool?,
                                sleep: (TimeInterval) -> Void, start: () throws -> Void,
-                               note: (Error) -> Void) -> Outcome {
-        stop()
+                               startWhenBusy: Bool = true, note: (Error) -> Void) -> Outcome {
+        let ownStopped = stop()
         var waited: TimeInterval = 0
         var idle = isRunningSomewhere() == false
         while !idle, waited + pollStep <= idlePoll + 0.000001 {
@@ -66,9 +79,13 @@ public enum HeadsetRestart {
         }
         sleep(settle)
         waited += settle
+        let busy = ownStopped && !idle && isRunningSomewhere() == true
         var started = false
-        do { try captureObjC(start); started = true } catch { note(error) }
-        return Outcome(waitedMs: Int((waited * 1000).rounded()), deviceIdle: idle, started: started)
+        if !busy || startWhenBusy {
+            do { try captureObjC(start); started = true } catch { note(error) }
+        }
+        return Outcome(waitedMs: Int((waited * 1000).rounded()), deviceIdle: idle, started: started,
+                       externalBusy: busy)
     }
 }
 
@@ -96,59 +113,5 @@ public enum BuiltinPin {
             return .drift(from: current)
         }
         return .corrected(from: current)
-    }
-}
-
-/// v1.7 H4: after a start failure, at most one retap/rebuild within `window`, then the
-/// next one waits until `window + backoff` after the failure; requests in between coalesce.
-/// HAL `Start failed` is not always thrown to us, so a configuration change arriving
-/// within `window` of our previous recovery counts as one too.
-public struct RecoveryThrottle: Sendable {
-    public static let window: TimeInterval = 1.0
-    public static let backoff: TimeInterval = 0.6
-    public enum Admission: Equatable, Sendable { case now, after(TimeInterval), coalesced }
-    public private(set) var attempts = 0
-    private var episodeStart: TimeInterval?
-    private var usedInEpisode = 0
-    private var lastAttempt: TimeInterval?
-    private var pendingAt: TimeInterval?
-    public init() {}
-
-    public mutating func startFailed(at time: TimeInterval) {
-        if let start = episodeStart, time < start + Self.window + Self.backoff { return }
-        episodeStart = time
-        usedInEpisode = 0
-    }
-
-    public mutating func request(at time: TimeInterval) -> Admission {
-        if let pending = pendingAt, time < pending { return .coalesced }
-        if let last = lastAttempt, time - last < Self.window, episodeStart.map({ time >= $0 + Self.window + Self.backoff }) ?? true {
-            episodeStart = last
-            usedInEpisode = 1
-        }
-        if let start = episodeStart, time < start + Self.window + Self.backoff {
-            if time < start + Self.window, usedInEpisode == 0 {
-                usedInEpisode = 1
-                return attempt(at: time)
-            }
-            let due = start + Self.window + Self.backoff
-            pendingAt = due
-            return .after(due - time)
-        }
-        episodeStart = nil
-        return attempt(at: time)
-    }
-
-    /// The deferred recovery runs now; its episode is over.
-    public mutating func deferredFired(at time: TimeInterval) {
-        pendingAt = nil
-        episodeStart = nil
-        _ = attempt(at: time)
-    }
-
-    private mutating func attempt(at time: TimeInterval) -> Admission {
-        attempts += 1
-        lastAttempt = time
-        return .now
     }
 }
