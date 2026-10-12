@@ -1,4 +1,5 @@
 # SYNTHETIC parser control — not live hardware proof
+# Shape = archived R1 (8b58cb96) with the v1.9 end line (speech_sections=5 from the relative floor); the eSCO line is synthetic.
 2026-10-13 01:53:07.662 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.663Z] dictate: builtin_backend=auhal device=81 bridge_device_check=ok
 2026-10-13 01:53:07.750 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.752Z] dictate: session=8b58cb96 event=start
 2026-10-13 01:53:08.542 coreaudiod[409:12345] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
