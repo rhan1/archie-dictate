@@ -9,6 +9,12 @@ public protocol CaptureEngine: AnyObject {
     func start(device: MicChoice) throws
     @discardableResult func stop() -> [Float]
     func rebuild() throws
+    /// v1.8 (L3): a lifecycle retry asks the engine first (Bluetooth: one recovery episode).
+    func recoveryAdmission(_ path: RecoveryPath) -> RecoveryAdmission
+}
+
+public extension CaptureEngine {
+    func recoveryAdmission(_ path: RecoveryPath) -> RecoveryAdmission { .proceed(after: 0) }
 }
 
 /// Main-event-queue policy; engine operations use the recorder's serial executor.
@@ -242,6 +248,10 @@ public final class CaptureLifecycle {
                 guard epoch === token, recordingRequested else { cleanLateStart(); return false }
                 watchFirstBuffer(token: token) { [weak self] in
                     guard let self else { return }
+                    guard case .proceed = self.engine.recoveryAdmission(.firstBuffer) else {
+                        self.note?("first_buffer_retry=skipped owner=engine")
+                        return
+                    }
                     var next = retryChain
                     self.failedAttempt(self.timeoutError, chain: &next)
                     self.resetAttempt()
@@ -284,7 +294,11 @@ public final class CaptureLifecycle {
                     try await rebuild()
                     guard epoch === token, !isCancelled() else { cleanLateStart(); return false }
                 }
-                if chain.delay > 0 { await wait(chain.delay) }
+                var delay = chain.delay
+                if chain.step == .retry, case .proceed(let after) = engine.recoveryAdmission(.startRetry) {
+                    delay = max(delay, after)
+                }
+                if delay > 0 { await wait(delay) }
                 guard epoch === token, !isCancelled() else { cleanLateStart(); return false }
                 let device = chain.device
                 if !engine.isRunning || chain.needsRebuild { try await start(device) }
@@ -297,6 +311,12 @@ public final class CaptureLifecycle {
                     Task { @MainActor [weak self] in
                         guard let self, self.epoch === token, !isCancelled(),
                               self.warmup.phase == .warming else { return }
+                        guard case .proceed(let after) = self.engine.recoveryAdmission(.firstBuffer) else {
+                            self.note?("first_buffer_retry=skipped owner=engine")
+                            return
+                        }
+                        if after > 0 { await wait(after) }
+                        guard self.epoch === token, !isCancelled() else { return }
                         var next = retryChain
                         self.failedAttempt(self.timeoutError, chain: &next)
                         if !next.isAttempt { self.terminalFailure(); return }
