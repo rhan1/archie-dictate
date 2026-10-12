@@ -6,6 +6,14 @@ import Foundation
 /// retained here: frames are folded into 50 ms RMS windows as they pass. Speech is measured
 /// relative to the dictation's own noise floor: R1's built-in fallback peaked at −24.8 dBFS
 /// but its speech windows were below the former fixed −40 dBFS RMS threshold.
+///
+/// v1.10 L2: the relative rule follows the dictation's own contrast. 10-13 07:00–07:10 the
+/// built-in at headset distance read `speech_sections=0` on 5 of 6 fallback runs (R3
+/// `peak_dbfs=-28.4`): its loudest speech windows sit ~9 dB over its room floor, under v1.9's
+/// fixed +12 dB. A window is speech when it is above −40 dBFS (unchanged) or, when the
+/// dictation's 95th-percentile window is ≥ `minContrastDB` over its 10th-percentile floor, when it
+/// is ≥ max(`minContrastDB`, half that contrast) over the floor (and above −60 dBFS). Constant
+/// noise has no contrast and never counts; digital zeros never set the floor.
 public struct CaptureEvidence: Sendable {
     public static let rate = 24_000.0
     /// RMS window for speech detection.
@@ -14,8 +22,11 @@ public struct CaptureEvidence: Sendable {
     public static let speechRMS: Float = 0.01
     /// −60 dBFS: digital zeros and near-zeros are never speech.
     public static let quietSpeechFloor: Float = 0.001
-    /// A window must be 12 dB above this dictation's 10th-percentile noise floor.
-    public static let relativeGain: Float = 4
+    /// v1.10: the least contrast (95th vs 10th percentile window) that can hold speech, and the
+    /// least margin over the floor a speech window needs.
+    public static let minContrastDB: Float = 6
+    /// Windows below this are digital silence: never part of the floor (a dropped link's zeros).
+    public static let digitalSilenceRMS: Float = 0.00001
     public static let minSection: TimeInterval = 0.3
     public static let minSeparation: TimeInterval = 0.2
     /// Abutting buffers whose timestamps jitter by up to this much stay one interval.
@@ -86,20 +97,34 @@ public struct CaptureEvidence: Sendable {
     }
 
     private func detector(for windows: [Float]) -> SectionDetector {
-        let noiseFloor = Self.tenthPercentile(of: windows)
         var detector = SectionDetector()
-        for rms in windows {
-            detector.append(loud: rms >= Self.speechRMS ||
-                (rms >= Self.quietSpeechFloor && rms >= noiseFloor * Self.relativeGain))
-        }
+        for loud in Self.speechWindows(windows) { detector.append(loud: loud) }
         return detector
     }
 
-    private static func tenthPercentile(of windows: [Float]) -> Float {
-        guard !windows.isEmpty else { return 0 }
-        let sorted = windows.sorted()
-        return sorted[Int((Double(sorted.count - 1) * 0.1).rounded(.down))]
+    /// Which of `windows` (50 ms RMS, one dictation or one chunk) are speech. Shared with
+    /// `LowSpeechSentenceGuard` so a chunk's speech ratio uses the same rule.
+    public static func speechWindows(_ windows: [Float]) -> [Bool] {
+        let threshold = relativeThreshold(windows)
+        return windows.map { rms in
+            rms >= speechRMS || (rms >= quietSpeechFloor && threshold.map { rms >= $0 } ?? false)
+        }
     }
+
+    /// The relative speech threshold, or nil when the windows hold no contrast.
+    static func relativeThreshold(_ windows: [Float]) -> Float? {
+        let audible = windows.filter { $0 >= digitalSilenceRMS }.sorted()
+        guard audible.count >= 2 else { return nil }
+        let floor = audible[Int((Double(audible.count - 1) * 0.1).rounded(.down))]
+        let top = audible[Int((Double(audible.count - 1) * 0.95).rounded(.down))]
+        let contrast = 20 * log10(top / floor)
+        guard contrast >= minContrastDB else { return nil }
+        return floor * pow(10, max(minContrastDB, contrast / 2) / 20)
+    }
+
+    /// The 50 ms RMS series the speech rule judged (counts-only levels, never written anywhere;
+    /// capped at `maxRecordedWindows`). Tests replay it against the frames the transcriber got.
+    public var levelEnvelope: [Float] { recordedWindows }
 
     /// Sections including the one still open (the recording may end mid-word).
     public var finalSpeechSections: Int {
