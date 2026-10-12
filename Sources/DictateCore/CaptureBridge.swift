@@ -16,6 +16,9 @@ public struct CaptureBridge {
         case fallback
         /// The headset went digital-zero for longer than `switchbackAfter` mid-dictation.
         case switchback
+        /// v1.9: the headset recovered (`takeoverSignal` of signal) while the built-in carried
+        /// after a fallback or switchback; it carries again (`bridge_switch=headset reason=recovered`).
+        case recovered
     }
     public struct Decision: Equatable, Sendable {
         public var dropFrames: Int = 0
@@ -52,6 +55,8 @@ public struct CaptureBridge {
     /// Built-in frames accepted (ring or dictation); 0 means the bridge carried nothing.
     public private(set) var builtinFrames = 0
     public private(set) var switchbacks = 0
+    /// v1.9: the headset carried again after the built-in had taken over.
+    public private(set) var headsetRetakes = 0
     /// v1.8: built-in frames fed while in `.fallback` (bt-proof: `builtin_frames_after_fallback`).
     public private(set) var builtinFramesAfterFallback = 0
     /// H2: nil until a restart was requested, then whether the headset delivered signal after it.
@@ -183,9 +188,14 @@ public struct CaptureBridge {
         case .switched where builtinAlive && silent > Self.switchbackAfter:
             if builtinFresh { switchBack(&result) }
             else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
-        case .fallback where staleSwitchback && signal >= Self.takeoverSignal:
-            state = .switched                    // the recovered headset carries again
+        case .fallback where signal >= Self.takeoverSignal:
+            // v1.9: the recovered headset carries again, whatever ended its turn (stale, digital
+            // zeros, or a startup fallback); tonight its second recovery delivered signal ~0.4 s
+            // after the 1.5 s fallback and v1.8's latch kept the distant built-in for the whole dictation.
+            state = .switched
             staleSwitchback = false
+            headsetRetakes += 1
+            result.event = .recovered
         default: break
         }
         // The one restart runs while the built-in carries; with nothing else to carry, only
@@ -281,6 +291,7 @@ public struct CaptureBridge {
         builtinAlive = false
         restart = nil
         switchbacks = 0
+        headsetRetakes = 0
         staleSwitchback = false
         return release
     }
