@@ -86,6 +86,12 @@ public final class AppController {
     private var captureFailure: CaptureFailure?
     /// v1.8 (L4): `session=<id>` correlates this dictation's notes with its outcome in bt-proof.
     private var openSession: (id: String, stats: AudioRecorder.CaptureStats?)?
+    /// The session a log line closes: taken from `openSession` exactly once (review #10).
+    struct SessionEnd { let id: String; let stats: AudioRecorder.CaptureStats? }
+    private func takeOpenSession(stats: AudioRecorder.CaptureStats? = nil) -> SessionEnd? {
+        defer { openSession = nil }
+        return openSession.map { SessionEnd(id: $0.id, stats: stats ?? $0.stats) }
+    }
     /// Tests: this controller's session/failure notes (the process-wide note sink is shared).
     var onSessionNote: ((String) -> Void)?
     private func sessionNote(_ line: String) {
@@ -662,7 +668,8 @@ public final class AppController {
         let finishClock = DispatchTime.now()
         let warmMs = capture.warmup.warmMs
         let samples = capture.end(.finished(.ok)) // flush final audio before detaching sessions
-        if openSession != nil { openSession?.stats = recorder.stats }
+        // This outcome owns its session from here on: a new dictation cannot repurpose it.
+        let session = takeOpenSession(stats: recorder.stats)
         recorder.onPCMChunk = nil
         let mediaEvents = resumeMedia()
         let duration = finishedAt.timeIntervalSince(recordingStarted ?? finishedAt)
@@ -680,7 +687,7 @@ public final class AppController {
             appleSession?.cancel()
             chunkedSession?.cancel()
             machine.transcriptionFinished()
-            fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0)
+            fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0, session: session)
             return
         }
 
@@ -855,33 +862,33 @@ public final class AppController {
                                     self.showOutcome(.ok)
                                 }
                                 self.traceFocus("pasting")
-                                self.appendLog(entry(text.count, app, .ok), fallback: policy.fallbackFields)
+                                self.appendLog(entry(text.count, app, .ok), fallback: policy.fallbackFields, session: session)
                                 return true
                             case .hold:
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(text, forType: .string)
                                 self.rememberHeldDictation(text)
                                 self.showOutcome(.held("focus_changed"), text: text)
-                                self.appendLog(entry(text.count, app, .held("focus_changed")), fallback: policy.fallbackFields)
+                                self.appendLog(entry(text.count, app, .held("focus_changed")), fallback: policy.fallbackFields, session: session)
                                 return false
                             }
                         })
                     })
                     if !policy.usesPaste {
                         self.clearOutcome()
-                        self.appendLog(entry(text.count, AppController.frontmostBundleID(), .ok), fallback: policy.fallbackFields)
+                        self.appendLog(entry(text.count, AppController.frontmostBundleID(), .ok), fallback: policy.fallbackFields, session: session)
                     }
                 case .success:
                     self.showOutcome(.held("no_stt"))
-                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields)
+                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields, session: session)
                 case .failure(let error):
                     let reason = (error as? TranscriptionError)?.logReason ?? "unknown"
                     if reason == "rejected_no_stt" {
                         self.showOutcome(.held("no_stt"))
-                        self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields)
+                        self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields, session: session)
                     } else {
                         self.showOutcome(.error(reason))
-                        self.appendLog(entry(0, AppController.frontmostBundleID(), .error(reason)), fallback: policy.fallbackFields)
+                        self.appendLog(entry(0, AppController.frontmostBundleID(), .error(reason)), fallback: policy.fallbackFields, session: session)
                     }
                 }
                 if fake == nil {
@@ -1032,7 +1039,8 @@ public final class AppController {
         log(duration: duration, bytes: 0, latencyMs: 0, chars: 0, app: AppController.frontmostBundleID(), outcome: .cancel)
     }
 
-    private func fail(reason: String, duration: TimeInterval, bytes: Int, latencyMs: Int) {
+    private func fail(reason: String, duration: TimeInterval, bytes: Int, latencyMs: Int, session: SessionEnd?? = nil) {
+        let owned = session ?? takeOpenSession()
         generation = CaptureEpoch()
         micStarting = false
         machine = DictationStateMachine()
@@ -1044,7 +1052,9 @@ public final class AppController {
         if mediaEvents != "-" { Self.note("fail media=\(mediaEvents)") }
         statusItem?.setRecording(false)
         showOutcome(.error(reason))
-        log(duration: duration, bytes: bytes, latencyMs: latencyMs, chars: 0, app: AppController.frontmostBundleID(), outcome: .error(reason))
+        appendLog(DictationLogEntry(time: Date(), durationSeconds: duration, audioBytes: bytes, latencyMs: latencyMs,
+                                    chars: 0, frontmostBundleID: AppController.frontmostBundleID(), outcome: .error(reason)),
+                  fallback: sessionPolicy.fallbackFields, session: owned)
     }
 
     private func log(duration: TimeInterval, bytes: Int, latencyMs: Int, chars: Int, app: String, outcome: DictationOutcome) {
@@ -1055,9 +1065,13 @@ public final class AppController {
     }
 
     func appendLog(_ entry: DictationLogEntry, fallback: String?) {
-        if let open = openSession {
-            openSession = nil
-            noteSessionEnd(id: open.id, stats: open.stats ?? recorder.stats, outcome: entry.outcome.label, entry: entry)
+        appendLog(entry, fallback: fallback, session: takeOpenSession())
+    }
+
+    /// Writes the outcome and closes exactly the session that produced it.
+    func appendLog(_ entry: DictationLogEntry, fallback: String?, session: SessionEnd?) {
+        if let session {
+            noteSessionEnd(id: session.id, stats: session.stats ?? recorder.stats, outcome: entry.outcome.label, entry: entry)
         }
         guard let fallback else { DictationLog.append(entry, to: paths.logURL); return }
         // DictateCore's line is unchanged; quota adds only its agreed label.

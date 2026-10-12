@@ -173,7 +173,14 @@ public struct CaptureHealth: Sendable {
             builtinReported = true
             actions.append(.builtinDead(problem))
         }
-        guard let boundary, failed == nil, let carrying else { return actions }
+        guard let boundary, failed == nil else { return actions }
+        guard let carrying else {
+            // No source configured yet (start still in flight): the never-first-buffer deadline runs anyway.
+            guard lastUseful == nil else { return actions }
+            if warned == nil, now - boundary > Self.builtinGrace { warned = .noInput; actions.append(.warn(.noInput)) }
+            if now >= boundary + Self.failAfter { failed = .noInput; actions.append(.fail(.noInput)) }
+            return actions
+        }
         let other: Source = carrying == .builtin ? .headset : .builtin
         let reason: Reason?
         switch status(carrying, at: now) {
