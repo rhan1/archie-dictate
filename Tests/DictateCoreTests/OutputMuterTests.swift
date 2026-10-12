@@ -39,6 +39,7 @@ final class FakeOutput: OutputMuteDevice {
     var profile = "a2dp"
     var capturedA2DPMute = false
     private var observers: [UUID: () -> Void] = [:]
+    private var outputObservers: [UUID: (OutputChange) -> Void] = [:]
     private final class Observation: CaptureCancellation {
         var cancellation: (() -> Void)?
         init(_ cancellation: @escaping () -> Void) { self.cancellation = cancellation }
@@ -65,7 +66,17 @@ final class FakeOutput: OutputMuteDevice {
         let id = UUID(); observers[id] = action
         return Observation { [weak self] in self?.observers[id] = nil }
     }
+    func observeOutputChanges(uid: String, _ action: @escaping (OutputChange) -> Void) -> CaptureCancellation? {
+        let id = UUID(); outputObservers[id] = action
+        return Observation { [weak self] in self?.outputObservers[id] = nil }
+    }
+    var outputObserverCount: Int { outputObservers.count }
     func notifyChange() { Array(observers.values).forEach { $0() } }
+    /// A CoreAudio change reaches both watches (settle windows and the live dictation).
+    func notifyOutput(_ reason: OutputChange) {
+        notifyChange()
+        Array(outputObservers.values).forEach { $0(reason) }
+    }
     func flip(to profile: String, notify: Bool = true) {
         self.profile = profile
         if profile == "a2dp" { mute["headset"] = capturedA2DPMute }
@@ -81,9 +92,11 @@ private final class MuteHarness {
     let clock = MuteClock()
     let file = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-mute-\(UUID().uuidString)")
     var events: [OutputMuter.Event] = []
+    var notes: [String] = []
     lazy var muter: OutputMuter = {
         let m = OutputMuter(device: out, stateFile: file, clock: clock, retryWait: { [clock] in clock.wait($0) })
         m.onEvent = { [weak self] in self?.events.append($0) }
+        m.onNote = { [weak self] in self?.notes.append($0) }
         return m
     }()
     var exists: Bool { FileManager.default.fileExists(atPath: file.path) }
@@ -302,5 +315,92 @@ struct OutputMuterTests {
         h.clock.advance(4)
         #expect(try String(contentsOf: h.file, encoding: .utf8) == "speakers\t0")
         _ = h.muter.restore(); h.clock.advance(5); #expect(!h.exists)
+    }
+
+    // v1.9 (L2): the mute is held for the whole dictation, across the headset's profile flips.
+    @Test func flagResetByProfileFlipIsReapplied() {
+        let h = MuteHarness()
+        #expect(h.muter.mute() == .muted)
+        h.out.profile = "hfp"; h.out.mute["headset"] = false   // the flip reset the device's flag
+        h.out.notifyOutput(.rateChanged)
+        #expect(h.out.mute["headset"] == true)
+        #expect(h.muter.reapplied == 1)
+        #expect(h.notes == ["mute_reapplied=1 uid=headset reason=rate_changed"])
+        h.out.profile = "a2dp"; h.out.mute["headset"] = false
+        h.out.notifyOutput(.defaultChanged)
+        #expect(h.out.mute["headset"] == true)
+        #expect(h.muter.reapplied == 2)
+        #expect(h.muter.restore() == .restored)
+        #expect(h.out.mute["headset"] == false)
+        #expect(h.muter.reapplied == 2)    // still readable for the timeline after restore
+        h.clock.advance(5); #expect(!h.exists)
+    }
+    @Test func aMutedFlagIsNotRewritten() {
+        let h = MuteHarness(); _ = h.muter.mute()
+        let writes = h.out.writes.count
+        h.out.notifyOutput(.devicesChanged)
+        #expect(h.out.writes.count == writes)
+        #expect(h.muter.reapplied == 0); #expect(h.notes.isEmpty)
+    }
+    @Test func secondUIDDuringDictationIsMutedAndRestored() throws {
+        let h = MuteHarness(); _ = h.muter.mute()
+        h.out.mute["headset-hfp"] = false
+        h.out.onWrite = { #expect(h.exists) }
+        h.out.defaultUID = "headset-hfp"   // the stack exposes HFP output as another device
+        h.out.notifyOutput(.defaultChanged)
+        h.out.onWrite = nil
+        #expect(h.out.mute["headset-hfp"] == true)
+        #expect(h.muter.mutedUIDs == ["headset", "headset-hfp"])
+        #expect(try String(contentsOf: h.file, encoding: .utf8) == "headset\t0\nheadset-hfp\t0")
+        #expect(h.notes == ["mute_reapplied=1 uid=headset-hfp reason=default_changed"])
+        #expect(h.muter.restore() == .restored)
+        #expect(h.out.mute["headset"] == false)
+        #expect(h.out.mute["headset-hfp"] == false)
+        h.clock.advance(5); #expect(!h.exists)
+    }
+    @Test func restoreRestoresEveryUIDInOrder() {
+        let h = MuteHarness(); _ = h.muter.mute()
+        h.out.mute["headset-hfp"] = true    // already muted by the user: its prior is kept
+        h.out.mute["speakers"] = false
+        h.out.defaultUID = "headset-hfp"; h.out.notifyOutput(.defaultChanged)
+        h.out.defaultUID = "speakers"; h.out.notifyOutput(.defaultChanged)
+        #expect(h.muter.mutedUIDs == ["headset", "headset-hfp", "speakers"])
+        let before = h.out.writes.count
+        #expect(h.muter.restore() == .restored)
+        let restoreWrites = h.out.writes[before...].map { "\($0.0)=\($0.1)" }
+        #expect(restoreWrites == ["headset=false", "headset-hfp=true", "speakers=false"])
+        #expect(h.out.mute["headset-hfp"] == true)
+        #expect(h.muter.mutedUIDs.isEmpty)
+    }
+    @Test func aFailedSecondRestoreKeepsItOwned() {
+        let h = MuteHarness(); _ = h.muter.mute()
+        h.out.mute["speakers"] = false
+        h.out.defaultUID = "speakers"; h.out.notifyOutput(.defaultChanged)
+        h.out.mute["speakers"] = nil         // gone before the end
+        #expect(h.muter.restore() == .restoreFailed)
+        #expect(h.out.mute["headset"] == false)
+        #expect(h.muter.mutedUIDs == ["speakers"])
+        #expect(h.exists)
+    }
+    @Test func hfpWithoutMuteIsNotedAndTheA2DPFlagKept() {
+        let h = MuteHarness(); _ = h.muter.mute()
+        h.out.mute["headset-hfp"] = false
+        h.out.unsupported = ["headset-hfp"]
+        h.out.defaultUID = "headset-hfp"
+        h.out.notifyOutput(.defaultChanged); h.out.notifyOutput(.rateChanged)
+        #expect(h.notes == ["mute_unsupported_uid=headset-hfp"])
+        #expect(!h.out.writes.contains { $0.0 == "headset-hfp" })
+        #expect(h.out.mute["headset"] == true)
+        #expect(h.muter.mutedUIDs == ["headset"])
+    }
+    @Test func restoreStopsReasserting() {
+        let h = MuteHarness(); _ = h.muter.mute()
+        #expect(h.out.outputObserverCount == 1)
+        #expect(h.muter.restore() == .restored)
+        #expect(h.out.outputObserverCount == 0)
+        h.clock.advance(5)
+        h.out.mute["headset"] = false; h.out.notifyOutput(.rateChanged)
+        #expect(h.muter.reapplied == 0)
+        #expect(h.out.mute["headset"] == false)
     }
 }
