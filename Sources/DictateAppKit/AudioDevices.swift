@@ -73,19 +73,41 @@ enum AudioDevices {
         try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                                       kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size)))
     }
-    /// H2: whether any client (any process) still runs IO on the default input device; nil if unreadable.
-    static func defaultInputIsRunningSomewhere() -> Bool? {
+    /// The current default input device (nil if unreadable).
+    static func defaultInputDevice() -> AudioDeviceID? {
         var device = AudioDeviceID(0)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr
-        else { return nil }
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr,
+              device != 0 else { return nil }
+        return device
+    }
+    /// v1.8 (L3): whether any client (any process) still runs IO on THIS device; nil if unreadable.
+    /// System-wide: it says nothing about our own units, which the caller has stopped first.
+    static func isRunningSomewhere(_ device: AudioDeviceID) -> Bool? {
         var running: UInt32 = 0
-        size = UInt32(MemoryLayout<UInt32>.size)
-        address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &running) == noErr else { return nil }
         return running != 0
+    }
+    static func isAlive(_ device: AudioDeviceID) -> Bool {
+        var alive: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &alive) == noErr else { return false }
+        return alive != 0
+    }
+    static func uid(of device: AudioDeviceID) -> String? {
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &uid) == noErr, let uid else { return nil }
+        return uid.takeRetainedValue() as String
     }
     /// D-a: after CurrentDevice changes, AUHAL keeps the previous default device's
     /// client (output-scope) format, and its input element does no sample-rate
