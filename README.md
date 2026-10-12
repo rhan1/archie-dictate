@@ -70,7 +70,7 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 - **Start Recording:** Press **⌥⌥** (double-tap Option). Grey bars appear while the microphone warms up, followed by white bars when listening to your voice.
 - **Finish Recording:** Tap **⌥ once** or click **✓**. Dictate transcribes the audio, runs cleanup, and pastes the text directly at your cursor.
 - **Cancel:** Press **Esc** or click **✕** to cancel recording or dismiss a pill.
-- **Held & Status Outcomes:** If a paste cannot land immediately (such as when switching apps during processing or when a service fails), the pill remains on screen for up to **20 seconds** displaying a status word (e.g., `held`, `no key`, `timeout`, `offline`, `error`).
+- **Held & Status Outcomes:** If a paste cannot land immediately (such as when switching apps during processing or when a service fails), the pill remains on screen for up to **20 seconds** displaying a status word (e.g., `held`, `no mic signal`, `no key`, `timeout`, `offline`, `error`).
   - Clicking **✓** or tapping **⌥ once** pastes the text into your active application.
   - The menu-bar microphone icon's **"Paste last dictation"** menu item retains the text for up to **10 minutes** in memory (RAM only, never saved to disk).
 - **Audio Output Muting:** Output audio is automatically muted while you talk (toggling the hardware mute flag only, never altering the volume slider) and restored immediately afterwards, including after a crash upon next launch.
@@ -94,9 +94,51 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 
 ## Bluetooth headsets
 
-A microphone that is open on a Bluetooth headset switches it to the hands-free profile (16 kHz, poor music quality). Dictate releases the audio engine within 2 s after every dictation, so music returns to full quality. While the headset's microphone starts (about a second), Dictate records from the built-in microphone so the first words are not lost. The timeline in `dictate.stderr.log` shows `bt_profile=a2dp|hfp`, `bridge_ms` and `bridge_src`. A `bt_hfp_foreign=1` note means another app is holding the headset microphone while Dictate is idle. `tools/probes/bt-probe.swift` prints the headset's live sample rate. To check it on your own headset, run `tools/bt-proof.sh` (about two minutes, two short dictations); it ends with `BT-PROOF: PASS` or the reason it failed.
+A microphone open on a Bluetooth headset switches macOS to the hands-free profile (HFP, 16 kHz). Dictate releases the audio engine within 2 s after every dictation, so output audio returns to high-fidelity A2DP (`bt_after3s=a2dp … engine_allocated=false`). While the headset voice link establishes (about 1–2 s), Dictate records concurrently from the Mac built-in microphone so initial speech is not lost. A `bt_hfp_foreign=1` note means another app is holding the headset microphone while Dictate is idle; `tools/probes/bt-probe.swift` prints the headset's live sample rate.
 
-If the headset link drops, the Mac mic carries the dictation. A headset sometimes starts sending pure silence when its voice link is torn down mid-start; Dictate keeps recording from the built-in microphone until the headset delivers real sound, stays on the built-in for the whole dictation if it never does, and switches back to the built-in if the headset goes silent part-way through. It also restarts the headset once so macOS can bring the link back. After a dictation, `tools/bt-proof.sh --log 10` checks the last 10 minutes of the system log and prints `BT-PROOF: PASS` when every dropped link either came back or the built-in microphone carried the dictation.
+v1.8's Bluetooth behaviour is unproven on a headset until the live protocol in [tools/live-protocol.md](tools/live-protocol.md) passes.
+
+### Dual-source capture and health clock
+
+- **Owned built-in capture:** The built-in microphone runs as an owned raw AUHAL unit pinned directly to the physical device (`builtin_backend=auhal`), isolated from AVAudioEngine's default aggregate tracking. Its device binding is read back every 100 ms (`bridge_device_check=ok|drift`); if it ever reports another device, the built-in is treated as dead rather than trusted.
+- **100 ms health clock:** An independent evaluator monitors both inputs every 100 ms. A source is marked stale after 600 ms without fresh frames (with startup grace periods of 1.0 s for the built-in mic and 2.0 s for the headset) and transport-silent after 1.5 s of exact digital zeros (distinct from quiet speech).
+- **Dynamic switching:** Dictate switches to the alternate input only when that source is fresh (frames delivered within 300 ms) and has at least 150 ms of real signal (`headset_signal_start=1`), in either direction (fallback no longer latches).
+- **Fast failure:** If no carrying source has valid signal, Dictate issues an immediate warning (`health=warn reason=…`) and terminates the dictation 2.0 s after the last useful audio with outcome `error:mic_dead` and pill status word `no mic signal`, logging actual audio duration and byte counts (`fail reason=mic_dead …`).
+- **Ordered delivery:** Audio chunks are queued and delivered in sequence outside the recorder lock so transitions never reorder audio.
+
+### Unified Bluetooth recovery
+
+All headset restart paths (startup retries, first-buffer timeouts, format configuration changes, and digital silence recovery) are governed by a single session-level episode:
+- At most one restart per 1.5 s window after input format has stabilized for 200 ms.
+- Recovery succeeds only when audio frames arrive within 1.0 s (not merely when `start()` returns).
+- Settle time after stopping is 300 ms.
+- External contention (when another app holds the headset) is noted via `bt_external_busy=1`, keeping capture on the healthy built-in mic without spinning (at most 3 attempts per dictation). Non-Bluetooth inputs recover immediately.
+
+### Diagnostic notes
+
+The unified log and `~/Library/Logs/Dictate/dictate.stderr.log` record key timeline events:
+- `session=<id> event=start|end`: Correlates session lifecycle with `recording_ms=`, `capture_intervals=`, `speech_sections=`, `builtin_frames_after_fallback=`, and `builtin_backend=`.
+- `builtin_backend=auhal`, `bridge_device_check=ok|drift|lost`: Status of the physical built-in capture unit.
+- `fallback_check builtin_fresh_at_fallback=1|0`: Verifies built-in freshness when falling back from a silent headset.
+- `headset_signal_start=1`: Confirms non-zero headset signal arrival.
+- `bt_external_busy=1`, `bt_recovery=requested|queued|settled`: Bluetooth recovery episode decisions.
+- `fail reason=mic_dead kept_ms=… last_delivery_ms=… sources=…`: Failure details when no input signal arrives.
+
+### Bluetooth proof (`tools/bt-proof.sh`)
+
+`tools/bt-proof.sh` inspects dictation sessions and validates capture integrity:
+- Inspect recent system logs: `tools/bt-proof.sh --log <minutes>`
+- Inspect a specific time window: `tools/bt-proof.sh --log-window '<start>' '<end>'` (e.g. `'2026-10-12 21:33:05' '2026-10-12 21:33:50'`)
+- Inspect saved log dumps or test fixtures: `tools/bt-proof.sh --from-file <file>`
+- With no arguments it still runs the older two-minute interactive profile check (two short dictations).
+
+A session achieves `BT-PROOF: PASS` only when all of the following hold:
+1. **Outcome:** `outcome=ok`, or `held` with retained characters (`chars>0`).
+2. **Coverage:** Sample-time capture coverage ≥95 % of the recording duration after a ≤1.0 s startup allowance, with no gap >600 ms (calculated from `capture_intervals=`).
+3. **Speech evidence:** At least 3 speech sections (`speech_sections>=3`, runs of ≥300 ms with RMS ≥−40 dBFS separated by ≥200 ms).
+4. **Transport recovery:** Every dropped eSCO link (`Dropping eSCO creation`) must either be re-created within 1.5 s followed by headset audio frames (`headset_signal_start=1`), or fall back onto a fresh built-in mic (`builtin_fresh_at_fallback=1`) that kept audio frames (`builtin_frames_after_fallback>0`).
+
+Missing sessions, duplicate session IDs, missing outcomes, or log errors fail (`BT-PROOF: FAIL <reason>`). Live testing on a Bluetooth headset follows the protocol in [tools/live-protocol.md](tools/live-protocol.md).
 
 ## Embedding (DictateKit)
 
