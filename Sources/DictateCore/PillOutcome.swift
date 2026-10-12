@@ -24,6 +24,7 @@ public struct PillOutcome: Equatable, Sendable {
         case .held(let reason): return reason == "no_stt" ? "no speech" : "held"
         case .error(let reason):
             let reason = reason.lowercased()
+            if reason.contains("mic_dead") { return "no mic signal" }
             if reason.contains("mic_start") || reason.contains("mic_denied") { return "no mic" }
             if reason.contains("missing_key") { return "no key" }
             if reason.contains("timedout") { return "timeout" }

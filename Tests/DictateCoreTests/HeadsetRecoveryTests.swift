@@ -13,7 +13,7 @@ struct HeadsetRecoveryTests {
         /// The Bluetooth input keeps running somewhere until this time (another client, coreaudiod teardown).
         var busyUntil: TimeInterval = 0
         var unreadable = false
-        func stop() { log.append("stop@\(ms)") }
+        func stop() -> Bool { log.append("stop@\(ms)"); return true }
         func running() -> Bool? { unreadable ? nil : clock < busyUntil }
         func sleep(_ s: TimeInterval) { clock += s }
         func start() { log.append("start@\(ms)") }
@@ -25,8 +25,8 @@ struct HeadsetRecoveryTests {
         fake.busyUntil = 0.1
         let outcome = HeadsetRestart.perform(stop: fake.stop, isRunningSomewhere: fake.running,
                                              sleep: fake.sleep, start: fake.start, note: { _ in })
-        #expect(fake.log == ["stop@0", "start@250"])                  // idle at 100 ms + 150 ms settle
-        #expect(outcome == .init(waitedMs: 250, deviceIdle: true, started: true))
+        #expect(fake.log == ["stop@0", "start@400"])                  // idle at 100 ms + 300 ms settle (v1.8)
+        #expect(outcome == .init(waitedMs: 400, deviceIdle: true, started: true))
     }
 
     @Test func restartPollIsBoundedAt400ms() {
@@ -34,13 +34,13 @@ struct HeadsetRecoveryTests {
         fake.busyUntil = 10
         let outcome = HeadsetRestart.perform(stop: fake.stop, isRunningSomewhere: fake.running,
                                              sleep: fake.sleep, start: fake.start, note: { _ in })
-        #expect(fake.log == ["stop@0", "start@550"])
+        #expect(fake.log == ["stop@0", "start@700"])
         #expect(!outcome.deviceIdle && outcome.started)
         let unreadable = FakeHeadset()
         unreadable.unreadable = true
         _ = HeadsetRestart.perform(stop: unreadable.stop, isRunningSomewhere: unreadable.running,
                                    sleep: unreadable.sleep, start: unreadable.start, note: { _ in })
-        #expect(unreadable.log == ["stop@0", "start@550"])
+        #expect(unreadable.log == ["stop@0", "start@700"])
     }
 
     @Test func failedRestartIsNotedNotRetried() {
@@ -86,31 +86,40 @@ struct HeadsetRecoveryTests {
         #expect(check == .drift(from: 152) && check.note == "bridge_device_check=drift from=152 fixed=0")
     }
 
-    // MARK: H4 — start-failure back-off
+    // MARK: H4 → v1.8 L3 — RecoveryThrottle folded into BluetoothRecoveryEpisode
 
     @Test func afterAStartFailureOneRecoveryRunsThenTheRestWait() {
-        var throttle = RecoveryThrottle()
-        throttle.startFailed(at: 0)
-        let admissions = [0.05, 0.1, 0.3, 0.9].map { throttle.request(at: $0) }
-        #expect(admissions == [.now, .after(1.5), .coalesced, .coalesced])
-        #expect(throttle.attempts == 1)                                    // within the first second
-        throttle.deferredFired(at: 1.6)
-        #expect(throttle.attempts == 2)
+        var episode = BluetoothRecoveryEpisode(bluetooth: true)
+        #expect(episode.request(.startRetry, at: 0) == .now)
+        let first = episode.begin(at: 0)
+        #expect(first)
+        let during = [episode.request(.configuration, at: 0.1), episode.request(.configuration, at: 0.3)]
+        #expect(during == [.coalesced, .coalesced])
+        episode.settled(.noFrames)
+        #expect(episode.request(.restart, at: 0.9) == .after(0.6))         // next window opens at 1.5
+        #expect(episode.request(.firstBuffer, at: 1.0) == .coalesced)
+        let second = episode.begin(at: 1.5)
+        #expect(second)
+        #expect(episode.attempts == 2)
     }
 
     @Test func configurationChangeRightAfterOurRecoveryCountsAsAFailedStart() {
-        var throttle = RecoveryThrottle()
-        #expect(throttle.request(at: 10) == .now)
-        guard case .after(let wait) = throttle.request(at: 10.4) else { Issue.record("not deferred"); return }
-        #expect(abs(wait - 1.2) < 1e-9)                                    // due at 10 + 1.0 + 0.6
-        #expect(throttle.request(at: 11.0) == .coalesced)
-        throttle.deferredFired(at: 11.6)
-        #expect(throttle.request(at: 14) == .now)                          // quiet again: immediate
-        #expect(throttle.attempts == 3)
+        // A notification storm: the stable-format debounce is bounded by the window.
+        var episode = BluetoothRecoveryEpisode(bluetooth: true)
+        for step in 0...20 { episode.formatChanged(at: 10 + Double(step) * 0.1) }
+        guard case .after(let wait) = episode.request(.configuration, at: 10) else { Issue.record("not deferred"); return }
+        #expect(abs(wait - 1.5) < 1e-9)                                    // 10 + window, not 12.2
+        var quiet = BluetoothRecoveryEpisode(bluetooth: true)
+        quiet.formatChanged(at: 20)
+        guard case .after(let debounce) = quiet.request(.configuration, at: 20.05) else { Issue.record("no debounce"); return }
+        #expect(abs(debounce - 0.15) < 1e-9)                               // stable 200 ms after the change
     }
 
     @Test func unrelatedConfigurationChangesAreNotDelayed() {
-        var throttle = RecoveryThrottle()
-        #expect([0, 1.5, 3, 4.5].map { throttle.request(at: $0) } == [.now, .now, .now, .now])
+        var episode = BluetoothRecoveryEpisode(bluetooth: false)               // non-Bluetooth: prompt recovery
+        var admissions: [BluetoothRecoveryEpisode.Admission] = []
+        for time in [0, 0.1, 0.2, 1.5] { admissions.append(episode.request(.configuration, at: time)) }
+        #expect(admissions == [.now, .now, .now, .now])
+        #expect(episode.attempts == 4)
     }
 }
