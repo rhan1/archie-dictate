@@ -241,6 +241,7 @@ public struct CaptureFeed {
     /// built-in, shows the warning, and ends the dictation on `failure`.
     public mutating func tick(at now: TimeInterval) -> TickOutput {
         var out = TickOutput()
+        guard bridge.state != .off else { return out }
         for action in health.tick(at: now, carrying: carrying) {
             switch action {
             case .builtinDead(let problem):
@@ -280,6 +281,7 @@ public struct CaptureFeed {
     @discardableResult public mutating func cancel() -> Bool {
         ring.removeAll()
         standby.removeAll()
+        health = CaptureHealth()
         return bridge.cancel()
     }
 
