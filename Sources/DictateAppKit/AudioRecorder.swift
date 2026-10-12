@@ -205,10 +205,11 @@ public final class AudioRecorder: CaptureEngine {
 
     /// Stops `unit` only if it is still running for `epoch` (a reused unit is never stopped by stale cleanup).
     private func stopBuiltinUnit(_ unit: BuiltinCapture, queue: DispatchQueue, epoch: CaptureEpoch) {
+        // The watch belongs to the current queue: cleanup on an abandoned queue never touches it.
         queue.async { [weak self] in
-            self?.lock.withLock { self?.builtinWatch.began(at: ProcessInfo.processInfo.systemUptime) }
+            self?.lock.withLock { if self?.builtinQueue === queue { self?.builtinWatch.began(at: ProcessInfo.processInfo.systemUptime) } }
             unit.stop(epoch: epoch)
-            self?.lock.withLock { self?.builtinWatch.ended() }
+            self?.lock.withLock { if self?.builtinQueue === queue { self?.builtinWatch.ended() } }
         }
     }
 
@@ -256,12 +257,24 @@ public final class AudioRecorder: CaptureEngine {
         self.startedAt = DispatchTime.now()
         stats.device = device == .builtIn ? "built-in" : (AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown")
         if device == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) } }
-        // L3: a lifecycle retry the episode queued is begun here, when it actually runs.
-        lock.withLock {
-            if lifecycleAttemptPending, engineEpoch === startEpoch {
-                lifecycleAttemptPending = false
-                _ = episode.begin(at: startedAt, force: true)
+        // L3: a lifecycle retry the episode queued is begun here, when it actually runs, after
+        // re-checking the stable format (a notification during the lifecycle's wait moves it).
+        let lifecycleAttempt: Bool = lock.withLock {
+            defer { lifecycleAttemptPending = false }
+            return lifecycleAttemptPending && engineEpoch === startEpoch
+        }
+        if lifecycleAttempt {
+            if case .wait(let more) = lock.withLock({ episode.beginIfStable(at: ProcessInfo.processInfo.systemUptime) }) {
+                Thread.sleep(forTimeInterval: min(more, BluetoothRecoveryEpisode.window))
+                if case .wait = lock.withLock({ episode.beginIfStable(at: ProcessInfo.processInfo.systemUptime) }) {
+                    lock.withLock { _ = episode.begin(at: ProcessInfo.processInfo.systemUptime, force: true) }   // bounded by the window
+                }
             }
+        }
+        // Verification is armed BEFORE the hardware start: a frame during startup counts, and a
+        // start that never returns still settles the attempt at its absolute deadline.
+        if lock.withLock({ episode.isRunning && engineEpoch === startEpoch }) {
+            verifyFrames(epoch: startEpoch, since: ProcessInfo.processInfo.systemUptime, path: .startRetry)
         }
         registerConfigurationObserver()
         try installTapAndStart()
@@ -275,9 +288,6 @@ public final class AudioRecorder: CaptureEngine {
         }
         guard activated else { throw CancellationError() }
         recording = true
-        if lock.withLock({ episode.isRunning && engineEpoch === startEpoch }) {
-            verifyFrames(epoch: startEpoch, since: startedAt, path: .startRetry)
-        }
     }
 
     /// Serial background execution keeps Bluetooth engine startup off the main thread.
@@ -452,7 +462,8 @@ public final class AudioRecorder: CaptureEngine {
         var result: CaptureConfigurationRecovery.Result
         if bluetooth {
             // One admitted operation: a retap. No retap→rebuild escape inside the window; a failed
-            // retap asks the episode for a full restart instead.
+            // retap asks the episode for a full restart instead. Verification is armed first.
+            verifyFrames(epoch: epoch, since: now, path: .configuration)
             do {
                 try captureObjC {
                     try self.removeTap()
@@ -488,14 +499,15 @@ public final class AudioRecorder: CaptureEngine {
                     self.captureRunning = true
                 }
             }
-            if activated {
-                self.recording = true
-                if bluetooth { verifyFrames(epoch: epoch, since: now, path: .configuration) }
-            } else { self.teardownEngine() }
+            if activated { self.recording = true }
+            else { self.teardownEngine() }
             return
         }
         if bluetooth {
-            lock.withLock { if engineEpoch === epoch, episode.isRunning { episode.settled(.failed) } }
+            lock.withLock {
+                verifying = nil
+                if engineEpoch === epoch, episode.isRunning { episode.settled(.failed) }
+            }
             if result == .failed {
                 // The headset engine stays as it is (stopped by AVAudioEngine); the built-in, if
                 // healthy, keeps carrying; the episode decides the next attempt.
@@ -609,7 +621,6 @@ public final class AudioRecorder: CaptureEngine {
         defer { lock.withLock { restarting = false } }
         // Same shape as a cold start: a fresh engine, never the stopped one (its input
         // format reads 0 Hz while the headset is back on A2DP).
-        var startedAt = now
         let outcome = HeadsetRestart.perform(stop: {
             self.teardownEngine()
             return self.lock.withLock { self.engine == nil }
@@ -617,7 +628,7 @@ public final class AudioRecorder: CaptureEngine {
             device.flatMap { AudioDevices.isRunningSomewhere($0) }
         }, sleep: { Thread.sleep(forTimeInterval: $0) }, start: {
             guard self.lock.withLock({ self.engineEpoch === epoch }) else { throw CancellationError() }
-            startedAt = ProcessInfo.processInfo.systemUptime
+            self.verifyFrames(epoch: epoch, since: ProcessInfo.processInfo.systemUptime, path: path)    // armed before the start
             try self.rebuild()
             try self.installTapAndStart()
             let activated = self.lock.withLock {
@@ -634,6 +645,7 @@ public final class AudioRecorder: CaptureEngine {
         let carried: (nothing: Bool, event: CaptureBridge.Event?) = lock.withLock {
             guard engineEpoch === epoch else { return (false, nil) }
             feed.headsetRestarted(started: outcome.started)
+            if !outcome.started { verifying = nil }
             if outcome.externalBusy { episode.settled(.externalBusy) }
             else if !outcome.started { episode.settled(.failed) }
             guard !outcome.started else { return (false, nil) }
@@ -651,7 +663,6 @@ public final class AudioRecorder: CaptureEngine {
         // Notes reach the host's sink: never under `lock`.
         if let event = carried.event { Self.noteCarried(event, reason: "headset_restart_failed") }
         if carried.nothing { reportEngineFailure(epoch: epoch) }
-        if outcome.started { verifyFrames(epoch: epoch, since: startedAt, path: path) }
     }
 
     /// L3: a restart succeeded only if headset frames arrive within 1.0 s (not when start() returned).
