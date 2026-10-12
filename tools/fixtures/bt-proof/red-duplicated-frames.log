@@ -1,0 +1,3 @@
+# Duplicated frames control
+2026-10-12 10:00:10.000 dk [..] dictate: session=R7 event=start
+2026-10-12 10:00:21.000 dictate: session=R7 event=end outcome=ok duration_ms=10000 bytes=480044 chars=45 recording_ms=10000 capture_intervals=0-6000,5000-10000 speech_sections=3 builtin_frames_after_fallback=0
