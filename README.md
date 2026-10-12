@@ -96,7 +96,7 @@ Use the **left Option** key (press and release cleanly without other modifier ke
 
 A microphone open on a Bluetooth headset switches macOS to the hands-free profile (HFP, 16 kHz). Dictate releases the audio engine within 2 s after every dictation, so output audio returns to high-fidelity A2DP (`bt_after3s=a2dp … engine_allocated=false`). While the headset voice link establishes (about 1–2 s), Dictate records concurrently from the Mac built-in microphone so initial speech is not lost. A `bt_hfp_foreign=1` note means another app is holding the headset microphone while Dictate is idle; `tools/probes/bt-probe.swift` prints the headset's live sample rate.
 
-v1.8's Bluetooth behaviour is unproven on a headset until the live protocol in [tools/live-protocol.md](tools/live-protocol.md) passes.
+v1.9's Bluetooth behaviour is unproven on a headset until the live protocol in [tools/live-protocol.md](tools/live-protocol.md) passes.
 
 ### Dual-source capture and health clock
 
@@ -110,7 +110,9 @@ v1.8's Bluetooth behaviour is unproven on a headset until the live protocol in [
 
 All headset restart paths (startup retries, first-buffer timeouts, format configuration changes, and digital silence recovery) are governed by a single session-level episode:
 - At most one restart per 1.5 s window after input format has stabilized for 200 ms.
-- Recovery succeeds only when audio frames arrive within 1.0 s (not merely when `start()` returns).
+- v1.9: when the configuration change finds the headset engine already stopped (AVAudioEngine auto-stops it on the A2DP→HFP switch), the first re-attach is immediate (`bt_recovery=immediate path=configuration engine_running=0 after_ms=…`): macOS tears an idle voice link down about 250 ms after it connects unless a client is doing IO. Later attempts keep the debounce.
+- Recovery succeeds only when audio frames with signal arrive within 1.0 s (not merely when `start()` returns). Outcome words: `result=frames` (signal), `result=silent_frames` (buffers, all digital zeros — an idle link; treated like no frames), `result=no_frames`.
+- v1.9: a headset that recovers after the built-in took over carries again once it delivers 150 ms of signal (`bridge_switch=headset reason=recovered`).
 - Settle time after stopping is 300 ms.
 - External contention (when another app holds the headset) is noted via `bt_external_busy=1`, keeping capture on the healthy built-in mic without spinning (at most 3 attempts per dictation). Non-Bluetooth inputs recover immediately.
 
@@ -121,7 +123,10 @@ The unified log and `~/Library/Logs/Dictate/dictate.stderr.log` record key timel
 - `builtin_backend=auhal`, `bridge_device_check=ok|drift|lost`: Status of the physical built-in capture unit.
 - `fallback_check builtin_fresh_at_fallback=1|0`: Verifies built-in freshness when falling back from a silent headset.
 - `headset_signal_start=1`: Confirms non-zero headset signal arrival.
-- `bt_external_busy=1`, `bt_recovery=requested|queued|settled`: Bluetooth recovery episode decisions.
+- `bt_external_busy=1`, `bt_recovery=requested|queued|immediate|settled`: Bluetooth recovery episode decisions (`settled … result=frames|silent_frames|no_frames`).
+- `bridge_switch=headset reason=recovered`: a recovered headset carries again after a fallback.
+- `mute_reapplied=1 uid=… reason=default_changed|devices_changed|rate_changed`: the output mute flag was reset during the dictation (a headset profile flip) and set again; the timeline's `media=muted>restored(verified) mute_reapplied=<n>` counts them. `mute_unsupported_uid=…`: that output exposes no settable mute flag (volume is never touched).
+- `speech_sections=` counts speech sections relative to the dictation's own noise floor (+12 dB, never below −60 dBFS), so a quiet built-in fallback still shows its speech.
 - `fail reason=mic_dead kept_ms=… last_delivery_ms=… sources=…`: Failure details when no input signal arrives.
 
 ### Bluetooth proof (`tools/bt-proof.sh`)
