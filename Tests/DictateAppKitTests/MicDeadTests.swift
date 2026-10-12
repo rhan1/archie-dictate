@@ -69,12 +69,12 @@ struct MicDeadRecorderTests {
     }
 
     /// Runs a scenario at 20× until it fails or `mediaSeconds` of media time pass.
-    private func run(_ scenario: WAVInjectedRecorder.Scenario, mediaSeconds: Double) async throws
-        -> (failure: CaptureFailure?, notes: [String], pcm: [Int16], wav: [Int16]) {
+    private func run(_ scenario: WAVInjectedRecorder.Scenario, mediaSeconds: Double, legacy: Bool = false) async throws
+        -> (failure: CaptureFailure?, notes: [String], pcm: [Int16], wav: [Int16], stats: AudioRecorder.CaptureStats) {
         // Longer than any run: the WAV's trailing zeros must never be what the clock sees.
         let (dir, url) = try wav(seconds: 7)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let recorder = WAVInjectedRecorder(url: url, pace: 0.05, scenario: scenario)
+        let recorder = WAVInjectedRecorder(url: url, pace: 0.05, scenario: scenario, legacyRecoveryTiming: legacy)
         let notes = Lines()
         let pcmLock = NSLock()
         var pcm: [Int16] = []
@@ -89,7 +89,26 @@ struct MicDeadRecorderTests {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         _ = recorder.stop()
-        return (failure, notes.snapshot, pcmLock.withLock { pcm }, Self.tone(seconds: 7))
+        return (failure, notes.snapshot, pcmLock.withLock { pcm }, Self.tone(seconds: 7), recorder.stats)
+    }
+
+    // v1.9 L1: sco_torn_down_250ms — the immediate re-attach keeps the route; v1.8's debounce loses it.
+    @Test func scoTornDown250msImmediateReattachHeadsetCarriesGreen() async throws {
+        let result = try await run(.scoTornDown250ms, mediaSeconds: 3)
+        #expect(result.failure == nil)
+        #expect(result.notes.contains("bt_recovery=immediate path=configuration engine_running=0 after_ms=0"))
+        #expect(!result.notes.contains { $0.hasPrefix("bridge_src=builtin_fallback") })
+        #expect(result.stats.bridgeSource == "builtin")             // bridged, then the headset took over
+        #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))
+    }
+
+    @Test func scoTornDown250msV18DebounceFallsBackRed() async throws {
+        let result = try await run(.scoTornDown250ms, mediaSeconds: 3, legacy: true)
+        #expect(result.failure == nil)
+        #expect(result.notes.contains("bt_recovery=queued path=configuration wait_ms=200"))
+        #expect(result.notes.contains("bridge_src=builtin_fallback reason=headset_digital_silence"))
+        #expect(result.stats.bridgeSource == "builtin_fallback")
+        #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))   // the built-in still carries
     }
 
     @Test func builtinDiesScenarioEndsWithMicDeadWithin2s() async throws {
