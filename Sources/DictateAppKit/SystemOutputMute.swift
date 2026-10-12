@@ -53,6 +53,11 @@ public final class SystemOutputMute: OutputMuteDevice {
     /// Watch the muted UID even when it is no longer the default output.
     /// Rebind its rate listener when CoreAudio replaces its object on reconnect.
     public func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation? {
+        ChangeWatch(owner: self, uid: uid) { _ in action() }
+    }
+
+    /// v1.9 (L2): the same watch while a dictation holds the mute, telling which property changed.
+    public func observeOutputChanges(uid: String, _ action: @escaping (OutputChange) -> Void) -> CaptureCancellation? {
         ChangeWatch(owner: self, uid: uid, action: action)
     }
 
@@ -79,16 +84,19 @@ public final class SystemOutputMute: OutputMuteDevice {
     private final class ChangeWatch: CaptureCancellation {
         weak var owner: SystemOutputMute?
         let uid: String
-        let action: () -> Void
+        let action: (OutputChange) -> Void
         var cancelled = false
         var systemListeners: [PropertyListener] = []
         var rateListener: PropertyListener?
         var watchedDevice: AudioDeviceID?
-        init(owner: SystemOutputMute, uid: String, action: @escaping () -> Void) {
+        init(owner: SystemOutputMute, uid: String, action: @escaping (OutputChange) -> Void) {
             self.owner = owner; self.uid = uid; self.action = action
-            for selector in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices] {
+            let system: [(AudioObjectPropertySelector, OutputChange)] = [
+                (kAudioHardwarePropertyDefaultOutputDevice, .defaultChanged), (kAudioHardwarePropertyDevices, .devicesChanged)
+            ]
+            for (selector, reason) in system {
                 systemListeners.append(PropertyListener(object: AudioObjectID(kAudioObjectSystemObject), selector: selector) { [weak self] in
-                    self?.changed()
+                    self?.changed(reason)
                 })
             }
             rebind()
@@ -99,14 +107,14 @@ public final class SystemOutputMute: OutputMuteDevice {
             rateListener?.cancel(); rateListener = nil; watchedDevice = device
             if let device {
                 rateListener = PropertyListener(object: device, selector: kAudioDevicePropertyNominalSampleRate) { [weak self] in
-                    self?.changed()
+                    self?.changed(.rateChanged)
                 }
             }
         }
-        func changed() {
+        func changed(_ reason: OutputChange) {
             guard !cancelled else { return }
             rebind()
-            action()
+            action(reason)
         }
         func cancel() {
             cancelled = true
