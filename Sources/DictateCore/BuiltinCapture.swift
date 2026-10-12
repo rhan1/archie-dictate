@@ -12,6 +12,8 @@ public protocol BuiltinCapture: AnyObject {
     func start(epoch: CaptureEpoch) throws
     /// Idempotent; also after a partial start.
     func stop()
+    /// Stops only if the unit is still running for `epoch` (stale cleanup never stops a reused unit).
+    func stop(epoch: CaptureEpoch)
     var isDelivering: Bool { get }
     /// Read back from the unit now (nil: unreadable or not started).
     var currentDeviceID: UInt32? { get }
