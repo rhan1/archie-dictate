@@ -1,0 +1,17 @@
+# Archived live run R1 (session 8b58cb96), Archie 35.1 + DictateKit v1.8, 2026-10-13 01:53:07–01:53:27 +08 — speech_sections=0 on a quiet built-in fallback (transcript-free notes; timeline line omitted)
+2026-10-13 01:53:07.662 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.663Z] dictate: builtin_backend=auhal device=81 bridge_device_check=ok
+2026-10-13 01:53:07.750 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.752Z] dictate: keys=groq:ok reader=custom
+2026-10-13 01:53:07.750 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.752Z] dictate: session=8b58cb96 event=start
+2026-10-13 01:53:07.755 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:07.757Z] dictate: tap2_to_first_kept_buffer_ms=0 kept_src=ring preroll_frames=2040
+2026-10-13 01:53:08.542 Df Archie[64486:389ec716] [com.razakhan.archie:voice] dk [2026-10-12T17:53:08.543Z] dictate: bt_recovery=queued path=configuration wait_ms=200
+2026-10-13 01:53:09.751 Df Archie[64486:389f63d3] [com.razakhan.archie:voice] dk [2026-10-12T17:53:09.752Z] dictate: bt_recovery=settled path=configuration result=frames
+2026-10-13 01:53:09.751 Df Archie[64486:389ec717] [com.razakhan.archie:voice] dk [2026-10-12T17:53:09.752Z] dictate: bt_recovery=queued path=configuration wait_ms=291
+2026-10-13 01:53:10.319 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:10.321Z] dictate: bridge_src=builtin_fallback reason=headset_digital_silence
+2026-10-13 01:53:10.319 Df Archie[64486:389e4e55] [com.razakhan.archie:voice] dk [2026-10-12T17:53:10.321Z] dictate: fallback_check builtin_fresh_at_fallback=1 builtin_age_ms=0
+2026-10-13 01:53:10.783 Df Archie[64486:389f63d3] [com.razakhan.archie:voice] dk [2026-10-12T17:53:10.785Z] dictate: headset_signal_start=1
+2026-10-13 01:53:11.052 Df Archie[64486:389f6c24] [com.razakhan.archie:voice] dk [2026-10-12T17:53:11.053Z] dictate: bt_recovery=settled path=configuration result=frames
+2026-10-13 01:53:17.584 Df Archie[64486:389ec13c] [com.razakhan.archie:voice] dk [2026-10-12T17:53:17.585Z] dictate: headset_signal_start=1
+2026-10-13 01:53:17.983 Df Archie[64486:389f68ae] [com.razakhan.archie:voice] dk [2026-10-12T17:53:17.985Z] dictate: headset_signal_start=1
+2026-10-13 01:53:18.283 Df Archie[64486:389e4e54] [com.razakhan.archie:voice] dk [2026-10-12T17:53:18.285Z] dictate: headset_signal_start=1
+2026-10-13 01:53:26.018 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:26.020Z] dictate: headset_restart=1 result=still_silent
+2026-10-13 01:53:26.671 Df Archie[64486:38322c0a] [com.razakhan.archie:voice] dk [2026-10-12T17:53:26.672Z] dictate: session=8b58cb96 event=end outcome=ok duration_ms=18268 bytes=877364 chars=219 recording_ms=18263 capture_intervals=0-18249 speech_sections=0 builtin_frames_after_fallback=375368 builtin_backend=auhal

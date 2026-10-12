@@ -68,6 +68,12 @@ struct BtProofGateTests {
         #expect(res.finalLine.contains("drop_unrecovered@"))
     }
 
+    @Test func redFallbackZeroSectionsFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-fallback-zero-sections.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine == "BT-PROOF: FAIL speech_sections=0 <3")
+    }
+
     @Test func redMissingOutcomeFails() throws {
         let res = try runGate(fixturePath: fixtureURL(named: "red-missing-outcome.log"))
         #expect(res.status == 1)
