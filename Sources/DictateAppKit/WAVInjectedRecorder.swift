@@ -137,7 +137,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     public func start(device: MicChoice = .default) throws {
         // Parse before taking the lock: a throw must never leave it held (isRunning is read next).
-        let parsed = try Self.parseWAV(at: url)
+        try start(parsed: Self.parseWAV(at: url))
+    }
+
+    private func start(parsed: [Int16]) throws {
         lock.lock()
         if timer != nil {
             lock.unlock()
@@ -175,8 +178,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
         failed = false
     }
 
+    /// Parses off the caller's actor (the controller calls this from the main actor).
     public func startAsync(device: MicChoice = .default) async throws {
-        try start(device: device)
+        if isRunning { return }
+        let url = self.url
+        let parsed = try await Task.detached { try Self.parseWAV(at: url) }.value
+        try start(parsed: parsed)
     }
 
     private func tick() {
