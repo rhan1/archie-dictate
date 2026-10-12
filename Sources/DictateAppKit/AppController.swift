@@ -645,6 +645,7 @@ public final class AppController {
                     return key
                 }, prompt: prompt,
                    rejoinGuard: GroqChunkedTranscriber.rejoinGuardEnabled(environment: ProcessInfo.processInfo.environment),
+                   lowSpeechGuard: GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: ProcessInfo.processInfo.environment),
                    onChunkText: { index, text in incremental?.append(index: index, text: text) },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
@@ -1009,6 +1010,7 @@ public final class AppController {
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
+                           "stt_dropped_low_speech_sentence=\(chunked.droppedLowSpeechSentences)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
                            "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
                 for call in chunked.calls {
