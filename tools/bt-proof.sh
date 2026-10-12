@@ -179,13 +179,17 @@ main() {
 }
 
 esco_usage() {
-    echo "Usage: $0 [--log <minutes> | --log-window '<start>' '<end>' | --from-file <coreaudio.log> [<notes.log>] | analyse <stderr> <probe>]" >&2
+    echo "Usage: $0 [--log <minutes> | --log-window '<start>' '<end>' | --from-file <file> [<file2> ...] | analyse <stderr> <probe>]" >&2
     exit 2
 }
 
 esco_analyse() {
-    local ca_file="$1"
-    local notes_file="${2:-/dev/null}"
+    local stream_file="$1"
+
+    if [ ! -r "$stream_file" ]; then
+        echo "BT-PROOF: FAIL parser_error"
+        return 1
+    fi
 
     /usr/bin/awk '
     function days_from_civil(y, m, d,   era, yoe, m_adj, doy, doe) {
@@ -204,117 +208,612 @@ esco_analyse() {
 
     function parse_time(d_str, t_str,   d_parts, t_parts, s_parts, y, m, d, h, min, s, ms_str, ms) {
         if (split(d_str, d_parts, "-") != 3) return -1
+        if (length(d_parts[1]) != 4 || length(d_parts[2]) != 2 || length(d_parts[3]) != 2) return -1
+        if (d_parts[1] !~ /^[0-9]{4}$/ || d_parts[2] !~ /^[0-9]{2}$/ || d_parts[3] !~ /^[0-9]{2}$/) return -1
         y = d_parts[1] + 0
         m = d_parts[2] + 0
         d = d_parts[3] + 0
         if (split(t_str, t_parts, ":") != 3) return -1
+        if (length(t_parts[1]) != 2 || length(t_parts[2]) != 2) return -1
+        if (t_parts[1] !~ /^[0-9]{2}$/ || t_parts[2] !~ /^[0-9]{2}$/) return -1
         h = t_parts[1] + 0
         min = t_parts[2] + 0
         if (split(t_parts[3], s_parts, ".") == 2) {
+            if (s_parts[1] !~ /^[0-9]{2}$/ || s_parts[2] !~ /^[0-9]+$/) return -1
             s = s_parts[1] + 0
             ms_str = s_parts[2]
             while (length(ms_str) < 3) ms_str = ms_str "0"
             ms = substr(ms_str, 1, 3) + 0
         } else {
+            if (t_parts[3] !~ /^[0-9]{2}$/) return -1
             s = t_parts[3] + 0
             ms = 0
         }
         return days_from_civil(y, m, d) * 86400000 + h * 3600000 + min * 60000 + s * 1000 + ms
     }
 
+    function format_raw_time(t_str,   t_parts, s_parts, ms_str) {
+        if (split(t_str, t_parts, ":") != 3) return t_str
+        if (split(t_parts[3], s_parts, ".") == 2) {
+            ms_str = s_parts[2]
+            while (length(ms_str) < 3) ms_str = ms_str "0"
+            return t_parts[1] ":" t_parts[2] ":" s_parts[1] "." substr(ms_str, 1, 3)
+        } else {
+            return t_parts[1] ":" t_parts[2] ":" t_parts[3] ".000"
+        }
+    }
+
+    function extract_field(s, key,   m) {
+        if (match(s, "(^|[ \t])" key "=[^ \t\r\n]+")) {
+            m = substr(s, RSTART, RLENGTH)
+            sub("^[ \t]*" key "=", "", m)
+            return m
+        }
+        return ""
+    }
+
+    function has_field(s, key) {
+        return match(s, "(^|[ \t])" key "=[^ \t\r\n]+") > 0
+    }
+
     {
         t = parse_time($1, $2)
         if (t < 0) next
 
+        t_raw = format_raw_time($2)
+
         if (index($0, "Dropping eSCO creation") > 0) {
             n_drops++
-            drop_time[n_drops] = t
-            drop_raw[n_drops] = $2
-        } else if (index($0, "type = Creation") > 0) {
-            n_creations++
-            creation_time[n_creations] = t
-        } else if (index($0, "type = Disconnection") > 0) {
-            n_disconns++
-            disconn_time[n_disconns] = t
+            drop_t[n_drops] = t
+            drop_raw[n_drops] = t_raw
+            drop_sess[n_drops] = ""
         }
+
+        if (index($0, "operaton type = Creation") > 0 || index($0, "operation type = Creation") > 0) {
+            n_creations++
+            creation_t[n_creations] = t
+            creation_sess[n_creations] = ""
+        }
+
         if (index($0, "bridge_src=builtin_fallback") > 0) {
             n_fallbacks++
-            fallback_time[n_fallbacks] = t
+            fallback_t[n_fallbacks] = t
+            fallback_sess[n_fallbacks] = ""
+            if (has_field($0, "builtin_fresh_at_fallback")) {
+                fallback_fresh[n_fallbacks] = extract_field($0, "builtin_fresh_at_fallback") + 0
+            } else {
+                fallback_fresh[n_fallbacks] = -1
+            }
+        }
+
+        if (has_field($0, "builtin_fresh_at_fallback")) {
+            n_freshness++
+            freshness_t[n_freshness] = t
+            freshness_val[n_freshness] = extract_field($0, "builtin_fresh_at_fallback") + 0
+        }
+
+        if (index($0, "headset_signal_start=1") > 0) {
+            n_headset_signals++
+            headset_signal_t[n_headset_signals] = t
+            headset_signal_sess[n_headset_signals] = ""
+        }
+
+        if (has_field($0, "session")) {
+            saw_session_note = 1
+            sid = extract_field($0, "session")
+            ev = extract_field($0, "event")
+            if (ev == "start") {
+                if (!session_seen[sid]) {
+                    session_seen[sid] = 1
+                    n_sessions++
+                    session_list[n_sessions] = sid
+                    session_start_cnt[sid] = 1
+                    session_start_t[sid] = t
+                } else {
+                    session_duplicate[sid] = 1
+                    session_start_cnt[sid]++
+                }
+            } else if (ev == "end") {
+                if (!session_seen[sid]) {
+                    session_seen[sid] = 1
+                    n_sessions++
+                    session_list[n_sessions] = sid
+                    session_missing_start[sid] = 1
+                    session_end_cnt[sid] = 1
+                    session_end_t[sid] = t
+                } else {
+                    session_end_cnt[sid]++
+                    session_end_t[sid] = t
+                }
+                if (has_field($0, "outcome")) {
+                    session_has_outcome[sid] = 1
+                    session_outcome[sid] = extract_field($0, "outcome")
+                }
+                if (has_field($0, "duration_ms")) {
+                    session_has_duration_ms[sid] = 1
+                    session_duration_ms[sid] = extract_field($0, "duration_ms") + 0
+                }
+                if (has_field($0, "bytes")) {
+                    session_has_bytes[sid] = 1
+                    session_bytes[sid] = extract_field($0, "bytes") + 0
+                }
+                if (has_field($0, "chars")) {
+                    session_has_chars[sid] = 1
+                    session_chars[sid] = extract_field($0, "chars") + 0
+                }
+                if (has_field($0, "recording_ms")) {
+                    session_has_recording_ms[sid] = 1
+                    session_recording_ms[sid] = extract_field($0, "recording_ms") + 0
+                }
+                if (has_field($0, "capture_intervals")) {
+                    session_has_capture_intervals[sid] = 1
+                    session_capture_intervals[sid] = extract_field($0, "capture_intervals")
+                }
+                if (has_field($0, "speech_sections")) {
+                    session_has_speech_sections[sid] = 1
+                    session_speech_sections[sid] = extract_field($0, "speech_sections") + 0
+                }
+                if (has_field($0, "builtin_frames_after_fallback")) {
+                    session_has_builtin_frames[sid] = 1
+                    session_builtin_frames[sid] = extract_field($0, "builtin_frames_after_fallback") + 0
+                }
+            }
+        }
+
+        if (match($0, "(^|[ \t])duration=[0-9]+(\\.[0-9]+)?s") && has_field($0, "bytes") && has_field($0, "latency_ms") && has_field($0, "chars") && has_field($0, "app") && has_field($0, "outcome")) {
+            n_legacy_lines++
+            legacy_t[n_legacy_lines] = t
+            legacy_raw[n_legacy_lines] = t_raw
+            legacy_line[n_legacy_lines] = $0
         }
     }
 
     END {
-        recovered_cnt = 0
-        fallback_cnt = 0
-        failed_cnt = 0
-        earliest_fail_raw = ""
-        earliest_fail_time = ""
+        tot_pass = 0
+        tot_held = 0
+        tot_cancelled = 0
+        tot_failed = 0
+        tot_recovered = 0
+        tot_successful_fallbacks = 0
+        drops_outside_sessions = 0
 
-        for (i = 1; i <= n_drops; i++) {
-            td = drop_time[i]
-            c_found = 0
-            min_tc = 0
-            for (j = 1; j <= n_creations; j++) {
-                if (creation_time[j] > td) {
-                    if (!c_found || creation_time[j] < min_tc) {
-                        c_found = 1
-                        min_tc = creation_time[j]
-                    }
-                }
+        if (!saw_session_note && n_legacy_lines > 0) {
+            for (k = 1; k <= n_legacy_lines; k++) {
+                lline = legacy_line[k]
+                lt = legacy_t[k]
+                lraw = legacy_raw[k]
+
+                split(lraw, r_parts, ":")
+                split(r_parts[3], sec_parts, ".")
+                legacy_id = "legacy-" r_parts[1] r_parts[2] sec_parts[1]
+
+                dur_s_str = extract_field(lline, "duration")
+                sub(/s$/, "", dur_s_str)
+                dur_ms_val = (dur_s_str + 0) * 1000
+
+                n_sessions++
+                session_list[n_sessions] = legacy_id
+                session_seen[legacy_id] = 1
+                session_start_cnt[legacy_id] = 1
+                session_end_cnt[legacy_id] = 1
+                session_start_t[legacy_id] = lt - dur_ms_val - 1000
+                session_end_t[legacy_id] = lt + 1000
+
+                session_has_outcome[legacy_id] = 1
+                session_outcome[legacy_id] = extract_field(lline, "outcome")
+
+                session_has_duration_ms[legacy_id] = 1
+                session_duration_ms[legacy_id] = dur_ms_val
+
+                session_has_bytes[legacy_id] = 1
+                session_bytes[legacy_id] = extract_field(lline, "bytes") + 0
+
+                session_has_chars[legacy_id] = 1
+                session_chars[legacy_id] = extract_field(lline, "chars") + 0
             }
+        }
 
-            d_found = 0
-            min_tdisc = 0
-            for (j = 1; j <= n_disconns; j++) {
-                if (disconn_time[j] > td && (!c_found || disconn_time[j] < min_tc)) {
-                    if (!d_found || disconn_time[j] < min_tdisc) {
-                        d_found = 1
-                        min_tdisc = disconn_time[j]
-                    }
-                }
-            }
-            anchor = (d_found ? min_tdisc : td)
+        for (i = 1; i <= n_sessions; i++) {
+            sid = session_list[i]
+            if (session_start_cnt[sid] == 0) session_missing_start[sid] = 1
+            if (session_end_cnt[sid] == 0) session_missing_end[sid] = 1
+        }
 
-            if (c_found && min_tc <= anchor + 1500) {
-                drop_status[i] = "recovered"
-                recovered_cnt++
-            } else {
-                fb_found = 0
-                for (j = 1; j <= n_fallbacks; j++) {
-                    if (fallback_time[j] >= td - 2000 && fallback_time[j] <= td + 5000) {
-                        fb_found = 1
+        for (d = 1; d <= n_drops; d++) {
+            drop_sess[d] = ""
+            for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+                sid = session_list[s_idx]
+                if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
+                    if (session_start_t[sid] <= drop_t[d] && drop_t[d] <= session_end_t[sid]) {
+                        drop_sess[d] = sid
+                        sess_drop_cnt[sid]++
                         break
                     }
                 }
-                if (fb_found) {
-                    drop_status[i] = "fallback"
-                    fallback_cnt++
-                } else {
-                    drop_status[i] = "FAIL"
-                    failed_cnt++
-                    if (earliest_fail_time == "" || td < earliest_fail_time) {
-                        earliest_fail_time = td
-                        earliest_fail_raw = drop_raw[i]
+            }
+            if (drop_sess[d] == "") {
+                drops_outside_sessions++
+                drop_status[d] = "FAIL"
+            }
+        }
+
+        for (c = 1; c <= n_creations; c++) {
+            creation_sess[c] = ""
+            for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+                sid = session_list[s_idx]
+                if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
+                    if (session_start_t[sid] <= creation_t[c] && creation_t[c] <= session_end_t[sid]) {
+                        creation_sess[c] = sid
+                        break
                     }
                 }
             }
         }
 
-        n = (n_drops + 0)
-        print "drops=" n " recovered=" recovered_cnt " fallback=" fallback_cnt " failed=" failed_cnt
-        for (i = 1; i <= n_drops; i++) {
-            print "drop " drop_raw[i] " -> " drop_status[i]
+        for (f = 1; f <= n_fallbacks; f++) {
+            fallback_sess[f] = ""
+            for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+                sid = session_list[s_idx]
+                if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
+                    if (session_start_t[sid] <= fallback_t[f] && fallback_t[f] <= session_end_t[sid]) {
+                        fallback_sess[f] = sid
+                        break
+                    }
+                }
+            }
         }
 
-        if (failed_cnt == 0) {
+        for (h = 1; h <= n_headset_signals; h++) {
+            headset_signal_sess[h] = ""
+            for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+                sid = session_list[s_idx]
+                if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
+                    if (session_start_t[sid] <= headset_signal_t[h] && headset_signal_t[h] <= session_end_t[sid]) {
+                        headset_signal_sess[h] = sid
+                        break
+                    }
+                }
+            }
+        }
+
+        for (f = 1; f <= n_fallbacks; f++) {
+            if (fallback_fresh[f] == -1) {
+                tf = fallback_t[f]
+                fsid = fallback_sess[f]
+                best_diff = 999999
+                found_val = -1
+                for (k = 1; k <= n_freshness; k++) {
+                    diff = freshness_t[k] - tf
+                    if (diff < 0) abs_diff = -diff; else abs_diff = diff
+                    if (abs_diff <= 50) {
+                        if (fsid == "" || (session_start_t[fsid] <= freshness_t[k] && freshness_t[k] <= session_end_t[fsid])) {
+                            if (abs_diff < best_diff) {
+                                best_diff = abs_diff
+                                found_val = freshness_val[k]
+                            }
+                        }
+                    }
+                }
+                if (found_val >= 0) fallback_fresh[f] = found_val
+            }
+        }
+
+        for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+            sid = session_list[s_idx]
+            n_r = 0
+
+            if (session_duplicate[sid]) {
+                n_r++; reasons[n_r] = "duplicate_session"
+            }
+            if (session_missing_start[sid]) {
+                n_r++; reasons[n_r] = "missing_start_marker"
+            }
+            if (session_missing_end[sid]) {
+                n_r++; reasons[n_r] = "missing_end_marker"
+            }
+
+            # (a) outcome
+            if (!session_has_outcome[sid]) {
+                n_r++; reasons[n_r] = "missing_outcome"
+            } else {
+                outc = session_outcome[sid]
+                if (outc == "cancel") {
+                    session_verdict[sid] = "CANCELLED"
+                    tot_cancelled++
+                    continue
+                } else if (outc == "ok") {
+                    # ok passes
+                } else if (match(outc, /^held(:.*)?$/)) {
+                    if (session_has_chars[sid] && session_chars[sid] > 0) {
+                        session_is_held[sid] = 1
+                    } else {
+                        n_r++; reasons[n_r] = "outcome=" outc
+                    }
+                } else {
+                    n_r++; reasons[n_r] = "outcome=" outc
+                }
+            }
+
+            # (b) coverage
+            if (!session_has_capture_intervals[sid]) {
+                n_r++; reasons[n_r] = "missing_capture_intervals"
+                if (session_has_bytes[sid] && session_has_duration_ms[sid] && session_duration_ms[sid] > 0) {
+                    byte_cov = (session_bytes[sid] - 44) / 48000.0 / (session_duration_ms[sid] / 1000.0)
+                    pct = byte_cov * 100.0
+                    pct_str = sprintf("%.1f", pct)
+                    session_cov_pct[sid] = pct_str "%"
+                    if (byte_cov < 0.95) {
+                        n_r++; reasons[n_r] = "coverage=" pct_str "% <95%"
+                    }
+                } else {
+                    session_cov_pct[sid] = "na"
+                }
+            } else {
+                if (!session_has_recording_ms[sid]) {
+                    n_r++; reasons[n_r] = "missing_recording_ms"
+                    D = 0
+                } else {
+                    D = session_recording_ms[sid]
+                }
+
+                c_ints = session_capture_intervals[sid]
+                if (c_ints == "none") {
+                    n_intervals = 0
+                } else {
+                    n_intervals = split(c_ints, arr_ints, ",")
+                    prev_e = -1
+                    order_err = 0
+                    for (i = 1; i <= n_intervals; i++) {
+                        split(arr_ints[i], p, "-")
+                        s_val = p[1] + 0
+                        e_val = p[2] + 0
+                        iv_s[i] = s_val
+                        iv_e[i] = e_val
+                        if (e_val <= s_val || (i > 1 && s_val < prev_e)) {
+                            order_err = 1
+                        }
+                        prev_e = e_val
+                    }
+                    if (order_err) {
+                        n_r++; reasons[n_r] = "duplicate_or_unordered_intervals"
+                    }
+                }
+
+                A = 1000
+                if (n_intervals > 0) {
+                    if (iv_s[1] > A) {
+                        n_r++; reasons[n_r] = "late_start=" iv_s[1] "ms"
+                    }
+                    if (D <= A) {
+                        cov = 1.0
+                    } else {
+                        n_clip = 0
+                        for (i = 1; i <= n_intervals; i++) {
+                            cs = (iv_s[i] > A ? iv_s[i] : A)
+                            ce = (iv_e[i] < D ? iv_e[i] : D)
+                            if (cs < ce) {
+                                n_clip++
+                                clip_s[n_clip] = cs
+                                clip_e[n_clip] = ce
+                            }
+                        }
+                        for (i = 1; i <= n_clip; i++) {
+                            for (j = i + 1; j <= n_clip; j++) {
+                                if (clip_s[j] < clip_s[i]) {
+                                    tmp = clip_s[i]; clip_s[i] = clip_s[j]; clip_s[j] = tmp
+                                    tmp = clip_e[i]; clip_e[i] = clip_e[j]; clip_e[j] = tmp
+                                }
+                            }
+                        }
+                        tot_covered = 0
+                        if (n_clip > 0) {
+                            cur_s = clip_s[1]
+                            cur_e = clip_e[1]
+                            for (i = 2; i <= n_clip; i++) {
+                                if (clip_s[i] <= cur_e) {
+                                    if (clip_e[i] > cur_e) cur_e = clip_e[i]
+                                } else {
+                                    tot_covered += (cur_e - cur_s)
+                                    cur_s = clip_s[i]
+                                    cur_e = clip_e[i]
+                                }
+                            }
+                            tot_covered += (cur_e - cur_s)
+                        }
+                        cov = tot_covered / (D - A)
+                    }
+                } else {
+                    cov = 0.0
+                }
+
+                pct = cov * 100.0
+                pct_str = sprintf("%.1f", pct)
+                session_cov_pct[sid] = pct_str "%"
+                if (cov < 0.95) {
+                    n_r++; reasons[n_r] = "coverage=" pct_str "% <95%"
+                }
+
+                max_gap = 0
+                if (n_intervals > 0) {
+                    for (i = 1; i < n_intervals; i++) {
+                        g = iv_s[i+1] - iv_e[i]
+                        if (g > 600 && g > max_gap) max_gap = g
+                    }
+                    if (session_has_recording_ms[sid]) {
+                        end_g = D - iv_e[n_intervals]
+                        if (end_g > 600 && end_g > max_gap) max_gap = end_g
+                    }
+                }
+                if (max_gap > 600) {
+                    n_r++; reasons[n_r] = "gap=" max_gap "ms >600ms"
+                }
+            }
+
+            # (c) speech
+            if (!session_has_speech_sections[sid]) {
+                n_r++; reasons[n_r] = "missing_speech_sections"
+            } else {
+                sp_sec = session_speech_sections[sid]
+                if (sp_sec < 3) {
+                    n_r++; reasons[n_r] = "speech_sections=" sp_sec " <3"
+                }
+            }
+
+            # (d) drops inside session
+            for (d = 1; d <= n_drops; d++) {
+                if (drop_sess[d] == sid) {
+                    td = drop_t[d]
+                    rec_ok = 0
+                    for (c = 1; c <= n_creations; c++) {
+                        if (creation_sess[c] == sid) {
+                            tc = creation_t[c]
+                            if (tc > td && tc <= td + 1500) {
+                                for (h = 1; h <= n_headset_signals; h++) {
+                                    if (headset_signal_sess[h] == sid && headset_signal_t[h] > tc) {
+                                        rec_ok = 1
+                                        break
+                                    }
+                                }
+                                if (rec_ok) break
+                            }
+                        }
+                    }
+
+                    if (rec_ok) {
+                        drop_status[d] = "recovered"
+                        sess_recovered_cnt[sid]++
+                        tot_recovered++
+                    } else {
+                        fb_ok = 0
+                        for (f = 1; f <= n_fallbacks; f++) {
+                            if (fallback_sess[f] == sid) {
+                                tf = fallback_t[f]
+                                if (tf >= td - 2000 && fallback_fresh[f] == 1 && session_has_builtin_frames[sid] && session_builtin_frames[sid] > 0) {
+                                    fb_ok = 1
+                                    break
+                                }
+                            }
+                        }
+                        if (fb_ok) {
+                            drop_status[d] = "fallback"
+                            sess_fallback_cnt[sid]++
+                            tot_successful_fallbacks++
+                        } else {
+                            drop_status[d] = "FAIL"
+                            n_r++; reasons[n_r] = "drop_unrecovered@" drop_raw[d]
+                        }
+                    }
+                }
+            }
+
+            if (n_r == 0) {
+                if (session_is_held[sid]) {
+                    session_verdict[sid] = "HELD"
+                    tot_held++
+                } else {
+                    session_verdict[sid] = "PASS"
+                    tot_pass++
+                }
+            } else {
+                session_verdict[sid] = "FAIL"
+                tot_failed++
+                session_n_reasons[sid] = n_r
+                for (r_i = 1; r_i <= n_r; r_i++) {
+                    session_reasons[sid, r_i] = reasons[r_i]
+                }
+            }
+        }
+
+        for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+            sid = session_list[s_idx]
+            cov_out = (session_cov_pct[sid] != "" ? session_cov_pct[sid] : "na")
+            if (session_verdict[sid] == "CANCELLED") cov_out = "na"
+            outc = (session_has_outcome[sid] ? session_outcome[sid] : "missing")
+
+            r_str = ""
+            if (session_verdict[sid] == "FAIL" && session_n_reasons[sid] > 0) {
+                r_str = " reasons=" session_reasons[sid, 1]
+                for (r_i = 2; r_i <= session_n_reasons[sid]; r_i++) {
+                    r_str = r_str "," session_reasons[sid, r_i]
+                }
+            }
+
+            printf("session=%s %s outcome=%s coverage=%s drops=%d recovered=%d successful_fallbacks=%d%s\n",
+                   sid, session_verdict[sid], outc, cov_out,
+                   sess_drop_cnt[sid] + 0, sess_recovered_cnt[sid] + 0, sess_fallback_cnt[sid] + 0,
+                   r_str)
+        }
+
+        for (d = 1; d <= n_drops; d++) {
+            sess_name = (drop_sess[d] != "" && drop_sess[d] != "none" ? drop_sess[d] : "none")
+            printf("drop %s session=%s -> %s\n", drop_raw[d], sess_name, drop_status[d])
+        }
+
+        printf("sessions=%d pass=%d held=%d cancelled=%d failed=%d drops=%d recovered=%d successful_fallbacks=%d drops_outside_sessions=%d\n",
+               n_sessions, tot_pass, tot_held, tot_cancelled, tot_failed,
+               n_drops, tot_recovered, tot_successful_fallbacks, drops_outside_sessions)
+
+        evaluable = tot_pass + tot_held + tot_failed
+        if (evaluable == 0) {
+            print "BT-PROOF: FAIL missing_sessions"
+            exit 1
+        } else if (tot_failed == 0) {
             print "BT-PROOF: PASS"
             exit 0
         } else {
-            print "BT-PROOF: FAIL " earliest_fail_raw
+            first_fail_idx = 0
+            for (k = 1; k <= n_sessions; k++) {
+                sid = session_list[k]
+                if (session_verdict[sid] == "FAIL") {
+                    first_fail_idx = k
+                    break
+                }
+            }
+            sid = session_list[first_fail_idx]
+            fail_reasons = ""
+            for (r_i = 1; r_i <= session_n_reasons[sid]; r_i++) {
+                if (r_i == 1) fail_reasons = session_reasons[sid, r_i]
+                else fail_reasons = fail_reasons " " session_reasons[sid, r_i]
+            }
+            if (n_drops > 0) {
+                fail_reasons = fail_reasons " successful_fallbacks=" tot_successful_fallbacks
+            }
+            print "BT-PROOF: FAIL " fail_reasons
             exit 1
         }
     }
-    ' "$ca_file" "$notes_file"
+    ' "$stream_file"
+    local awk_rc=$?
+    if [ "$awk_rc" -ne 0 ] && [ "$awk_rc" -ne 1 ]; then
+        echo "BT-PROOF: FAIL parser_error"
+        return 1
+    fi
+    return "$awk_rc"
+}
+
+esco_from_files() {
+    for f in "$@"; do
+        if [ ! -r "$f" ]; then
+            echo "BT-PROOF: FAIL parser_error"
+            exit 1
+        fi
+    done
+    local stream_tmp
+    stream_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-stream.XXXXXX")
+    trap 'rm -f "$stream_tmp"' EXIT
+    sort -s -k1,2 "$@" > "$stream_tmp" 2>/dev/null
+    local sort_rc=$?
+    if [ "$sort_rc" -ne 0 ]; then
+        echo "BT-PROOF: FAIL parser_error"
+        rm -f "$stream_tmp"
+        trap - EXIT
+        exit 1
+    fi
+    esco_analyse "$stream_tmp"
+    local rc=$?
+    rm -f "$stream_tmp"
+    trap - EXIT
+    exit "$rc"
 }
 
 esco_log_window() {
@@ -331,50 +830,79 @@ esco_log_window() {
         esco_usage
     fi
 
-    local coreaudio_tmp
-    local notes_tmp
-    coreaudio_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-ca.XXXXXX")
+    local ca_tmp notes_tmp stderr_tmp dict_tmp combined_tmp stream_tmp
+    ca_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-ca.XXXXXX")
     notes_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-notes.XXXXXX")
-    trap 'rm -f "$coreaudio_tmp" "$notes_tmp"' EXIT
+    stderr_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-stderr.XXXXXX")
+    dict_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-dict.XXXXXX")
+    combined_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-combined.XXXXXX")
+    stream_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-stream.XXXXXX")
+    trap 'rm -f "$ca_tmp" "$notes_tmp" "$stderr_tmp" "$dict_tmp" "$combined_tmp" "$stream_tmp"' EXIT
 
     /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
         --predicate 'process == "coreaudiod" AND subsystem == "com.apple.bluetooth"' 2>/dev/null \
-        | grep -E 'Dropping eSCO creation|Injecting silent Audio started|operation completed operaton type = (Creation|Disconnection)' \
-        > "$coreaudio_tmp"
+        | grep -E 'Dropping eSCO creation|operat(i)?on type = Creation' \
+        > "$ca_tmp"
     local status_ca=${PIPESTATUS[0]}
 
     /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
         --predicate 'subsystem == "com.razakhan.archie" AND category == "voice"' 2>/dev/null \
-        | grep -F 'bridge_src=builtin_fallback' \
+        | grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start' \
         > "$notes_tmp"
     local status_notes=${PIPESTATUS[0]}
 
     if [ "$status_ca" -ne 0 ] || [ "$status_notes" -ne 0 ]; then
         echo "BT-PROOF: FAIL log_show_error"
-        exit 2
+        exit 1
     fi
 
     local dictate_stderr="$HOME/Library/Logs/Dictate/dictate.stderr.log"
     if [ -f "$dictate_stderr" ]; then
-        local line
-        local stamp
-        local l_sec
-        local local_ts
+        local line stamp frac text l_sec local_base ms_part local_ts
         while IFS= read -r line; do
-            if [[ "$line" =~ ^\[([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+            if [[ "$line" =~ ^\[([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.([0-9]+))?Z\]\ dictate:\ +(.*) ]]; then
                 stamp="${BASH_REMATCH[1]}Z"
-                l_sec=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$stamp" '+%s' 2>/dev/null || true)
-                if [ -n "$l_sec" ] && [ "$l_sec" -ge "$start_sec" ] && [ "$l_sec" -le "$end_sec" ]; then
-                    local_ts=$(date -r "$l_sec" '+%Y-%m-%d %H:%M:%S.000')
-                    echo "$local_ts $line" >> "$notes_tmp"
+                frac="${BASH_REMATCH[3]:-}"
+                text="${BASH_REMATCH[4]}"
+                if [[ "$text" =~ session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start ]]; then
+                    l_sec=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$stamp" '+%s' 2>/dev/null || true)
+                    if [ -n "$l_sec" ] && [ "$l_sec" -ge "$start_sec" ] && [ "$l_sec" -le "$end_sec" ]; then
+                        local_base=$(date -r "$l_sec" '+%Y-%m-%d %H:%M:%S')
+                        if [ -n "$frac" ]; then
+                            while [ ${#frac} -lt 3 ]; do frac="${frac}0"; done
+                            ms_part=".${frac:0:3}"
+                        else
+                            ms_part=".000"
+                        fi
+                        local_ts="${local_base}${ms_part}"
+                        echo "$local_ts dictate: $text" >> "$stderr_tmp"
+                    fi
                 fi
             fi
-        done < <(grep -F 'bridge_src=builtin_fallback' "$dictate_stderr" 2>/dev/null || true)
+        done < <(grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start' "$dictate_stderr" 2>/dev/null || true)
     fi
 
-    esco_analyse "$coreaudio_tmp" "$notes_tmp"
+    local dictate_log="$HOME/Library/Logs/Dictate/dictate.log"
+    if [ -f "$dictate_log" ]; then
+        local line d_stamp d_rest d_sec d_local_ts
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})([+-][0-9]{2}):([0-9]{2})\ +(duration=.*) ]]; then
+                d_stamp="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+                d_rest="${BASH_REMATCH[4]}"
+                d_sec=$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$d_stamp" '+%s' 2>/dev/null || true)
+                if [ -n "$d_sec" ] && [ "$d_sec" -ge "$start_sec" ] && [ "$d_sec" -le "$end_sec" ]; then
+                    d_local_ts=$(date -r "$d_sec" '+%Y-%m-%d %H:%M:%S.000')
+                    echo "$d_local_ts $d_rest" >> "$dict_tmp"
+                fi
+            fi
+        done < <(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* duration=' "$dictate_log" 2>/dev/null || true)
+    fi
+
+    cat "$ca_tmp" "$notes_tmp" "$stderr_tmp" "$dict_tmp" > "$combined_tmp"
+    sort -s -k1,2 "$combined_tmp" > "$stream_tmp"
+    esco_analyse "$stream_tmp"
     local rc=$?
-    rm -f "$coreaudio_tmp" "$notes_tmp"
+    rm -f "$ca_tmp" "$notes_tmp" "$stderr_tmp" "$dict_tmp" "$combined_tmp" "$stream_tmp"
     trap - EXIT
     exit "$rc"
 }
@@ -393,14 +921,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         fi
         esco_log_window "$2" "$3"
     elif [[ "${1:-}" == "--from-file" ]]; then
-        if [ $# -lt 2 ] || [ $# -gt 3 ] || [ ! -f "${2:-}" ]; then
+        shift
+        if [ $# -lt 1 ]; then
             esco_usage
         fi
-        if [ $# -eq 3 ] && [ ! -f "${3:-}" ]; then
-            esco_usage
-        fi
-        esco_analyse "$2" "${3:-/dev/null}"
-        exit $?
+        esco_from_files "$@"
     elif [[ "${1:-}" == "analyse" ]]; then
         analyse "${2:-}" "${3:-}"
         exit $?
@@ -411,3 +936,4 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         main "$@"
     fi
 fi
+
