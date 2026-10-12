@@ -128,7 +128,12 @@ public final class AppController {
         self.paths = paths
         pill = EnginePanel(surface: surface, factory: dependencies?.panelFactory ?? { PillPanel() })
         engineMode = mode
-        muter = OutputMuter(device: SystemOutputMute(), stateFile: paths.mutedStateURL)
+        let muter = OutputMuter(device: SystemOutputMute(), stateFile: paths.mutedStateURL)
+        // Standalone and hosted alike (v1.9): settle events and re-mute notes reach the log.
+        // Verified settle events can occur after the dictation timeline is emitted.
+        muter.onEvent = { event in AppController.note(event.rawValue) }
+        muter.onNote = { AppController.note($0) }
+        self.muter = muter
         let prompt = Vocabulary.buildPrompt(fileURL: paths.vocabularyURL)
         let keys = keyStore
         let groqKey: @Sendable () throws -> String = {
@@ -204,8 +209,6 @@ public final class AppController {
             warmLocalModel()
             Task { await AppleTranscriber.ensureAssets() }
         }
-        // Verified settle events can occur after the dictation timeline is emitted.
-        muter.onEvent = { event in AppController.note(event.rawValue) }
         // A run that crashed while muted is undone at launch.
         if let event = muter.recoverIfNeeded() { AppController.note("media=\(event.rawValue) (at launch)") }
         installTerminationRestore()
@@ -533,7 +536,10 @@ public final class AppController {
         if let event = muter.restore() { mediaLog.append(event.rawValue) }
         if let event = media.resumeIfWePaused() { mediaLog.append(event.rawValue) }
         defer { mediaLog = [] }
-        return mediaLog.isEmpty ? "none" : mediaLog.joined(separator: ">")
+        guard !mediaLog.isEmpty else { return "none" }
+        // v1.9 (L2): how often the flag was muted again while this dictation held it.
+        let reapplied = mediaLog.contains("muted") ? " mute_reapplied=\(muter.reapplied)" : ""
+        return mediaLog.joined(separator: ">") + reapplied
     }
 
     /// Quit (menu) and SIGTERM (launchctl kickstart/bootout) both restore the
