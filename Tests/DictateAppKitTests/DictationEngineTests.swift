@@ -19,7 +19,7 @@ private final class TestRecorder: EngineRecorder {
     var onLevel: ((Double) -> Void)?
     var onPCMChunk: (([Int16]) -> Void)?
     var onFirstBuffer: (() -> Void)?
-    var onCaptureFailure: (() -> Void)?
+    var onCaptureFailure: ((CaptureFailure) -> Void)?
     var stats = AudioRecorder.CaptureStats()
     var ready = false
     var starts = 0, stops = 0

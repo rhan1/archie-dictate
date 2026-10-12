@@ -88,6 +88,9 @@ public struct CaptureRing {
 /// arbitration (CaptureBridge), the pre-roll ring before the second tap, and the
 /// frames that enter the dictation after it. The owner holds its lock around
 /// every call, exactly as it did for the bridge alone.
+///
+/// v1.8: also the per-source health (CaptureHealth, ticked by the owner's 100 ms clock) and the
+/// counts-only capture evidence (CaptureEvidence) the session-end note carries.
 public struct CaptureFeed {
     public struct Output: Equatable, Sendable {
         public var frames: [Float] = []
@@ -96,9 +99,25 @@ public struct CaptureFeed {
         public var firstKept = false
         public var restartHeadset = false
         public var event: CaptureBridge.Event?
+        /// v1.8: the headset just completed `switchSignal` of signal (`headset_signal_start=1`).
+        public var headsetSignalStart = false
+        /// v1.8: with a `.fallback` event, whether the built-in was fresh, and its buffer age.
+        public var fallbackFresh: Bool?
+        public var builtinAgeMs: Int?
+        public var fallbackRefused = false
+    }
+    /// One health-clock evaluation's effects, applied by the owner after its lock.
+    public struct TickOutput: Equatable, Sendable {
+        public var frames: [Float] = []
+        public var notes: [String] = []
+        public var stopBuiltin = false
+        public var warn: CaptureHealth.Reason?
+        public var failure: CaptureFailure?
     }
     public private(set) var bridge = CaptureBridge()
     public private(set) var ring: CaptureRing
+    public private(set) var health = CaptureHealth()
+    public private(set) var evidence = CaptureEvidence()
     /// While the headset carries, the built-in's latest frames wait here so a switchback
     /// resumes exactly where the headset stopped (the buffer that crossed the switch
     /// arrived before the decision). 1.5 s covers the stale-headset wait (1.0 s) plus one buffer.
@@ -113,38 +132,86 @@ public struct CaptureFeed {
         bridge.start(defaultInput: defaultInput, hasBuiltin: hasBuiltin, epoch: epoch)
         ring.removeAll()
         standby.removeAll()
+        health = CaptureHealth()
+        evidence = CaptureEvidence()
+    }
+
+    /// The owner asked a source's hardware to start (its startup grace runs from here).
+    public mutating func sourceStarted(_ source: CaptureBridge.Source, at time: TimeInterval) {
+        health.sourceStarted(source, at: time)
+    }
+    /// The device read-back or listener found a problem with a source.
+    public mutating func deviceProblem(_ source: CaptureBridge.Source, _ problem: CaptureHealth.Problem) {
+        health.deviceProblem(source, problem)
+    }
+
+    /// The source whose frames currently enter the dictation (nil before the second tap).
+    public var carrying: CaptureBridge.Source? {
+        guard bridge.isRecording else { return nil }
+        switch bridge.state {
+        case .off: return nil
+        case .builtinOnly, .fallback: return .builtin
+        case .switched: return .headset
+        }
     }
 
     public mutating func accept(_ frames: [Float], source: CaptureBridge.Source, at time: TimeInterval,
                                 arrivedAt: TimeInterval? = nil, epoch: CaptureEpoch? = nil) -> Output {
+        if let epoch, epoch !== bridge.epoch { return Output() }
+        let now = arrivedAt ?? time
         let hadKept = bridge.firstKeptMs != nil
-        let peak = frames.reduce(Float(0)) { max($0, abs($1)) }
+        let peak = Self.peak(frames[...])
+        let signalStart = health.buffer(source, at: now, frames: frames.count, peak: peak)
+        let builtinFresh = source == .headset ? health.isFresh(.builtin, at: now) : true
         let decision = bridge.buffer(source: source, at: time, frames: frames.count,
-                                     arrivedAt: arrivedAt, epoch: epoch, peak: peak)
+                                     arrivedAt: arrivedAt, epoch: epoch, peak: peak, builtinFresh: builtinFresh)
         var output = Output(releaseBuiltin: decision.releaseBuiltin,
                             restartHeadset: decision.restartHeadset, event: decision.event)
+        output.headsetSignalStart = source == .headset && signalStart
+        output.fallbackRefused = decision.fallbackRefused
+        if decision.event == .fallback || decision.fallbackRefused {
+            output.fallbackFresh = decision.event == .fallback
+            output.builtinAgeMs = health.ageMs(.builtin, at: now)
+        }
         let trimmed = frames.dropFirst(decision.dropFrames)
         if decision.framesToRing > 0 {
             ring.append(Array(trimmed.prefix(decision.framesToRing)),
                         at: time + Double(decision.dropFrames) / CaptureRing.sampleRate)
         }
-        output.frames = Array(trimmed.prefix(decision.framesToFeed))
+        let fed = trimmed.prefix(decision.framesToFeed)
+        output.frames = Array(fed)
+        keep(fed, at: time + Double(decision.dropFrames) / CaptureRing.sampleRate, arrivedAt: now)
         if source == .builtin, bridge.canSwitchBack || decision.event == .switchback {
             standby.append(frames, at: time)
         }
-        if decision.event == .switchback { output.frames += resumeBuiltin() }
+        if decision.event == .switchback { output.frames += resumeBuiltin(arrivedAt: now) }
         output.firstKept = !hadKept && bridge.firstKeptMs != nil
         return output
     }
 
+    private static func peak(_ frames: ArraySlice<Float>) -> Float {
+        frames.reduce(Float(0)) { max($0, abs($1)) }
+    }
+
+    /// Frames that entered the dictation: evidence + useful-delivery time.
+    private mutating func keep(_ frames: ArraySlice<Float>, at time: TimeInterval, arrivedAt: TimeInterval) {
+        guard bridge.isRecording, !frames.isEmpty else { return }
+        evidence.append(frames, at: time)
+        health.kept(at: arrivedAt, peak: Self.peak(frames))
+    }
+
     /// The standby built-in frames from where the headset stopped (into the ring before the second tap).
-    private mutating func resumeBuiltin() -> [Float] {
+    private mutating func resumeBuiltin(arrivedAt: TimeInterval? = nil) -> [Float] {
         let end = standby.newestEnd
         let resumed = standby.drain(from: bridge.fedThroughTime ?? 0)
         guard let end, !resumed.isEmpty else { return [] }
         bridge.resumedBuiltin(frames: resumed.count, through: end)
-        if bridge.isRecording { return resumed }
-        ring.append(resumed, at: end - Double(resumed.count) / CaptureRing.sampleRate)
+        let start = end - Double(resumed.count) / CaptureRing.sampleRate
+        if bridge.isRecording {
+            keep(resumed[...], at: start, arrivedAt: arrivedAt ?? end)
+            return resumed
+        }
+        ring.append(resumed, at: start)
         return []
     }
 
@@ -159,9 +226,54 @@ public struct CaptureFeed {
     /// The second tap: keeps ring audio from `time − preRoll` and returns it.
     public mutating func recordingStarted(at time: TimeInterval,
                                           preRoll: TimeInterval = CaptureRing.preRoll) -> [Float] {
+        let end = ring.newestEnd
         let kept = ring.drain(from: time - preRoll)
         bridge.recordingStarted(at: time, preRoll: preRoll, keptFrames: kept.count)
+        health.recordingStarted(at: time)
+        evidence.start(at: time)
+        if let end, !kept.isEmpty {
+            keep(kept[...], at: end - Double(kept.count) / CaptureRing.sampleRate, arrivedAt: time)
+        }
         return kept
+    }
+
+    /// One 100 ms health evaluation (v1.8 L2). Switches are applied here; the owner stops a dead
+    /// built-in, shows the warning, and ends the dictation on `failure`.
+    public mutating func tick(at now: TimeInterval) -> TickOutput {
+        var out = TickOutput()
+        guard bridge.state != .off else { return out }
+        for action in health.tick(at: now, carrying: carrying) {
+            switch action {
+            case .builtinDead(let problem):
+                let before = bridge.state
+                bridge.builtinDied()
+                out.stopBuiltin = true
+                out.notes.append("bridge_builtin_lost=1 reason=\(problem.rawValue) state=\(before)")
+            case .switchTo(.headset, let reason):
+                bridge.takeOver()
+                out.notes.append("bridge_switch=headset reason=\(reason.rawValue)")
+            case .switchTo(.builtin, let reason):
+                guard bridge.canSwitchBack else { continue }
+                bridge.headsetStalled(stale: reason != .zeros)
+                out.frames += resumeBuiltin(arrivedAt: now)
+                out.notes.append("bridge_switchback=1 reason=\(reason.rawValue)")
+            case .warn(let reason):
+                out.warn = reason
+                out.notes.append("health=warn reason=\(reason.rawValue)")
+            case .fail(let reason):
+                out.failure = failure(reason: reason, at: now)
+            }
+        }
+        return out
+    }
+
+    /// What was kept so far, for a `mic_dead` failure (real duration and bytes, never zero).
+    public func failure(reason: CaptureHealth.Reason, at now: TimeInterval) -> CaptureFailure {
+        let boundary = health.boundary ?? now
+        return CaptureFailure(reason: .micDead, health: reason, durationSeconds: max(0, now - boundary),
+                              bytes: 44 + evidence.framesKept * 2, framesKept: evidence.framesKept,
+                              lastDeliveryMs: health.lastUseful.map { max(0, Int((($0 - boundary) * 1000).rounded())) },
+                              sources: health.summary(at: now))
     }
 
     /// Lone tap, finish or cancel: the ring is discarded with the session.
@@ -169,6 +281,7 @@ public struct CaptureFeed {
     @discardableResult public mutating func cancel() -> Bool {
         ring.removeAll()
         standby.removeAll()
+        health = CaptureHealth()
         return bridge.cancel()
     }
 

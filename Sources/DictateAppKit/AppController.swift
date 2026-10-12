@@ -82,6 +82,16 @@ public final class AppController {
     private var outcomeText: String?
     private var outcomeTimer: Timer?
     private var recoveryTap: DispatchWorkItem?
+    /// v1.8: the recorder's reason for ending capture on its own (consumed by `capture.onFailure`).
+    private var captureFailure: CaptureFailure?
+    /// v1.8 (L4): `session=<id>` correlates this dictation's notes with its outcome in bt-proof.
+    private var openSession: (id: String, stats: AudioRecorder.CaptureStats?)?
+    /// Tests: this controller's session/failure notes (the process-wide note sink is shared).
+    var onSessionNote: ((String) -> Void)?
+    private func sessionNote(_ line: String) {
+        Self.note(line)
+        onSessionNote?(line)
+    }
 
     public convenience init() {
         self.init(keyStore: KeyStore(), paths: AppPaths(), surface: .pill, mode: .dictate)
@@ -427,13 +437,29 @@ public final class AppController {
             self?.recorder.onFirstBuffer = { [weak self] in
                 self?.capture.bufferArrived(at: ProcessInfo.processInfo.systemUptime, epoch: token)
             }
-            self?.recorder.onCaptureFailure = { [weak self] in self?.capture.engineFailed(epoch: token) }
+            self?.recorder.onCaptureFailure = { [weak self] failure in
+                guard let self else { return }
+                self.captureFailure = failure
+                self.capture.engineFailed(epoch: token)
+            }
         }
         // Also bind the initial prewarm epoch before any recording has begun.
         capture.onEpochChanged?(capture.epoch)
         capture.onFailure = { [weak self] in
-            guard let self, self.fakeTranscript == nil else { return }
-            self.fail(reason: "mic_\(self.micAvailable ? "start" : "denied")", duration: 0, bytes: 0, latencyMs: 0)
+            guard let self else { return }
+            let failure = self.captureFailure
+            self.captureFailure = nil
+            // v1.8 (L2): the health clock heard nothing: `error:mic_dead` with what was really kept.
+            if let failure, failure.reason == .micDead {
+                self.sessionNote(failure.note)
+                self.fail(reason: CaptureFailure.Reason.micDead.rawValue, duration: failure.durationSeconds,
+                          bytes: failure.bytes, latencyMs: 0)
+                return
+            }
+            guard self.fakeTranscript == nil else { return }
+            if let failure { Self.note(failure.note) }
+            self.fail(reason: "mic_\(self.micAvailable ? "start" : "denied")", duration: failure?.durationSeconds ?? 0,
+                      bytes: failure?.bytes ?? 0, latencyMs: 0)
         }
         capture.onMaxDuration = { [weak self] in
             guard let self else { return }
@@ -549,6 +575,11 @@ public final class AppController {
         else { recordingTarget = Self.frontmostTarget() }
         generation = CaptureEpoch()
         let token = generation
+        captureFailure = nil
+        if let stale = openSession { noteSessionEnd(id: stale.id, stats: stale.stats ?? recorder.stats, outcome: "abandoned", entry: nil) }
+        let session = String(UUID().uuidString.prefix(8)).lowercased()
+        openSession = (session, nil)
+        sessionNote("session=\(session) event=start")
         btStart = BluetoothProfile.sample()
         btEndNotePending = true
         recordingStarted = Date()
@@ -631,6 +662,7 @@ public final class AppController {
         let finishClock = DispatchTime.now()
         let warmMs = capture.warmup.warmMs
         let samples = capture.end(.finished(.ok)) // flush final audio before detaching sessions
+        if openSession != nil { openSession?.stats = recorder.stats }
         recorder.onPCMChunk = nil
         let mediaEvents = resumeMedia()
         let duration = finishedAt.timeIntervalSince(recordingStarted ?? finishedAt)
@@ -1023,6 +1055,10 @@ public final class AppController {
     }
 
     func appendLog(_ entry: DictationLogEntry, fallback: String?) {
+        if let open = openSession {
+            openSession = nil
+            noteSessionEnd(id: open.id, stats: open.stats ?? recorder.stats, outcome: entry.outcome.label, entry: entry)
+        }
         guard let fallback else { DictationLog.append(entry, to: paths.logURL); return }
         // DictateCore's line is unchanged; quota adds only its agreed label.
         do {
@@ -1035,6 +1071,19 @@ public final class AppController {
             try handle.seekToEnd()
             try handle.write(contentsOf: Data((entry.formatted() + " fallback=\(fallback)\n").utf8))
         } catch { /* Same best-effort diagnostic behavior as DictationLog. */ }
+    }
+
+    /// `session=<id> event=end outcome=… duration_ms=… bytes=… chars=… recording_ms=…
+    /// capture_intervals=… speech_sections=… builtin_frames_after_fallback=…` (counts only).
+    private func noteSessionEnd(id: String, stats: AudioRecorder.CaptureStats, outcome: String, entry: DictationLogEntry?) {
+        var line = "session=\(id) event=end outcome=\(outcome)"
+        if let entry {
+            line += " duration_ms=\(Int((entry.durationSeconds * 1000).rounded())) bytes=\(entry.audioBytes) chars=\(entry.chars)"
+        }
+        line += " recording_ms=\(stats.recordingMs) capture_intervals=\(stats.captureIntervals)"
+        line += " speech_sections=\(stats.speechSections) builtin_frames_after_fallback=\(stats.builtinFramesAfterFallback)"
+        if let backend = stats.builtinBackend { line += " builtin_backend=\(backend)" }
+        sessionNote(line)
     }
 
     private func traceFocus(_ event: String) {
@@ -1085,7 +1134,9 @@ public final class AppController {
     static func setNoteSink(_ sink: (@Sendable (String) -> Void)?) { noteLock.withLock { noteSink = sink } }
 
     static func note(_ message: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] dictate: \(message)"
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let line = "[\(formatter.string(from: Date()))] dictate: \(message)"
         FileHandle.standardError.write(Data((line + "\n").utf8))
         noteLock.withLock { noteSink }?(line)
     }
