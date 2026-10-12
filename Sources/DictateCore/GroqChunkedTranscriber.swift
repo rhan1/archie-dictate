@@ -18,6 +18,11 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         environment["DICTATE_REJOIN_GUARD"] != "0"
     }
 
+    /// DICTATE_LOW_SPEECH_GUARD=0 turns the sentence guard off; anything else enables it.
+    public static func lowSpeechGuardEnabled(environment: [String: String]) -> Bool {
+        environment["DICTATE_LOW_SPEECH_GUARD"] != "0"
+    }
+
     public static func shouldRejoin(previous: String, current: String,
                                     cutKind: PauseChunker.CutKind, quietRunMs: Int?) -> Bool {
         guard cutKind == .forced || (cutKind == .pause && quietRunMs.map { $0 < 400 } == true) else { return false }
@@ -74,6 +79,24 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public let hedges: Int
         public let hedgeWins: Int
         public let rateLimits: RateLimits?
+        /// Long sentences removed from low-speech, non-final chunks.
+        public let droppedLowSpeechSentences: Int
+
+        public init(text: String, chunks: Int, rejoins: Int, failedCount: Int, lastChunkMs: Int, sttMs: Int,
+                    calls: [Call], hedges: Int, hedgeWins: Int, rateLimits: RateLimits?,
+                    droppedLowSpeechSentences: Int = 0) {
+            self.text = text
+            self.chunks = chunks
+            self.rejoins = rejoins
+            self.failedCount = failedCount
+            self.lastChunkMs = lastChunkMs
+            self.sttMs = sttMs
+            self.calls = calls
+            self.hedges = hedges
+            self.hedgeWins = hedgeWins
+            self.rateLimits = rateLimits
+            self.droppedLowSpeechSentences = droppedLowSpeechSentences
+        }
     }
 
     private let lock = NSLock()
@@ -84,7 +107,12 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let leadIn: String
     private let finalModel: String?
     private let rejoinGuard: Bool
+    private let lowSpeechGuard: Bool
     private var originalChunks: [Int: PauseChunker.Chunk] = [:]
+    private var speechRatios: [Int: Double] = [:]
+    /// v1.10 L3: chunks the low-speech guard already judged, and what it dropped from each.
+    private var guarded: Set<Int> = []
+    private var droppedByIndex: [Int: Int] = [:]
     private var rejoinTask: Task<Void, Never>?
     private var rejoins = 0
     private let onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)?
@@ -103,7 +131,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
                 fillerLeadIn: Bool = true, leadIn: String? = nil, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
                 hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = nil,
-                finalModel: String? = nil, rejoinGuard: Bool = false,
+                finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = true,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
@@ -117,6 +145,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         self.leadIn = leadIn ?? (fillerLeadIn ? Self.fillerLeadIn : "")
         self.finalModel = finalModel
         self.rejoinGuard = rejoinGuard
+        self.lowSpeechGuard = lowSpeechGuard
         self.onGroqRateLimit = onGroqRateLimit
         self.onChunkText = onChunkText
         chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
@@ -143,6 +172,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     @discardableResult
     private func enqueue(_ chunk: PauseChunker.Chunk, isFinal: Bool = false) -> Task<Void, Never> {
         if rejoinGuard { originalChunks[chunk.index] = chunk }
+        speechRatios[chunk.index] = LowSpeechSentenceGuard.speechRatio(of: chunk.samples)
         let model = isFinal ? finalModel ?? client.modelName : client.modelName
         let task = Task.detached { [self] in await upload(chunk, model: model, isFinal: isFinal) }
         tasks.append(task)
@@ -284,7 +314,13 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 else if attempt == 2 { failures.insert(chunk.index) }
             }
             if let text = outcome.text {
-                onChunkText?(chunk.index, text)
+                // v1.10 L3: the incremental cleaner cleans a chunk once the next one arrives, so a
+                // low-speech chunk's dropped sentence is replaced BEFORE the next chunk is emitted.
+                let replacements = lock.withLock {
+                    [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
+                }
+                for (index, filtered) in replacements where index < chunk.index { onChunkText?(index, filtered) }
+                onChunkText?(chunk.index, replacements.first { $0.0 == chunk.index }?.1 ?? text)
                 return
             }
         }
@@ -317,12 +353,31 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         return lock.withLock {
             let start = finishAt!
             let lastMs = lastResponse.map { $0 > start ? Int(($0 - start) / 1_000_000) : 0 } ?? 0
+            for index in texts.keys.sorted() { _ = guardLocked(index) }
+            let dropped = droppedByIndex.values.reduce(0, +)
             return Result(text: texts.keys.sorted().compactMap { texts[$0] }.filter { !$0.isEmpty }.joined(separator: " "),
                           chunks: tasks.count, rejoins: rejoins, failedCount: failures.count, lastChunkMs: lastMs,
                           sttMs: Self.ms(from: start), calls: calls,
                           hedges: calls.filter { $0.hedgeFired }.count,
-                          hedgeWins: calls.filter { $0.winningRequest == 2 }.count, rateLimits: limits)
+                          hedgeWins: calls.filter { $0.winningRequest == 2 }.count, rateLimits: limits,
+                          droppedLowSpeechSentences: dropped)
         }
+    }
+
+    /// v1.10 L3: judges chunk `index` once its next non-empty chunk text is known (the last chunk
+    /// never is). Stores the filtered text and returns it when a sentence was dropped. Lock held.
+    private func guardLocked(_ index: Int) -> String? {
+        guard lowSpeechGuard, index >= 0, !guarded.contains(index), let text = texts[index], !text.isEmpty,
+              let next = texts.keys.sorted().first(where: { $0 > index && !(texts[$0] ?? "").isEmpty }).flatMap({ texts[$0] })
+        else { return nil }
+        guarded.insert(index)
+        // A chunk without a measured ratio is never treated as low speech.
+        let result = LowSpeechSentenceGuard.filter(text, speechRatio: speechRatios[index] ?? 1,
+                                                   vocabulary: vocabulary, nextText: next)
+        guard result.dropped > 0 else { return nil }
+        texts[index] = result.text
+        droppedByIndex[index] = result.dropped
+        return result.text
     }
 
     /// Boundary indices (the current chunk of each pair) worth one pair request. Adjacent ORIGINAL
@@ -333,7 +388,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         for index in originalChunks.keys.sorted() where index >= 1 && plan.count < Self.maxRejoins {
             guard !consumed.contains(index - 1), !consumed.contains(index),
                   !failures.contains(index - 1), !failures.contains(index),
-                  let previous = originalChunks[index - 1], let current = originalChunks[index],
+                  let previous = originalChunks[index - 1], originalChunks[index] != nil,
                   let before = texts[index - 1], let after = texts[index],
                   Self.shouldRejoin(previous: before, current: after,
                                     cutKind: previous.cutKind, quietRunMs: previous.quietRunMs) else { continue }
@@ -375,6 +430,11 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 guard let text = response.text, !text.isEmpty else { return nil }
                 texts[index - 1] = text
                 texts[index] = ""
+                if let previousRatio = speechRatios[index - 1], let currentRatio = speechRatios[index] {
+                    speechRatios[index - 1] = min(previousRatio, currentRatio)
+                }
+                guarded.remove(index - 1)          // the joined text is judged afresh at finish
+                droppedByIndex[index - 1] = nil
                 return text
             }
             if let joined {
