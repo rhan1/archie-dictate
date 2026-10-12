@@ -463,6 +463,37 @@ struct CaptureHealthTests {
         #expect(click.finalSpeechSections == 0)                          // a 50 ms click is not speech
     }
 
+    @Test func quietBuiltinSpeechCountsSections() {
+        var evidence = CaptureEvidence()
+        evidence.start(at: 0)
+        var time = 0.0
+        let room = [Float](repeating: 0.0005, count: Self.chunk)         // about −66 dBFS
+        let phrase = [Float](repeating: 0.004, count: Self.chunk)        // about −48 dBFS
+        func add(_ frames: [Float]) {
+            evidence.append(frames, at: time)
+            time += Double(frames.count) / CaptureEvidence.rate
+        }
+        for _ in 0..<3 {
+            for _ in 0..<5 { add(phrase) }                               // 0.5 s
+            for _ in 0..<4 { add(room) }                                 // 0.4 s
+        }
+        #expect(evidence.finalSpeechSections == 3)
+        #expect(evidence.speechSections == 3)
+    }
+
+    @Test func zerosOnlyGivesNoSections() {
+        func sections(for sample: Float) -> Int {
+            var evidence = CaptureEvidence()
+            evidence.start(at: 0)
+            for i in 0..<50 {                                            // 5 s, 100 ms chunks
+                evidence.append([Float](repeating: sample, count: Self.chunk), at: Double(i) * 0.1)
+            }
+            return evidence.finalSpeechSections
+        }
+        #expect(sections(for: 0) == 0)
+        #expect(sections(for: 0.0005) == 0)
+    }
+
     @Test func intervalsShowGapsAndOverlapsLiterally() {
         var evidence = CaptureEvidence()
         evidence.start(at: 100)
