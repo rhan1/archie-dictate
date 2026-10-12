@@ -110,6 +110,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let lowSpeechGuard: Bool
     private var originalChunks: [Int: PauseChunker.Chunk] = [:]
     private var speechRatios: [Int: Double] = [:]
+    /// v1.10 L3: chunks the low-speech guard already judged, and what it dropped from each.
+    private var guarded: Set<Int> = []
+    private var droppedByIndex: [Int: Int] = [:]
     private var rejoinTask: Task<Void, Never>?
     private var rejoins = 0
     private let onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)?
@@ -311,7 +314,13 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 else if attempt == 2 { failures.insert(chunk.index) }
             }
             if let text = outcome.text {
-                onChunkText?(chunk.index, text)
+                // v1.10 L3: the incremental cleaner cleans a chunk once the next one arrives, so a
+                // low-speech chunk's dropped sentence is replaced BEFORE the next chunk is emitted.
+                let replacements = lock.withLock {
+                    [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
+                }
+                for (index, filtered) in replacements where index < chunk.index { onChunkText?(index, filtered) }
+                onChunkText?(chunk.index, replacements.first { $0.0 == chunk.index }?.1 ?? text)
                 return
             }
         }
@@ -344,37 +353,31 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         return lock.withLock {
             let start = finishAt!
             let lastMs = lastResponse.map { $0 > start ? Int(($0 - start) / 1_000_000) : 0 } ?? 0
-            let indices = texts.keys.sorted()
-            var filtered: [String] = []
-            var dropped = 0
-            for (offset, index) in indices.enumerated() {
-                guard let text = texts[index], !text.isEmpty else { continue }
-                let nextText: String?
-                if offset + 1 < indices.count {
-                    nextText = indices[(offset + 1)...].lazy.compactMap { candidate -> String? in
-                        guard let candidateText = self.texts[candidate], !candidateText.isEmpty else { return nil }
-                        return candidateText
-                    }.first
-                } else {
-                    nextText = nil
-                }
-                if lowSpeechGuard {
-                    let result = LowSpeechSentenceGuard.filter(text,
-                        speechRatio: speechRatios[index] ?? 0,
-                        vocabulary: vocabulary, nextText: nextText)
-                    filtered.append(result.text)
-                    dropped += result.dropped
-                } else {
-                    filtered.append(text)
-                }
-            }
-            return Result(text: filtered.joined(separator: " "),
+            for index in texts.keys.sorted() { _ = guardLocked(index) }
+            let dropped = droppedByIndex.values.reduce(0, +)
+            return Result(text: texts.keys.sorted().compactMap { texts[$0] }.filter { !$0.isEmpty }.joined(separator: " "),
                           chunks: tasks.count, rejoins: rejoins, failedCount: failures.count, lastChunkMs: lastMs,
                           sttMs: Self.ms(from: start), calls: calls,
                           hedges: calls.filter { $0.hedgeFired }.count,
                           hedgeWins: calls.filter { $0.winningRequest == 2 }.count, rateLimits: limits,
                           droppedLowSpeechSentences: dropped)
         }
+    }
+
+    /// v1.10 L3: judges chunk `index` once its next non-empty chunk text is known (the last chunk
+    /// never is). Stores the filtered text and returns it when a sentence was dropped. Lock held.
+    private func guardLocked(_ index: Int) -> String? {
+        guard lowSpeechGuard, index >= 0, !guarded.contains(index), let text = texts[index], !text.isEmpty,
+              let next = texts.keys.sorted().first(where: { $0 > index && !(texts[$0] ?? "").isEmpty }).flatMap({ texts[$0] })
+        else { return nil }
+        guarded.insert(index)
+        // A chunk without a measured ratio is never treated as low speech.
+        let result = LowSpeechSentenceGuard.filter(text, speechRatio: speechRatios[index] ?? 1,
+                                                   vocabulary: vocabulary, nextText: next)
+        guard result.dropped > 0 else { return nil }
+        texts[index] = result.text
+        droppedByIndex[index] = result.dropped
+        return result.text
     }
 
     /// Boundary indices (the current chunk of each pair) worth one pair request. Adjacent ORIGINAL
@@ -430,6 +433,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 if let previousRatio = speechRatios[index - 1], let currentRatio = speechRatios[index] {
                     speechRatios[index - 1] = min(previousRatio, currentRatio)
                 }
+                guarded.remove(index - 1)          // the joined text is judged afresh at finish
+                droppedByIndex[index - 1] = nil
                 return text
             }
             if let joined {

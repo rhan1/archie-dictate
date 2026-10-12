@@ -101,6 +101,31 @@ struct LowSpeechSentenceGuardTests {
         #expect(unguardedResult.droppedLowSpeechSentences == 0)
     }
 
+    /// The incremental cleaner pastes from the streamed chunk texts (R1: chunks=3,
+    /// cleanup_mode=incremental), so the guard must reach them: chunk 0's replacement arrives
+    /// before chunk 1 (the cleaner cleans a chunk only once the next one is in).
+    @Test func streamedChunkTextIsReplacedBeforeTheNextChunk() async {
+        let lowSpeech = tone(seconds: 0.4, amplitude: 3_000) + noise(seconds: 2.6)
+        let speech = tone(seconds: 3, amplitude: 3_000)
+        let events = StreamedEvents()
+        let transport = CannedLowSpeechTransport(responses: [hallucination, "the launch is on Thursday", "with Maria."])
+        let stt = GroqChunkedTranscriber(transport: transport, apiKey: { "test-key" },
+            prompt: "TurnoutWatch, Limpar", fillerLeadIn: false, hedgeAfterMs: 60_000, lowSpeechGuard: true,
+            onChunkText: { index, text in events.add(index, text) })
+        if let task = stt.submit(.init(index: 0, samples: lowSpeech), isFinal: false) { await task.value }
+        if let task = stt.submit(.init(index: 1, samples: speech), isFinal: false) { await task.value }
+        if let task = stt.submit(.init(index: 2, samples: speech), isFinal: true) { await task.value }
+        let result = await stt.finish()
+        let all = events.snapshot
+        let firstOne = all.firstIndex { $0.0 == 1 } ?? -1
+        let lastZero = all.lastIndex { $0.0 == 0 } ?? -1
+        #expect(lastZero >= 0 && lastZero < firstOne)
+        #expect(all[lastZero].1 == "Hey, um, so.")
+        #expect(all.filter { $0.0 == 0 }.count == 2)                 // the raw text, then its replacement
+        #expect(result.droppedLowSpeechSentences == 1)
+        #expect(result.text == "Hey, um, so. the launch is on Thursday with Maria.")
+    }
+
     private func noise(seconds: Double) -> [Int16] {
         (0..<Int(seconds * 24_000)).map { index in index.isMultiple(of: 2) ? 15 : -15 }
     }
@@ -110,4 +135,11 @@ struct LowSpeechSentenceGuardTests {
             Int16((Double(amplitude) * sin(2 * .pi * 220 * Double(index) / 24_000)).rounded())
         }
     }
+}
+
+private final class StreamedEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [(Int, String)] = []
+    func add(_ index: Int, _ text: String) { lock.withLock { events.append((index, text)) } }
+    var snapshot: [(Int, String)] { lock.withLock { events } }
 }
