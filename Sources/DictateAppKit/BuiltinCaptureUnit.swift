@@ -19,6 +19,9 @@ final class BuiltinCaptureUnit: BuiltinCapture {
     let backend = "auhal"
 
     private let lock = NSLock()
+    /// Held across every call on the opaque unit from another thread (read-back) and across its
+    /// teardown, so a read-back can never run on a disposed instance (review #1).
+    private let unitLock = NSLock()
     private let worker = DispatchQueue(label: "dictate.builtin.worker")
     private var unit: AudioUnit?
     private var context: BuiltinRenderContext?
@@ -43,8 +46,10 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         lock.withLock { lastArrival.map { ProcessInfo.processInfo.systemUptime - $0 <= CaptureHealth.staleAfter } ?? false }
     }
     var currentDeviceID: UInt32? {
-        guard let unit = lock.withLock({ self.unit }) else { return nil }
-        return try? AudioDevices.currentDevice(of: unit)
+        unitLock.withLock {
+            guard let unit = lock.withLock({ self.unit }) else { return nil }
+            return try? AudioDevices.currentDevice(of: unit)
+        }
     }
 
     struct StartError: Error, CustomStringConvertible, LocalizedError {
@@ -68,7 +73,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         var created: AudioUnit?
         try check(AudioComponentInstanceNew(component, &created), "new")
         guard let unit = created else { throw StartError(step: "new", status: -1) }
-        lock.withLock { self.unit = unit; teardown = OwnedUnitTeardown(); teardown.didCreate() }
+        unitLock.withLock { lock.withLock { self.unit = unit; teardown = OwnedUnitTeardown(); teardown.didCreate() } }
         do {
             var on: UInt32 = 1, off: UInt32 = 0
             let u32 = UInt32(MemoryLayout<UInt32>.size)
@@ -113,8 +118,15 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         startWorker()
     }
 
+    func stop(epoch token: CaptureEpoch) {
+        guard lock.withLock({ epoch === token }) else { return }
+        stop()
+    }
+
     /// Idempotent: stop → uninitialize → dispose, each attempted (OwnedUnitTeardown).
     func stop() {
+        unitLock.lock()
+        defer { unitLock.unlock() }
         let (unit, timer, listeners) = lock.withLock { () -> (AudioUnit?, DispatchSourceTimer?, [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)]) in
             epoch = nil
             let taken = (self.unit, self.timer, self.listeners)

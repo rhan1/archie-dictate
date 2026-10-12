@@ -235,6 +235,10 @@ public final class CaptureLifecycle {
         while chain.isAttempt {
             guard epoch === token, recordingRequested else { cleanLateStart(); return false }
             do {
+                if chain.step == .retry, case .skip = engine.recoveryAdmission(.startRetry) {
+                    recordingReady(at: time, device: .default, fields: ["mic_retry=engine"])
+                    return true
+                }
                 if chain.needsRebuild {
                     resetAttempt()
                     try captureObjC { try engine.rebuild() }
@@ -288,15 +292,22 @@ public final class CaptureLifecycle {
         while chain.isAttempt {
             guard epoch === token, !isCancelled() else { cleanLateStart(); return false }
             do {
+                // v1.8 (L3): the engine admits a retry BEFORE any hardware is touched.
+                var delay = chain.delay
+                if chain.step == .retry {
+                    switch engine.recoveryAdmission(.startRetry) {
+                    case .proceed(let after): delay = max(delay, after)
+                    case .skip:
+                        // The engine owns recovery (its episode, its health clock): no retry here.
+                        recordingReady(at: time, device: .default, fields: ["mic_retry=engine"])
+                        return true
+                    }
+                }
                 if chain.needsRebuild {
                     warmup.stopped()
                     cancelPrewarm()
                     try await rebuild()
                     guard epoch === token, !isCancelled() else { cleanLateStart(); return false }
-                }
-                var delay = chain.delay
-                if chain.step == .retry, case .proceed(let after) = engine.recoveryAdmission(.startRetry) {
-                    delay = max(delay, after)
                 }
                 if delay > 0 { await wait(delay) }
                 guard epoch === token, !isCancelled() else { cleanLateStart(); return false }

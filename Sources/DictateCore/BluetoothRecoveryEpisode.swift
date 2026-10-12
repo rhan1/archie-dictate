@@ -90,9 +90,10 @@ public struct BluetoothRecoveryEpisode: Sendable {
 
     /// The queued (or immediate) attempt runs now. Returns false when it must not (it was
     /// already settled, or the debounce moved: a later format change re-queues it).
-    public mutating func begin(at now: TimeInterval) -> Bool {
+    /// `force`: the caller already waited the admitted delay itself (a lifecycle retry).
+    public mutating func begin(at now: TimeInterval, force: Bool = false) -> Bool {
         guard bluetooth else { return true }
-        guard pendingDue != nil else { return false }
+        guard let due = pendingDue, force || now >= due - 0.001 else { return false }
         pendingDue = nil
         if windowStart == nil || now >= windowStart! + Self.window { windowStart = now; usedInWindow = false }
         usedInWindow = true
@@ -100,6 +101,21 @@ public struct BluetoothRecoveryEpisode: Sendable {
         attempts += 1
         if externalBusySeen { attemptsAfterBusy += 1 }
         return true
+    }
+
+    public enum Begin: Equatable, Sendable { case begun, notPending, wait(TimeInterval) }
+    /// A queued attempt is due: re-checks the stable-format debounce (a later notification moved
+    /// it, bounded by the window) and either begins or tells the caller to requeue.
+    public mutating func beginIfStable(at now: TimeInterval) -> Begin {
+        guard bluetooth else { return .begun }
+        guard let due = pendingDue else { return .notPending }
+        var stable = max(due, lastFormatChange.map { $0 + Self.stableFor } ?? due)
+        if let start = windowStart { stable = min(stable, max(due, start + Self.window)) }
+        if now < stable - 0.001 {
+            pendingDue = stable
+            return .wait(stable - now)
+        }
+        return begin(at: now) ? .begun : .notPending
     }
 
     /// The queued attempt is no longer needed (healthy signal, replaced engine, new epoch):
