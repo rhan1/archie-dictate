@@ -200,7 +200,8 @@ public struct CaptureHealth: Sendable {
             actions.append(.warn(shown))
         }
         if now >= deadline {
-            let final = reason ?? warned ?? .noInput
+            // The first problem shown is the cause (21:33: the built-in died, then only zeros were left).
+            let final = warned ?? reason ?? .noInput
             failed = final
             actions.append(.fail(final))
         }
