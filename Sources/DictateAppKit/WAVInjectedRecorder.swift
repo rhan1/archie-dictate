@@ -14,13 +14,28 @@ import DictateCore
 ///   (10-12 21:33). The health clock must end the dictation with `mic_dead`.
 /// - `builtin_drifts` (v1.8): as `builtin_dies`, but the built-in's device read-back reports
 ///   another device (the aggregate) at 0.5 s and the unit is stopped.
+/// - `sco_torn_down_250ms` (v1.9): the 10-13 01:53:08 race, timed from R1 (ms after the headset
+///   start): AVAudioEngine auto-stops at +11, SCO connects at +200, our configuration
+///   notification arrives at +242, a retap reaches IO 134 ms after it is begun, and coreaudiod
+///   disables the idle SCO route at +450 unless IO is back by then. The re-attach is admitted by
+///   the production `BluetoothRecoveryEpisode`; in time → the headset (the WAV) carries,
+///   too late → it delivers only zeros. `legacyRecoveryTiming` = v1.8's debounced admission.
 public final class WAVInjectedRecorder: EngineRecorder {
     public enum Scenario: String, Sendable {
         case plain, headsetZeros = "headset_zeros", builtinDies = "builtin_dies", builtinDrifts = "builtin_drifts"
+        case scoTornDown250ms = "sco_torn_down_250ms"
         var hasHeadset: Bool { self != .plain }
     }
     /// Built-in frames stop after this much media time in the dying scenarios.
     public static let builtinLifetime: TimeInterval = 0.5
+    /// `sco_torn_down_250ms` timing (s after the headset start; R1 01:53:08.300 + …).
+    public static let scoNotifyAt: TimeInterval = 0.242
+    public static let scoRetapLatency: TimeInterval = 0.134
+    public static let scoRouteDisabledAt: TimeInterval = 0.45
+    /// v1.8's admission (debounced even when the engine auto-stopped): the RED twin.
+    public let legacyRecoveryTiming: Bool
+    /// When the re-attached headset IO runs (nil: not computed for this scenario).
+    public private(set) var scoIOAt: TimeInterval?
     public let url: URL
     public let pace: Double
     public let scenario: Scenario
@@ -55,7 +70,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
     private var builtinStopped = false
     private var failed = false
 
-    public init(url: URL, pace: Double = 1.0, scenario: Scenario = .plain) {
+    public init(url: URL, pace: Double = 1.0, scenario: Scenario = .plain, legacyRecoveryTiming: Bool = false) {
+        self.legacyRecoveryTiming = legacyRecoveryTiming
         self.url = url
         self.pace = max(0.0001, pace)
         self.scenario = scenario
@@ -176,6 +192,32 @@ public final class WAVInjectedRecorder: EngineRecorder {
         boundary = time
         builtinStopped = false
         failed = false
+        scoIOAt = nil
+        scoNotes = []
+        if scenario == .scoTornDown250ms {
+            var episode = BluetoothRecoveryEpisode(bluetooth: true)
+            episode.formatChanged(at: Self.scoNotifyAt)
+            let admission = episode.request(.configuration, at: Self.scoNotifyAt, engineStopped: !legacyRecoveryTiming)
+            var wait: TimeInterval = 0
+            switch admission {
+            case .now: break
+            case .after(let delay): wait = delay
+            case .coalesced, .exhausted: wait = .infinity
+            }
+            scoIOAt = Self.scoNotifyAt + wait + Self.scoRetapLatency
+            scoNotes = episode.immediateAttempts > 0
+                ? ["bt_recovery=immediate path=configuration engine_running=0 after_ms=0"]
+                : ["bt_recovery=queued path=configuration wait_ms=\(Int((wait * 1000).rounded()))"]
+        }
+    }
+    private var scoNotes: [String] = []
+
+    /// The headset's buffer for the chunk at `offset` s after the boundary (nil: its engine is stopped).
+    private func headsetChunk(offset: TimeInterval, wav: [Float]) -> [Float]? {
+        guard scenario == .scoTornDown250ms, let io = scoIOAt else { return [Float](repeating: 0, count: wav.count) }
+        guard offset + 0.1 > io else { return nil }
+        // IO back before the teardown keeps the route: the headset hears the speaker.
+        return io < Self.scoRouteDisabledAt ? wav : [Float](repeating: 0, count: wav.count)
     }
 
     /// Parses off the caller's actor (the controller calls this from the main actor).
@@ -225,11 +267,16 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 }
             }
             var outs: [CaptureFeed.Output] = []
+            notes += scoNotes
+            scoNotes = []
             if !builtinStopped { outs.append(feed.accept(wav, source: .builtin, at: time)) }
-            outs.append(feed.accept([Float](repeating: 0, count: chunk.count), source: .headset, at: time))
+            if let headset = headsetChunk(offset: time - boundary, wav: wav) {
+                outs.append(feed.accept(headset, source: .headset, at: time))
+            }
             for out in outs {
                 if out.event == .fallback { notes.append("bridge_src=builtin_fallback reason=headset_digital_silence") }
                 if out.event == .switchback { notes.append("bridge_switchback=1") }
+                if out.event == .recovered { notes.append("bridge_switch=headset reason=recovered") }
                 if let fresh = out.fallbackFresh {
                     notes.append("fallback_check builtin_fresh_at_fallback=\(fresh ? 1 : 0) builtin_age_ms=\(out.builtinAgeMs.map(String.init) ?? "none")\(out.fallbackRefused ? " refused=1" : "")")
                 }

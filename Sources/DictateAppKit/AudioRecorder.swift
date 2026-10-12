@@ -114,7 +114,8 @@ public final class AudioRecorder: CaptureEngine {
     private var restarting = false
     private var restartEpoch = CaptureEpoch()
     /// L3: the admitted attempt being verified (frames within 1 s), bound to its own token.
-    private var verifying: (token: CaptureEpoch, since: TimeInterval, firstFrame: TimeInterval?)?
+    /// v1.9: `firstSignal` = the first buffer with signal; zeros alone settle as `silent_frames`.
+    private var verifying: (token: CaptureEpoch, since: TimeInterval, firstFrame: TimeInterval?, firstSignal: TimeInterval?)?
     /// A lifecycle retry the episode queued: `start()` begins it when the lifecycle runs it.
     private var lifecycleAttemptPending = false
 
@@ -399,14 +400,15 @@ public final class AudioRecorder: CaptureEngine {
                 return self.engineEpoch
             }
             self.onExecutor { [weak self] in
-                self?.configurationChanged(identity: identity, epoch: epoch, queued: false)
+                self?.configurationChanged(identity: identity, epoch: epoch, queued: false, notifiedAt: now)
             }
         }
     }
 
     /// Runs on the executor. Bluetooth: admitted by the episode (one controlled recovery per
     /// window, after a stable format; a queued one is re-validated). Other inputs: at once.
-    private func configurationChanged(identity: CaptureEpoch, epoch: CaptureEpoch, queued: Bool) {
+    private func configurationChanged(identity: CaptureEpoch, epoch: CaptureEpoch, queued: Bool,
+                                      notifiedAt: TimeInterval? = nil) {
         let current = { self.recording && self.lock.withLock {
             self.engineIdentity === identity &&
             self.captureRunning && self.engineEpoch === epoch
@@ -436,7 +438,18 @@ public final class AudioRecorder: CaptureEngine {
                 }
             } else {
                 guard current() else { return }
-                let admission = lock.withLock { episode.request(.configuration, at: now) }
+                // v1.9 (L1): AVAudioEngine auto-stopped on the profile switch — re-attach IO now,
+                // before coreaudiod tears the idle SCO route down (~250 ms after it connected).
+                let running = (try? captureObjC { self.engine?.isRunning ?? false }) ?? false
+                let (admission, immediate): (BluetoothRecoveryEpisode.Admission, Bool) = lock.withLock {
+                    let before = episode.immediateAttempts
+                    let admission = episode.request(.configuration, at: now, engineStopped: !running)
+                    return (admission, episode.immediateAttempts > before)
+                }
+                if immediate {
+                    let afterMs = Int(((now - (notifiedAt ?? now)) * 1000).rounded())
+                    AppController.note("bt_recovery=immediate path=configuration engine_running=0 after_ms=\(afterMs)")
+                }
                 switch admission {
                 case .now: lock.withLock { _ = episode.begin(at: now) }
                 case .after(let wait):
@@ -670,15 +683,15 @@ public final class AudioRecorder: CaptureEngine {
     /// `since` must arrive by `since + 1 s`; a later frame is not this attempt's success.
     private func verifyFrames(epoch: CaptureEpoch, since: TimeInterval, path: RecoveryPath) {
         let token = CaptureEpoch()
-        lock.withLock { verifying = (token, since, nil) }
+        lock.withLock { verifying = (token, since, nil, nil) }
         healthQueue.asyncAfter(deadline: .now() + BluetoothRecoveryEpisode.successWithin) { [weak self] in
             guard let self else { return }
             let result: BluetoothRecoveryEpisode.Outcome? = self.lock.withLock {
                 guard let check = self.verifying, check.token === token else { return nil }
                 self.verifying = nil
                 guard self.engineEpoch === epoch, self.episode.isRunning else { return nil }
-                let frames = check.firstFrame.map { $0 <= since + BluetoothRecoveryEpisode.successWithin } ?? false
-                let outcome: BluetoothRecoveryEpisode.Outcome = frames ? .frames : .noFrames
+                let outcome = BluetoothRecoveryEpisode.verdict(since: since, firstFrame: check.firstFrame,
+                                                               firstSignal: check.firstSignal)
                 self.episode.settled(outcome)
                 return outcome
             }
@@ -931,8 +944,11 @@ public final class AudioRecorder: CaptureEngine {
         lock.lock()
         guard engineEpoch === epoch, tap == nil || (tapEpoch === tap && captureRunning) else { lock.unlock(); return }
         let arrival = ProcessInfo.processInfo.systemUptime
-        if source == .headset, verifying != nil, verifying?.firstFrame == nil, arrival > (verifying?.since ?? .infinity) {
-            verifying?.firstFrame = arrival
+        if source == .headset, verifying != nil, arrival > (verifying?.since ?? .infinity) {
+            if verifying?.firstFrame == nil { verifying?.firstFrame = arrival }
+            // v1.9: digital zeros (an idle SCO route) are not a recovered headset.
+            if verifying?.firstSignal == nil,
+               converted.contains(where: { abs($0) >= CaptureBridge.silencePeak }) { verifying?.firstSignal = arrival }
         }
         let decision = feed.accept(converted, source: source, at: time, arrivedAt: arrival, epoch: epoch)
         deliverLocked(decision.frames)
@@ -946,6 +962,7 @@ public final class AudioRecorder: CaptureEngine {
         switch decision.event {
         case .fallback?: AppController.note("bridge_src=builtin_fallback reason=headset_digital_silence")
         case .switchback?: AppController.note("bridge_switchback=1")
+        case .recovered?: AppController.note("bridge_switch=headset reason=recovered")
         case nil: break
         }
         if let fresh = decision.fallbackFresh {
