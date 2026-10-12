@@ -148,6 +148,7 @@ struct CaptureHealthTests {
         var current: UInt32? = 81
         func start(epoch: CaptureEpoch) throws {}
         func stop() {}
+        func stop(epoch: CaptureEpoch) {}
         var isDelivering = true
         var currentDeviceID: UInt32? { current }
         var expectedDeviceID: UInt32? = 81
@@ -471,5 +472,118 @@ struct CaptureHealthTests {
         evidence.append(Self.tone(), at: 101.05)                         // overlapping: kept separate
         #expect(evidence.intervalsNote == "0-200,1000-1100,1050-1150")
         #expect(evidence.framesKept == 4 * Self.chunk)
+    }
+
+    // MARK: v1.8 review fixes (Codex high, 2026-10-12)
+
+    @Test func neverFirstBufferFailsEvenBeforeTheBridgeIsConfigured() {
+        // #2: the boundary is set, the start (and bridge configuration) is still blocked.
+        var feed = CaptureFeed()
+        _ = feed.recordingStarted(at: 10, preRoll: 0)
+        var failures: [TimeInterval] = [], warns: [CaptureHealth.Reason] = []
+        var now = 10.0
+        for _ in 0..<40 {
+            now = ((now + 0.1) * 1000).rounded() / 1000
+            let out = feed.tick(at: now)
+            if out.failure != nil { failures.append(now) }
+            if let warn = out.warn { warns.append(warn) }
+        }
+        #expect(failures == [12.0] && warns == [.noInput])
+    }
+
+    @Test func aBridgeConfiguredWithinTheDeadlineAndDeliveringIsNotAFailureGreen() {
+        var feed = CaptureFeed()
+        _ = feed.recordingStarted(at: 10, preRoll: 0)
+        var failures = 0
+        var now = 10.0
+        for step in 0..<40 {
+            if step == 5 {                                               // start returns at 10.5
+                feed.start(defaultInput: .bluetooth, hasBuiltin: true)
+                _ = feed.recordingStarted(at: 10, preRoll: 0)              // the original boundary is kept
+            }
+            if step >= 5 { _ = feed.accept(Self.tone(), source: .builtin, at: now, arrivedAt: now + 0.1) }
+            now = ((now + 0.1) * 1000).rounded() / 1000
+            if feed.tick(at: now).failure != nil { failures += 1 }
+        }
+        #expect(failures == 0)
+    }
+
+    @Test func aDeadBuiltinDoesNotHandTheDictationToAZeroHeadset() {
+        // #3: death changes liveness only; zeros never become the carried audio.
+        var rig = Rig()
+        for i in 0..<20 { rig.step(builtin: i < 5 ? Self.tone() : nil, headset: Self.zeros) }
+        #expect(rig.feed.bridge.state == .builtinOnly)
+        #expect(rig.keptFrames == 5 * Self.chunk)
+        var stale = Rig()
+        for i in 0..<9 { stale.step(builtin: i < 4 ? Self.tone() : nil, headset: Self.tone()) }   // headset carries
+        let failed = stale.feed.headsetFailed(at: stale.now)                // built-in alive but 0.5 s silent
+        #expect(failed.event == nil && failed.deferred && failed.frames.isEmpty)
+        #expect(stale.feed.bridge.state == .switched)                        // nothing chosen: the clock decides
+    }
+
+    @Test func aFreshBuiltinStillTakesOverWhenTheHeadsetEngineFailsGreen() {
+        var rig = Rig()
+        for _ in 0..<9 { rig.step(builtin: Self.tone(), headset: Self.tone()) }
+        let failed = rig.feed.headsetFailed(at: rig.now)
+        #expect(failed.event == .switchback && !failed.deferred)
+    }
+
+    @Test func aLaterFormatChangeRequeuesTheQueuedRestart() {
+        // #4: a notification at 0.19 moves the stable point to 0.39 (bounded by the window).
+        var episode = BluetoothRecoveryEpisode(bluetooth: true)
+        episode.formatChanged(at: 0)
+        #expect(episode.request(.configuration, at: 0) == .after(0.2))
+        episode.formatChanged(at: 0.19)
+        guard case .wait(let more) = episode.beginIfStable(at: 0.2) else { Issue.record("began early"); return }
+        #expect(abs(more - 0.19) < 1e-9)
+        let early = episode.begin(at: 0.3)
+        #expect(!early)                                                    // never before it is due
+        #expect(episode.beginIfStable(at: 0.39) == .begun && episode.attempts == 1)
+        var storm = BluetoothRecoveryEpisode(bluetooth: true)
+        _ = storm.request(.restart, at: 0)
+        for step in 1...30 { storm.formatChanged(at: Double(step) * 0.1) }
+        guard case .wait(let bounded) = storm.beginIfStable(at: 0.05) else { Issue.record("no wait"); return }
+        #expect(bounded <= BluetoothRecoveryEpisode.window)                  // the storm cannot defer it past the window
+    }
+
+    @Test func aStableFormatBeginsTheQueuedRestartGreen() {
+        var episode = BluetoothRecoveryEpisode(bluetooth: true)
+        episode.formatChanged(at: 0)
+        _ = episode.request(.configuration, at: 0)
+        #expect(episode.beginIfStable(at: 0.2) == .begun && episode.attempts == 1)
+    }
+
+    /// #5: a refused lifecycle retry touches no hardware.
+    private final class AdmittingEngine: CaptureEngine {
+        var admission: RecoveryAdmission = .skip
+        var starts = 0, rebuilds = 0, admissions: [RecoveryPath] = []
+        var isRunning = false
+        var isAllocated = false
+        func release() { isRunning = false }
+        func start(device: MicChoice) throws {
+            starts += 1
+            if starts == 1 { throw NSError(domain: "test.start", code: 35) }
+            isRunning = true
+        }
+        func stop() -> [Float] { isRunning = false; return [] }
+        func rebuild() throws { rebuilds += 1 }
+        func recoveryAdmission(_ path: RecoveryPath) -> RecoveryAdmission { admissions.append(path); return admission }
+    }
+
+    @Test func refusedStartRetryNeverRebuildsOrRestarts() {
+        let engine = AdmittingEngine()
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: CaptureDispatchScheduler())
+        #expect(lifecycle.beginRecording(at: 1))
+        #expect(engine.admissions == [.startRetry] && engine.rebuilds == 0 && engine.starts == 1)
+        lifecycle.end(.cancel)
+    }
+
+    @Test func admittedStartRetryRebuildsAndStartsOnceGreen() {
+        let engine = AdmittingEngine()
+        engine.admission = .proceed(after: 0)
+        let lifecycle = CaptureLifecycle(engine: engine, scheduler: CaptureDispatchScheduler())
+        #expect(lifecycle.beginRecording(at: 1))
+        #expect(engine.admissions == [.startRetry] && engine.rebuilds == 1 && engine.starts == 2 && engine.isRunning)
+        lifecycle.end(.cancel)
     }
 }
