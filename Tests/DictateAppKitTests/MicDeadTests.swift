@@ -180,6 +180,79 @@ struct MicDeadTests {
         throw URLError(.timedOut)
     }
 
+    /// The engine's own session notes through the real gate: a mic_dead dictation FAILs, a
+    /// three-phrase dictation carried by the built-in beside a silent headset PASSes (synthetic
+    /// media clock; parser + engine agreement, not live hardware proof).
+    @Test func engineSessionNotesDriveBtProof() async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for scenario in [WAVInjectedRecorder.Scenario.builtinDies, .headsetZeros] {
+            // Three 0.6 s phrases separated by 0.4 s of quiet room noise, then 3 s more room noise.
+            var samples: [Int16] = []
+            for phrase in 0..<3 {
+                samples += (0..<14_400).map { Int16(8_000 * sin(Double($0 + phrase) * 2 * .pi * 220 / 24_000)) }
+                samples += (0..<9_600).map { $0 % 2 == 0 ? 24 : -24 }
+            }
+            samples += (0..<72_000).map { $0 % 2 == 0 ? 24 : -24 }
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-gate-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let url = dir.appendingPathComponent("phrases.wav")
+            try WAVEncoder.encode(samples: samples, sampleRate: 24_000, channels: 1).write(to: url)
+            let paths = AppPaths(home: dir.appendingPathComponent("home"))
+            let keys = KeyStore(reader: { _ in "fixture" })
+            keys.prefetch(services: ["groq-api"])
+            try await waitFor { keys.key(for: "groq-api") != nil }
+            let clipboard = NSPasteboard(name: .init("dictate-gate-\(UUID().uuidString)"))
+            defer { clipboard.releaseGlobally() }
+            let recorder = WAVInjectedRecorder(url: url, pace: 0.1, scenario: scenario)
+            let notes = Lines()
+            recorder.note = { notes.add($0) }
+            let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
+                sttTransport: HTTP("please send the report"), groqCleanupTransport: HTTP(""), localCleanupTransport: HTTP(""),
+                inserter: TextInserter(pasteboard: clipboard, postKeystroke: {}),
+                panelFactory: { Panel() }, requestMicrophoneAccess: { $0(true) },
+                frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+            let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .captureOnly,
+                                           dependencies: dependencies)
+            controller.onSessionNote = { notes.add($0) }
+            let engine = DictationEngine(controller: controller)
+            var levels = 0
+            engine.onState = { if case .recording = $0 { levels += 1 } }
+            engine.start()
+            if scenario == .headsetZeros {
+                try await waitFor { levels >= 34 }                          // ≥ 3.3 s of media: all three phrases
+                engine.finish()
+            }
+            try await waitFor { notes.snapshot.contains { $0.contains("event=end") } }
+            // Stamp the engine's lines in emission order (10 ms apart) as the gate's input.
+            let base = Date(timeIntervalSince1970: 1_800_000_000)
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+            let stream = notes.snapshot.enumerated().map { index, line in
+                "\(formatter.string(from: base.addingTimeInterval(Double(index) * 0.01))) dictate: \(line)"
+            }.joined(separator: "\n") + "\n"
+            let input = dir.appendingPathComponent("stream.log")
+            try stream.write(to: input, atomically: true, encoding: .utf8)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [root.appendingPathComponent("tools/bt-proof.sh").path, "--from-file", input.path]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            try process.run()
+            process.waitUntilExit()
+            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let last = output.split(separator: "\n").last.map(String.init) ?? ""
+            if scenario == .builtinDies {
+                #expect(process.terminationStatus == 1)
+                #expect(last.hasPrefix("BT-PROOF: FAIL outcome=error:mic_dead"))
+            } else {
+                #expect(process.terminationStatus == 0, "\(output)")
+                #expect(last == "BT-PROOF: PASS")
+            }
+        }
+    }
+
     /// mic_dead_propagates_to_host: health failure → lifecycle → controller → dictate.log + pill word,
     /// no STT, no paste; GREEN: the same controller with a live built-in finishes `ok`.
     @Test func micDeadPropagatesToTheLogAndThePill() async throws {
