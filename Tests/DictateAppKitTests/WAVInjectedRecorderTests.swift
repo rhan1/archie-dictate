@@ -15,6 +15,20 @@ struct WAVInjectedRecorderTests {
         }
     }
 
+    private func makeQuietSpeechSamples() -> [Int16] {
+        let sampleRate = 24_000
+        let room = Int16((0.0005 * 32768.0).rounded())
+        let phrasePeak = 0.0085 // RMS ≈ 0.006, below CaptureEvidence.speechRMS (−40 dBFS).
+        var samples = [Int16](repeating: room, count: sampleRate)        // 1.0 s room tone
+        for _ in 0..<5 {
+            samples += (0..<Int(0.6 * Double(sampleRate))).map { i in
+                Int16((sin(2.0 * Double.pi * 220.0 * Double(i) / Double(sampleRate)) * phrasePeak * 32768.0).rounded())
+            }
+            samples += [Int16](repeating: room, count: Int(0.4 * Double(sampleRate)))
+        }
+        return samples                                                     // 6.0 s total
+    }
+
     private func makeTempDir() throws -> URL {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -203,6 +217,34 @@ struct WAVInjectedRecorderTests {
         #expect(lock.withLock { notes }.contains("bridge_src=builtin_fallback reason=headset_digital_silence"))
         #expect(WAVInjectedRecorder.scenario(environment: ["DICTATE_INJECT_SCENARIO": "headset_zeros"]) == .headsetZeros)
         #expect(WAVInjectedRecorder.scenario(environment: [:]) == .plain)
+    }
+
+    @Test func fallbackFramesAreEvidence() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let samples = makeQuietSpeechSamples()
+        let wavURL = tempDir.appendingPathComponent("quiet-builtin-speech.wav")
+        try WAVEncoder.encode(samples: samples, sampleRate: 24_000, channels: 1).write(to: wavURL)
+
+        let recorder = WAVInjectedRecorder(url: wavURL, pace: 0.05, scenario: .headsetZeros)
+        let lock = NSLock()
+        var delivered = 0
+        recorder.onPCMChunk = { chunk in lock.withLock { delivered += chunk.count } }
+        try recorder.start()
+        recorder.resetCapture()
+        for _ in 0..<400 where lock.withLock({ delivered < samples.count }) {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        _ = recorder.stop()
+
+        let stats = recorder.stats
+        #expect(stats.recordingMs >= 6_000)
+        #expect(stats.bridgeSource == "builtin_fallback")
+        #expect(stats.speechSections >= 3)
+        #expect(stats.captureIntervals.hasPrefix("0-"))
+        let intervalEnd = Int(stats.captureIntervals.split(separator: "-").last ?? "0") ?? 0
+        #expect(intervalEnd >= 5_900)
+        #expect(stats.builtinFramesAfterFallback > 0)
     }
 
     @Test func dictationEngineConstructsWithInjectedAudioURL() async throws {
