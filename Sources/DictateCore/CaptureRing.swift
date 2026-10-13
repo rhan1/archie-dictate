@@ -155,6 +155,7 @@ public struct CaptureFeed {
     public private(set) var headsetLag: TimeInterval = 0
     public private(set) var aligned = false
     private var alignNote: String?
+    private var extraNotes: [String] = []
 
     public init(ringCapacity: Int = CaptureRing.defaultCapacity) {
         ring = CaptureRing(capacity: ringCapacity)
@@ -170,6 +171,7 @@ public struct CaptureFeed {
         headsetLag = 0
         aligned = false
         alignNote = nil
+        extraNotes = []
         health = CaptureHealth()
         evidence = CaptureEvidence()
         timeline = SourceTimeline()
@@ -218,7 +220,8 @@ public struct CaptureFeed {
             let start = content - Double(missing.count) / CaptureRing.sampleRate
             bridge.resumedHeadset(through: content + Double(frames.count) / CaptureRing.sampleRate)
             var adjusted = decision
-            adjusted.framesToFeed = decision.framesToFeed + missing.count
+            // Before the second tap the frames go to the pre-roll ring, after it to the dictation (review #1).
+            if decision.framesToRing > 0 { adjusted.framesToRing += missing.count } else { adjusted.framesToFeed += missing.count }
             return finish(adjusted, frames: missing + frames, source: source, time: start, now: now,
                           arrivedAt: arrivedAt, hadKept: hadKept, signalStart: signalStart)
         }
@@ -226,15 +229,17 @@ public struct CaptureFeed {
                       hadKept: hadKept, signalStart: signalStart)
     }
 
-    /// v1.13 (L3): before the first takeover, while the built-in carries and the headset hears signal:
-    /// estimate the headset's lag once (`SpliceAligner`); a clear estimate shifts every later headset time.
+    /// v1.13 (L3): while recording and the headset hears signal: estimate the headset's lag once
+    /// (`SpliceAligner`); a clear estimate shifts every later headset time. It may land after an early
+    /// takeover (warm first buffer, a short cold one): the bridge relabels its continuity point (review #5).
     private mutating func alignIfDue() {
-        guard !aligned, bridge.isRecording, bridge.state == .builtinOnly || bridge.state == .fallback,
+        guard !aligned, bridge.isRecording,
               let h = headsetHistory.newestRun(), let b = builtinHistory.newestRun(),
               let estimate = SpliceAligner.estimate(headset: h.frames, headsetStart: h.start,
                                                     builtin: b.frames, builtinStart: b.start) else { return }
         aligned = true
         headsetLag = estimate.lag
+        bridge.setHeadsetLag(estimate.lag)
         alignNote = "splice_align_ms=\(Int((estimate.lag * 1000).rounded())) corr=\(String(format: "%.2f", estimate.correlation))"
     }
 
@@ -262,8 +267,9 @@ public struct CaptureFeed {
         }
         if decision.event == .switchback { output.frames += resumeBuiltin(arrivedAt: now, from: bridge.resumeFrom) }
         output.firstKept = !hadKept && bridge.firstKeptMs != nil
-        output.notes = (alignNote.map { [$0] } ?? []) + bridge.takeSwitchNotes()
+        output.notes = (alignNote.map { [$0] } ?? []) + bridge.takeSwitchNotes() + extraNotes
         alignNote = nil
+        extraNotes = []
         return output
     }
 
@@ -286,7 +292,12 @@ public struct CaptureFeed {
     private mutating func resumeBuiltin(arrivedAt: TimeInterval? = nil, from: TimeInterval? = nil) -> [Float] {
         let end = standby.newestEnd
         let continuity = bridge.fedThroughTime ?? 0
-        let resumed = standby.drain(from: min(continuity, from ?? continuity))
+        let replayFrom = min(continuity, from ?? continuity)
+        // A replay older than the standby ring holds is cut to the ring (visible, never silent; review #3).
+        if let oldest = standby.oldestTime, replayFrom < oldest - 0.001 {
+            extraNotes.append("bridge_replay_truncated_ms=\(Int(((oldest - replayFrom) * 1000).rounded()))")
+        }
+        let resumed = standby.drain(from: replayFrom)
         guard let end, !resumed.isEmpty else { return [] }
         bridge.resumedBuiltin(frames: resumed.count, through: end)
         let start = end - Double(resumed.count) / CaptureRing.sampleRate
@@ -348,10 +359,15 @@ public struct CaptureFeed {
                 out.notes += bridge.takeSwitchNotes()
             case .switchTo(.builtin, let reason):
                 guard bridge.canSwitchBack else { continue }
+                // v1.13: digital zeros hand over only on the bridge's content-clock witness — the health
+                // clock's arrival-time speech run would mistake a late headset buffer at the first word
+                // after a long pause for a dead link.
+                if reason == .zeros, !bridge.builtinWitnessesSpeech { continue }
                 bridge.headsetStalled(stale: reason != .zeros, reason: reason.rawValue)
                 out.frames += resumeBuiltin(arrivedAt: now)
                 out.notes.append("bridge_switchback=1 reason=\(reason.rawValue)")
-                out.notes += bridge.takeSwitchNotes()
+                out.notes += bridge.takeSwitchNotes() + extraNotes
+                extraNotes = []
             case .warn(let reason):
                 out.warn = reason
                 out.notes.append("health=warn reason=\(reason.rawValue)")
