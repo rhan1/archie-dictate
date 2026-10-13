@@ -137,6 +137,7 @@ public struct CaptureFeed {
         health = CaptureHealth()
         evidence = CaptureEvidence()
         timeline = SourceTimeline()
+        timeline.headsetLabel = defaultInput == .bluetooth ? "headset" : "default_input"
     }
 
     /// The owner asked a source's hardware to start (its startup grace runs from here).

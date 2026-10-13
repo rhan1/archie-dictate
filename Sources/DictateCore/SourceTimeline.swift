@@ -29,12 +29,20 @@ public struct SourceTimeline: Equatable, Sendable {
     public private(set) var builtinFrames = 0
     public private(set) var headsetFrames = 0
     private var last: Run?
+    /// Source changes only (gaps inside one source are not changes): v1.11's `carrier=` intervals.
+    public struct Change: Equatable, Sendable { public var source: CaptureBridge.Source; public var at: TimeInterval }
+    public private(set) var changes: [Change] = []
+    public static let maxChanges = 64
+    /// v1.11's label for the headset source: `headset` on a Bluetooth default input, else `default_input`.
+    public var headsetLabel = "headset"
 
     public init() {}
 
     public mutating func start(at boundary: TimeInterval) {
+        let label = headsetLabel
         self = SourceTimeline()
         self.boundary = boundary
+        headsetLabel = label
     }
 
     /// A kept batch: `count` frames of `source` whose first sample is at host time `time`.
@@ -42,6 +50,7 @@ public struct SourceTimeline: Equatable, Sendable {
         guard count > 0, boundary != nil else { return }
         if source == .builtin { builtinFrames += count } else { headsetFrames += count }
         let end = time + Double(count) / Self.rate
+        if changes.last?.source != source, changes.count < Self.maxChanges { changes.append(Change(source: source, at: time)) }
         if var current = last, current.source == source, time - current.end < Self.joinGap {
             current.end = max(current.end, end)
             current.frames += count
@@ -69,6 +78,39 @@ public struct SourceTimeline: Equatable, Sendable {
         func ms(_ t: TimeInterval) -> Int { max(0, Int(((t - boundary) * 1000).rounded())) }   // pre-roll = 0, as capture_intervals
         let list = runs.map { "\($0.source == .builtin ? "builtin" : "headset"):\(ms($0.start))-\(ms($0.end))" }
         return "carrier=" + list.joined(separator: ",") + (truncated ? ",+\(unlistedRuns)" : "")
+    }
+
+    private func label(_ source: CaptureBridge.Source) -> String { source == .builtin ? "builtin" : headsetLabel }
+    private func ms(_ t: TimeInterval) -> Int { max(0, Int(((t - (boundary ?? t)) * 1000).rounded())) }
+
+    /// v1.11's `carrier=` value from the frames: `builtin:0-1100,headset:1100-15110` — each source
+    /// from the sample time its first kept frame took over, the last one to `endMs` (recording end).
+    public func carrierIntervals(endMs: Int) -> String {
+        guard boundary != nil, !changes.isEmpty else { return "none" }
+        return changes.enumerated().map { index, change in
+            let start = index == 0 ? 0 : ms(change.at)
+            let end = index + 1 < changes.count ? ms(changes[index + 1].at) : max(start, endMs)
+            return "\(label(change.source)):\(start)-\(end)"
+        }.joined(separator: ",")
+    }
+
+    /// v1.11's `headset_carried_ms=`: the ms of the headset's intervals in `carrierIntervals`.
+    public func headsetIntervalMs(endMs: Int) -> Int {
+        guard boundary != nil else { return 0 }
+        return changes.enumerated().reduce(0) { total, item in
+            guard item.element.source == .headset else { return total }
+            let start = item.offset == 0 ? 0 : ms(item.element.at)
+            let end = item.offset + 1 < changes.count ? ms(changes[item.offset + 1].at) : max(start, endMs)
+            return total + max(0, end - start)
+        }
+    }
+
+    /// v1.12: the exact runs, gaps shown: `carrier_frames=builtin:0-1100,headset:1100-15106`
+    /// (+ ` carrier_frames_truncated=1`).
+    public var framesNote: String {
+        let runs = carrierNote.replacingOccurrences(of: "carrier=", with: "carrier_frames=")
+            .replacingOccurrences(of: "headset:", with: "\(headsetLabel):")
+        return runs + (truncated ? " carrier_frames_truncated=1" : "")
     }
 
     /// `carrier=… headset_carried_ms=N` (+ ` carrier_truncated=1`).

@@ -63,9 +63,12 @@ struct LowSpeechSentenceGuardTests {
         #expect(LowSpeechSentenceGuard.speechRatio(of: [Int16](repeating: 0, count: 48_000)) == 0)
     }
 
-    @Test func lowSpeechGuardSwitchDefaultsToEnabled() {
-        #expect(GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: [:]))
+    /// v1.11 L1 (Fable, after GPT-6 review §H): the novelty rule deletes valid text, so it is OFF
+    /// unless DICTATE_LOW_SPEECH_GUARD=1. Replaces v1.10's `lowSpeechGuardSwitchDefaultsToEnabled`.
+    @Test func lowSpeechGuardSwitchDefaultsToDisabled() {
+        #expect(!GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: [:]))
         #expect(!GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: ["DICTATE_LOW_SPEECH_GUARD": "0"]))
+        #expect(GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: ["DICTATE_LOW_SPEECH_GUARD": "1"]))
     }
 
     @Test func speechRatioOfToneAfterSilence() {
