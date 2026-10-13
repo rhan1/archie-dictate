@@ -114,7 +114,7 @@ struct CaptureLeaseRecorderTests {
         let broker = CaptureLeaseBroker()
         let (dictation, _, slowHeadset) = Self.recorder("A", log, broker: broker)
         let (conversation, _, _) = Self.recorder("B", log, broker: broker)
-        conversation.leaseKind = .conversation
+        conversation.kind = .conversation
         slowHeadset.stopGate = DispatchSemaphore(value: 0)
         try await dictation.startAsync(device: .default)
         dictation.resetCapture()
@@ -142,7 +142,7 @@ struct CaptureLeaseRecorderTests {
         let broker = CaptureLeaseBroker()
         let (dictation, _, _) = Self.recorder("A", log, broker: broker)
         let (conversation, _, _) = Self.recorder("B", log, broker: broker)
-        conversation.leaseKind = .conversation
+        conversation.kind = .conversation
         try await dictation.startAsync(device: .default)
         await #expect(throws: CaptureLeaseBroker.Refusal.busy(holder: .dictation)) {
             try await conversation.startAsync(device: .default)
@@ -179,7 +179,7 @@ struct CaptureLeaseRecorderTests {
         let second = recorder.stop()
         #expect(second.count == 5 * 2_400 && second.allSatisfy { $0 == 0.75 })
         #expect(recorder.stats.captureIntervals == "0-500")         // continuous from the boundary
-        #expect(recorder.stats.carrier == "carrier=builtin:0-500 headset_carried_ms=0")
+        #expect(recorder.stats.carrier == "builtin:0-\(recorder.stats.recordingMs)" && recorder.stats.carrierFrames == "carrier_frames=builtin:0-500")
         #expect(recorder.stats.lease == "lease=2 lease_kind=dictation lease_wait_ms=0")
     }
 
@@ -204,7 +204,7 @@ struct CaptureLeaseRecorderTests {
         #expect(line.contains(" io_callbacks=builtin:10,headset:7 frames=builtin:24000,headset:16800 zeros=builtin:0,headset:0"))
         #expect(line.contains(" takeover_ms="))
         #expect(!line.contains("takeover_ms=-"))
-        #expect(recorder.stats.carrier.hasPrefix("carrier=builtin:0-"))
+        #expect(recorder.stats.carrier.hasPrefix("builtin:0-"))
         #expect(recorder.stats.carrier.contains(",headset:"))
         #expect(recorder.stats.startFormat == "16000Hz/1ch")
         #expect(await recorder.awaitRelease() == .released)
