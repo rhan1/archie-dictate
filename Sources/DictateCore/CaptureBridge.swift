@@ -118,6 +118,21 @@ public struct CaptureBridge {
 
     public mutating func setWarmRoute() { warmRoute = bluetooth }
 
+    /// v1.13 (L3): seconds the headset's content trails its timestamps; the owner shifts every headset
+    /// time by it before calling `buffer`. A change mid-dictation relabels the headset's content-clock
+    /// state, and — while it carries — the continuity point, so the next buffer continues exactly
+    /// (nothing trimmed, nothing repeated). Stale IO is still judged on its unshifted age.
+    public private(set) var headsetLag: TimeInterval = 0
+    public mutating func setHeadsetLag(_ lag: TimeInterval) {
+        let delta = lag - headsetLag
+        guard delta != 0 else { return }
+        headsetLag = lag
+        lastHeadsetEnd = lastHeadsetEnd.map { $0 - delta }
+        headsetSilentSince = headsetSilentSince.map { $0 - delta }
+        firstHeadsetTime = firstHeadsetTime.map { $0 - delta }
+        if state == .switched, bluetooth { fedThrough = fedThrough.map { $0 - delta } }
+    }
+
     /// v1.13 (L2): a format change on a warm route is IO evidence — a carrying headset hands the
     /// dictation back to the built-in (the owner replays it from standby) until usable frames return.
     /// Returns true when the carrier changed.
@@ -198,6 +213,16 @@ public struct CaptureBridge {
         return switchNotes
     }
 
+    /// A witnessed replay starts where the headset went silent, never before the recording's boundary
+    /// (pre-roll the second tap discarded stays discarded; review #6).
+    private var replayStart: TimeInterval? {
+        guard let since = headsetSilentSince else { return nil }
+        return max(since, recordingStart ?? since)
+    }
+
+    /// v1.13: the health clock's zeros switch defers to the same witness (one rule, one clock).
+    public var builtinWitnessesSpeech: Bool { witnessed }
+
     /// The built-in witnesses speech while the carrying headset is digitally silent (v1.13 L1): on the
     /// shared sample clock, the headset's silence and the built-in's speech overlap for `witnessSilence`
     /// and the built-in's run is at least `CaptureHealth.switchSignal` long. Compared as intervals (L3), a
@@ -241,6 +266,8 @@ public struct CaptureBridge {
         resumeFrom = nil
         if source == .builtin {
             lastBuiltinPeak = peak
+            // A hole in the built-in's timestamps is not speech: the run restarts (review #8).
+            if let end = lastBuiltinEnd, time > end + 0.005 { builtinSpeechFrames = 0; builtinSpeechSince = nil }
             if peak >= Self.witnessPeak {
                 if builtinSpeechFrames == 0 { builtinSpeechSince = time }
                 builtinSpeechFrames += frames
@@ -256,7 +283,7 @@ public struct CaptureBridge {
         // owner replays it from standby, from where the headset's silence began.
         if source == .builtin, canSwitchBack, bluetooth, witnessed {
             if builtinFresh {
-                let since = headsetSilentSince
+                let since = replayStart
                 switchBack(&result, reason: "witness")
                 resumeFrom = since
                 return result
@@ -267,7 +294,7 @@ public struct CaptureBridge {
             fallBack(&result)
         }
         // A headset that stops delivering buffers altogether (IO stopped, not zeros).
-        if source == .builtin, canSwitchBack, builtinFresh, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
+        if source == .builtin, canSwitchBack, builtinFresh, let last = lastHeadsetEnd, end - (last + headsetLag) > Self.headsetStaleAfter {
             switchBack(&result, reason: "stale_headset")
             staleSwitchback = true
             return result    // the owner replays this buffer from standby, after the frames it missed
@@ -331,7 +358,7 @@ public struct CaptureBridge {
         case .switched where builtinAlive && witnessed:
             // v1.13 (L1): digital silence alone is a pause; with the built-in hearing speech it is a dead link.
             if builtinFresh {
-                let since = headsetSilentSince
+                let since = replayStart
                 switchBack(&result, reason: "witness")
                 resumeFrom = since
             } else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }

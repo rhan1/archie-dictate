@@ -132,7 +132,11 @@ public struct HeadsetIOGuard: Sendable {
             open(.engineStopped, at: now)
             return due(at: now)
         }
-        if obligation != nil { return due(at: now) }
+        if obligation != nil {
+            // A warm running engine's new format generation is discharged only by signal (review #7).
+            if warmRoute, obligation?.reason == .engineStopped { obligation?.reason = .formatChanged }
+            return due(at: now)
+        }
         if warmRoute, inFlightSince == nil {
             open(.formatChanged, at: now)
             return due(at: now)
