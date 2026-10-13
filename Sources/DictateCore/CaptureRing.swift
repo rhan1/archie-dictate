@@ -310,6 +310,15 @@ public struct CaptureFeed {
     }
 
     public mutating func builtinFailed() { bridge.builtinFailed() }
+    /// v1.13 (L2): the headset was already on HFP when capture was configured.
+    public mutating func setWarmRoute() { bridge.setWarmRoute() }
+    /// v1.13 (L2): a configuration notification on the warm route: IO evidence. Returns the built-in
+    /// frames that resume the dictation (when the headset was carrying) and the switch notes.
+    public mutating func headsetFormatChanged(at now: TimeInterval) -> (frames: [Float], notes: [String]) {
+        let switched = bridge.headsetFormatChanged()
+        let frames = switched ? resumeBuiltin(arrivedAt: now) : []
+        return (frames, bridge.takeSwitchNotes())
+    }
     /// Carrier changes the bridge logged outside `accept`/`tick` (engine failures).
     public mutating func takeSwitchNotes() -> [String] { bridge.takeSwitchNotes() }
     public mutating func headsetRestarted(started: Bool = true) { bridge.headsetRestarted(started: started) }

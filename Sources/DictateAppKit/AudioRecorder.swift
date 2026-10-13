@@ -223,6 +223,8 @@ public final class AudioRecorder: CaptureEngine {
         let bluetooth = eligibility?.0 == .bluetooth
         let headset = bluetooth ? route.defaultInput() : nil
         let headsetUID = headset.flatMap(route.uid)
+        // v1.13 (L2): the voice link was already up before this dictation's client started.
+        let warmRoute = bluetooth && route.hfpAlready()
         var abandonedMs: Int?
         let unit: BuiltinCapture? = lock.withLock {
             guard engineEpoch === epoch else { return nil }
@@ -235,7 +237,8 @@ public final class AudioRecorder: CaptureEngine {
             bridgeConfigured = true
             feed.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch)
             episode = BluetoothRecoveryEpisode(bluetooth: bluetooth)
-            ioGuard = HeadsetIOGuard(bluetooth: bluetooth)
+            ioGuard = HeadsetIOGuard(bluetooth: bluetooth, warmRoute: warmRoute)
+            if warmRoute { feed.setWarmRoute() }
             headsetDevice = headset
             instrumentation = CaptureInstrumentation(backend: headsetUnitArm(device: device, bluetooth: bluetooth) ? .auhal : .engine)
             instrumentation.routeUID = headsetUID
@@ -640,6 +643,17 @@ public final class AudioRecorder: CaptureEngine {
                 }
             } else {
                 guard current() else { return }
+                // v1.13 (L2): on a warm route the notification is IO evidence: a carrying headset hands
+                // back to the built-in (replayed from standby) until usable frames return.
+                var evidenceNotes: [String] = []
+                lock.withLock {
+                    guard engineEpoch === epoch else { return }
+                    let out = feed.headsetFormatChanged(at: now)
+                    deliverLocked(out.frames)
+                    evidenceNotes = out.notes
+                }
+                delivery.drain()
+                evidenceNotes.forEach { AppController.note($0) }
                 // v1.9 (L1): AVAudioEngine auto-stopped on the profile switch — re-attach IO now,
                 // before coreaudiod tears the idle SCO route down (~250 ms after it connected).
                 let running = (try? captureObjC { self.engine?.isRunning ?? false }) ?? false
@@ -667,7 +681,9 @@ public final class AudioRecorder: CaptureEngine {
                         return
                     }
                     let afterMs = Int(((now - (notifiedAt ?? now)) * 1000).rounded())
-                    AppController.note("bt_recovery=immediate path=configuration engine_running=0 after_ms=\(afterMs)")
+                    let warm = lock.withLock { ioGuard.obligation?.reason == .formatChanged }
+                    AppController.note("bt_recovery=immediate path=configuration engine_running=\(running ? 1 : 0) after_ms=\(afterMs)"
+                                       + (warm ? " reason=warm_format_change" : ""))
                 case .episode:
                     let admission: BluetoothRecoveryEpisode.Admission = lock.withLock {
                         episode.request(.configuration, at: now, engineStopped: !running)
