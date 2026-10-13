@@ -14,7 +14,8 @@ public struct CaptureBridge {
     public enum Event: Equatable, Sendable {
         /// No headset signal within `fallbackAfter` of its first buffer.
         case fallback
-        /// The headset went digital-zero for longer than `switchbackAfter` mid-dictation.
+        /// Mid-dictation the built-in carries again: the carrying headset went digitally silent while
+        /// the built-in witnessed speech (v1.13), its IO stopped, or its engine failed.
         case switchback
         /// v1.9: the headset recovered (`takeoverSignal` of signal) while the built-in carried
         /// after a fallback or switchback; it carries again (`bridge_switch=headset reason=recovered`).
@@ -38,7 +39,18 @@ public struct CaptureBridge {
     public static let silencePeak: Float = 1e-4
     public static let takeoverSignal: TimeInterval = 0.15
     public static let fallbackAfter: TimeInterval = 1.5
-    public static let switchbackAfter: TimeInterval = 0.5
+    /// v1.13 (L1): a pause is not a dead headset. 10-13 15:19–15:22 (A1–A4, auhal arm): every cold
+    /// run dropped to the built-in for 0.2–0.7 s at the passage's two-second pause — v1.12 switched
+    /// back after 0.5 s of headset digital silence alone, and the switchback landed on the first word
+    /// after the pause ("We need" → "When you need"). The carrying headset is now presumed dead only on
+    /// IO evidence (no buffers for `headsetStaleAfter`, an engine failure, the health clock's stale or
+    /// device verdict) or when the built-in is a WITNESS: batch peaks of at least `witnessPeak` for
+    /// `CaptureHealth.switchSignal` of consecutive frames while the headset has been digitally silent
+    /// for `witnessSilence`. Both quiet is a pause: the headset keeps carrying.
+    /// −40 dBFS: the distant built-in carried Raza's speech at −44…−46 dBFS RMS (A1–A4 `rms_dbfs=`);
+    /// its room floor is far below.
+    public static let witnessPeak: Float = 0.01
+    public static let witnessSilence: TimeInterval = 0.1
     public static let restartAfter: TimeInterval = 0.7
     /// No headset buffer at all for this long while it carries (IO stopped, not zeros):
     /// longer than `switchbackAfter` because Bluetooth timestamps trail the built-in's.
@@ -84,6 +96,18 @@ public struct CaptureBridge {
     private var headsetSignalFrames = 0
     private var headsetSilentFrames = 0
     private var fallbackRefusedNoted = false
+    /// v1.13 (L1): consecutive built-in frames at speech level (`witnessPeak`).
+    private var builtinSpeechFrames = 0
+    /// Sample time of the first frame of the headset's current digital-silence run.
+    private var headsetSilentSince: TimeInterval?
+    private var lastHeadsetPeak: Float = 0
+    private var lastBuiltinPeak: Float = 0
+    /// Every carrier change since the last `takeSwitchNotes()`, with both sources' latest batch peaks:
+    /// `bridge_switch=builtin reason=witness headset_peak=0.00000 builtin_peak=0.03125`.
+    private var switchNotes: [String] = []
+    /// A witnessed switchback resumes the built-in from here (the headset's silence began; the
+    /// zeros it fed carried no speech), not from the continuity point.
+    public private(set) var resumeFrom: TimeInterval?
     public init() {}
 
     /// Timeline reason: a skip, a fallback, or a bridge whose built-in engine delivered no audio.
@@ -116,7 +140,7 @@ public struct CaptureBridge {
         firstKeptMs = keptFrames > 0 ? 0 : nil
         bridgeMs = state == .switched && bridgeSource == "builtin" ? 0 : nil
         carriers = []
-        noteCarrier()
+        noteCarrier(reason: nil)
     }
 
     /// The source feeding the dictation now: `builtin` (the bridge's unit), `headset` (the
@@ -129,10 +153,30 @@ public struct CaptureBridge {
         }
     }
 
-    private mutating func noteCarrier() {
+    /// `reason` nil: the recording's first carrier (not a switch, nothing logged).
+    private mutating func noteCarrier(reason: String?) {
         guard let tap = tapTime, let carrier, carriers.last?.source != carrier else { return }
         let at = Int((((fedThrough ?? tap) - tap) * 1000).rounded())
+        if let reason, !carriers.isEmpty {
+            switchNotes.append("bridge_switch=\(carrier) reason=\(reason) headset_peak=\(Self.peakText(lastHeadsetPeak))"
+                               + " builtin_peak=\(Self.peakText(lastBuiltinPeak))")
+        }
         carriers.append((carrier, max(carriers.last?.startMs ?? 0, at)))
+    }
+
+    static func peakText(_ peak: Float) -> String { String(format: "%.5f", Double(peak)) }
+
+    /// v1.13 (L1): the carrier changes logged since the last call (the owner prints them).
+    public mutating func takeSwitchNotes() -> [String] {
+        defer { switchNotes = [] }
+        return switchNotes
+    }
+
+    /// The built-in witnesses speech while the carrying headset is digitally silent (v1.13 L1).
+    private var witnessed: Bool {
+        guard headsetSilentSince != nil else { return false }
+        return Double(headsetSilentFrames) / Self.rate >= Self.witnessSilence - 0.000_001
+            && Double(builtinSpeechFrames) / Self.rate >= CaptureHealth.switchSignal - 0.000_001
     }
 
     /// `builtin:0-1106,headset:1106-15110` (ms from the second tap; the last runs to `endMs`), or `none`.
@@ -162,15 +206,30 @@ public struct CaptureBridge {
         if let token, token !== epoch { return Decision() }
         guard state != .off, frames > 0 else { return Decision() }
         var result = Decision()
+        resumeFrom = nil
+        if source == .builtin {
+            lastBuiltinPeak = peak
+            builtinSpeechFrames = peak >= Self.witnessPeak ? builtinSpeechFrames + frames : 0
+        }
         if source == .headset, bluetooth { arbitrate(&result, at: time, frames: frames,
                                                      arrivedAt: arrivedAt, peak: peak, builtinFresh: builtinFresh) }
+        // v1.13 (L1): the built-in buffer that completes the witness hands the dictation back; the
+        // owner replays it from standby, from where the headset's silence began.
+        if source == .builtin, canSwitchBack, bluetooth, witnessed {
+            if builtinFresh {
+                let since = headsetSilentSince
+                switchBack(&result, reason: "witness")
+                resumeFrom = since
+                return result
+            } else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
+        }
         let end = time + Double(frames) / Self.rate
         if source == .builtin, state == .builtinOnly, builtinFresh, let first = firstHeadsetTime, end - first >= Self.fallbackAfter {
             fallBack(&result)
         }
         // A headset that stops delivering buffers altogether (IO stopped, not zeros).
         if source == .builtin, canSwitchBack, builtinFresh, let last = lastHeadsetEnd, end - last > Self.headsetStaleAfter {
-            switchBack(&result)
+            switchBack(&result, reason: "stale_headset")
             staleSwitchback = true
             return result    // the owner replays this buffer from standby, after the frames it missed
         }
@@ -202,10 +261,13 @@ public struct CaptureBridge {
                                     arrivedAt: TimeInterval?, peak: Float, builtinFresh: Bool) {
         if firstHeadsetTime == nil { firstHeadsetTime = time }
         lastHeadsetEnd = time + Double(frames) / Self.rate
+        lastHeadsetPeak = peak
         if peak >= Self.silencePeak {
             headsetSignalFrames += frames
             headsetSilentFrames = 0
+            headsetSilentSince = nil
         } else {
+            if headsetSilentFrames == 0 { headsetSilentSince = time }
             headsetSilentFrames += frames
             headsetSignalFrames = 0
         }
@@ -217,7 +279,7 @@ public struct CaptureBridge {
         case .builtinOnly where bridgeSource != "none":
             if signal >= Self.takeoverSignal {
                 state = .switched
-                noteCarrier()
+                noteCarrier(reason: "takeover")
                 result.releaseBuiltin = true
                 if let tap = tapTime {
                     bridgeMs = max(0, Int((((arrivedAt ?? time) - tap) * 1000).rounded()))
@@ -227,15 +289,19 @@ public struct CaptureBridge {
                 if builtinFresh { fallBack(&result) }
                 else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
             }
-        case .switched where builtinAlive && silent > Self.switchbackAfter:
-            if builtinFresh { switchBack(&result) }
-            else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
+        case .switched where builtinAlive && witnessed:
+            // v1.13 (L1): digital silence alone is a pause; with the built-in hearing speech it is a dead link.
+            if builtinFresh {
+                let since = headsetSilentSince
+                switchBack(&result, reason: "witness")
+                resumeFrom = since
+            } else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
         case .fallback where signal >= Self.takeoverSignal:
             // v1.9: the recovered headset carries again, whatever ended its turn (stale, digital
             // zeros, or a startup fallback); tonight its second recovery delivered signal ~0.4 s
             // after the 1.5 s fallback and v1.8's latch kept the distant built-in for the whole dictation.
             state = .switched
-            noteCarrier()
+            noteCarrier(reason: "recovered")
             staleSwitchback = false
             headsetRetakes += 1
             result.event = .recovered
@@ -252,14 +318,14 @@ public struct CaptureBridge {
 
     private mutating func fallBack(_ result: inout Decision) {
         state = .fallback
-        noteCarrier()
+        noteCarrier(reason: "fallback")
         bridgeSource = "builtin_fallback"
         result.event = .fallback
     }
 
-    private mutating func switchBack(_ result: inout Decision) {
+    private mutating func switchBack(_ result: inout Decision, reason: String) {
         state = .fallback
-        noteCarrier()
+        noteCarrier(reason: reason)
         staleSwitchback = false
         switchbacks += 1
         result.event = .switchback
@@ -274,7 +340,7 @@ public struct CaptureBridge {
         case .builtinOnly:
             fallbackReason = "headset_engine_failed"
             fallBack(&result)
-        case .switched: switchBack(&result)
+        case .switched: switchBack(&result, reason: "headset_engine_failed")
         case .fallback: return .fallback
         case .off: return nil
         }
@@ -283,20 +349,20 @@ public struct CaptureBridge {
 
     /// v1.8 (L2): the health clock found the carrying built-in dead or transport-silent and the
     /// headset fresh with signal: the headset carries (either direction; `.fallback` no longer latches).
-    public mutating func takeOver() {
+    public mutating func takeOver(reason: String = "health") {
         guard state == .builtinOnly || state == .fallback else { return }
         state = .switched
-        noteCarrier()
+        noteCarrier(reason: reason)
         staleSwitchback = false
         if bridgeMs == nil, let tap = tapTime, let last = lastHeadsetEnd { bridgeMs = max(0, Int(((last - tap) * 1000).rounded())) }
     }
 
     /// v1.8 (L2): the carrying headset went stale or transport-silent on the health clock and a
     /// fresh built-in takes over. A stale (not zero) headset may take over again when it returns.
-    public mutating func headsetStalled(stale: Bool) {
+    public mutating func headsetStalled(stale: Bool, reason: String = "health") {
         guard canSwitchBack else { return }
         var result = Decision()
-        switchBack(&result)
+        switchBack(&result, reason: reason)
         staleSwitchback = stale
     }
 
@@ -356,7 +422,7 @@ public struct CaptureBridge {
             skipReason = "builtin_failed_after_fallback"
         default: break
         }
-        noteCarrier()
+        noteCarrier(reason: "builtin_failed")
     }
 }
 
