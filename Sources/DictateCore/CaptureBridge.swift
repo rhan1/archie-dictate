@@ -108,7 +108,31 @@ public struct CaptureBridge {
     /// A witnessed switchback resumes the built-in from here (the headset's silence began; the
     /// zeros it fed carried no speech), not from the continuity point.
     public private(set) var resumeFrom: TimeInterval?
+    /// v1.13 (L2): the headset was already on HFP when capture was configured: its link is proven, so
+    /// it takes over from its first usable (non-silent) buffer instead of after `takeoverSignal`.
+    /// W1 (auhal, warm) carried from 58 ms; the engine arm waited 2431 ms on the same route.
+    public private(set) var warmRoute = false
     public init() {}
+
+    public mutating func setWarmRoute() { warmRoute = bluetooth }
+
+    /// v1.13 (L2): a format change on a warm route is IO evidence — a carrying headset hands the
+    /// dictation back to the built-in (the owner replays it from standby) until usable frames return.
+    /// Returns true when the carrier changed.
+    @discardableResult public mutating func headsetFormatChanged() -> Bool {
+        guard warmRoute, state != .off else { return false }
+        headsetSignalFrames = 0                // only frames after the change count toward a takeover
+        guard canSwitchBack else { return false }
+        var result = Decision()
+        switchBack(&result, reason: "format_changed")
+        staleSwitchback = true
+        return true
+    }
+
+    /// Consecutive signal the headset needs to carry: one usable buffer on a warm route.
+    private func takeoverNeeded(frames: Int) -> TimeInterval {
+        warmRoute ? Double(frames) / Self.rate : Self.takeoverSignal
+    }
 
     /// Timeline reason: a skip, a fallback, or a bridge whose built-in engine delivered no audio.
     public var reason: String? {
@@ -277,7 +301,7 @@ public struct CaptureBridge {
         if signal >= Self.takeoverSignal, restart?.restarted == true { restart?.signalAfter = true }
         switch state {
         case .builtinOnly where bridgeSource != "none":
-            if signal >= Self.takeoverSignal {
+            if signal >= takeoverNeeded(frames: frames) - 0.000_001 {
                 state = .switched
                 noteCarrier(reason: "takeover")
                 result.releaseBuiltin = true
@@ -296,7 +320,7 @@ public struct CaptureBridge {
                 switchBack(&result, reason: "witness")
                 resumeFrom = since
             } else if !fallbackRefusedNoted { fallbackRefusedNoted = true; result.fallbackRefused = true }
-        case .fallback where signal >= Self.takeoverSignal:
+        case .fallback where signal >= takeoverNeeded(frames: frames) - 0.000_001:
             // v1.9: the recovered headset carries again, whatever ended its turn (stale, digital
             // zeros, or a startup fallback); tonight its second recovery delivered signal ~0.4 s
             // after the 1.5 s fallback and v1.8's latch kept the distant built-in for the whole dictation.
