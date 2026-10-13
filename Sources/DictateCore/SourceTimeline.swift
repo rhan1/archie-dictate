@@ -66,7 +66,7 @@ public struct SourceTimeline: Equatable, Sendable {
     /// `carrier=builtin:0-1106,headset:1106-15110` (`carrier=none` when nothing was kept).
     public var carrierNote: String {
         guard let boundary, !runs.isEmpty else { return "carrier=none" }
-        func ms(_ t: TimeInterval) -> Int { Int(((t - boundary) * 1000).rounded()) }
+        func ms(_ t: TimeInterval) -> Int { max(0, Int(((t - boundary) * 1000).rounded())) }   // pre-roll = 0, as capture_intervals
         let list = runs.map { "\($0.source == .builtin ? "builtin" : "headset"):\(ms($0.start))-\(ms($0.end))" }
         return "carrier=" + list.joined(separator: ",") + (truncated ? ",+\(unlistedRuns)" : "")
     }

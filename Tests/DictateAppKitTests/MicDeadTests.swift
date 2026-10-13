@@ -118,8 +118,8 @@ struct MicDeadRecorderTests {
     @Test func scoTornDown250msOneReattachThenHandsOffGreen() async throws {
         let result = try await run(.scoTornDown250ms, mediaSeconds: 3)
         #expect(result.failure == nil)
-        #expect(result.stats.ioOps == "io_ops=start:2 stop:1 rebuild:0 retap:1")
-        #expect(result.stats.ioHeld == "io_held=0 config_notifications=1")
+        #expect(result.stats.ioOps == "io_ops=start:2 stop:1 rebuild:0 retap:1 attempted:4 completed:3 failed:0 framework:1")
+        #expect(result.stats.ioHeld == "io_held=0 config_notifications=1 io_obligations=1/1 io_obligation=none reattaches=1")   // v1.12 L2: stop → obligation → re-attach → IO observed
         #expect(!result.notes.contains { $0.hasPrefix("bridge_src=builtin_fallback") })
         #expect(!result.notes.contains { $0.hasPrefix("headset_restart=") })
         #expect(result.stats.bridgeSource == "builtin")             // bridged, then the headset took over
@@ -131,7 +131,7 @@ struct MicDeadRecorderTests {
     @Test func scoTornDown250msV19ReattachRebuildsRed() async throws {
         let result = try await run(.scoTornDown250ms, mediaSeconds: 3, ioPolicy: .v19)
         #expect(result.failure == nil)
-        #expect(result.stats.ioOps == "io_ops=start:2 stop:2 rebuild:1 retap:1")
+        #expect(result.stats.ioOps == "io_ops=start:2 stop:2 rebuild:1 retap:1 attempted:6 completed:5 failed:0 framework:0")
         #expect(result.notes.contains("bridge_src=builtin_fallback reason=headset_digital_silence"))
         #expect(result.stats.bridgeSource == "builtin_fallback")
         #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))   // the built-in still carries
