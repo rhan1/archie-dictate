@@ -32,6 +32,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     private let raceAfterMs: Int
     private let finalIncludeExamples: Bool
     private let quotaProvider: @Sendable () -> GroqQuota
+    private let clock: any DictateClock
     private var chunks: [Int: String] = [:]
     private var contiguous = 0
     private var covered = 0
@@ -55,11 +56,13 @@ public final class IncrementalCleaner: @unchecked Sendable {
     /// The final tail call omits the few-shot pairs by default (v1.5.1: ~80 ms faster on the
     /// user's fixture); the single-call path keeps them.
     public init(cleaner: TranscriptCleaner, raceAfterMs: Int = 600, finalIncludeExamples: Bool = false,
-                quotaProvider: (@Sendable () -> GroqQuota)? = nil) {
+                quotaProvider: (@Sendable () -> GroqQuota)? = nil,
+                clock: any DictateClock = SystemClock()) {
         self.cleaner = cleaner
         self.finalIncludeExamples = finalIncludeExamples
         self.raceAfterMs = max(0, raceAfterMs)
         self.quotaProvider = quotaProvider ?? { GroqQuota.current }
+        self.clock = clock
     }
     public var needsFallback: Bool { lock.withLock { failed } }
     public var callCount: Int { lock.withLock { calls + singleCalls } }
@@ -140,7 +143,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
     public func seal() {
         lock.withLock {
             sealed = true
-            if sealedAt == nil { sealedAt = .now }
+            if sealedAt == nil { sealedAt = clock.now() }
         }
     }
 
@@ -152,7 +155,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
             if let finalTask { return finalTask }
             closed = true
             sealed = true
-            if sealedAt == nil { sealedAt = .now }
+            if sealedAt == nil { sealedAt = clock.now() }
             let inFlight = pending
             let deadline = sealedAt!.advanced(by: .milliseconds(raceAfterMs))
             let task = Task.detached { [self] in
@@ -205,9 +208,9 @@ public final class IncrementalCleaner: @unchecked Sendable {
         let incrementalPath = Task.detached { [self] in
             continuation.yield(.incremental(await finishIncremental(totalChunks: totalChunks, inFlight: inFlight)))
         }
-        let timer: Task<Void, Never>? = inFlight != nil ? Task.detached {
+        let timer: Task<Void, Never>? = inFlight != nil ? Task.detached { [self] in
             do {
-                try await ContinuousClock().sleep(until: deadline)
+                try await clock.sleep(until: deadline)
                 if !Task.isCancelled { continuation.yield(.deadline) }
             } catch {}
         } : nil
