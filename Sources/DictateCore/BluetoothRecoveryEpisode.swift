@@ -178,6 +178,8 @@ public struct BluetoothRecoveryEpisode: Sendable {
     }
 
     public var isRunning: Bool { running }
+    /// No further attempt can be admitted this dictation (budget spent, or external busy twice).
+    public var budgetSpent: Bool { bluetooth && (attempts >= Self.maxAttempts || (externalBusySeen && attemptsAfterBusy >= 1)) }
     public var lastOutcome: Outcome? { outcomes.last }
 }
 
