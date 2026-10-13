@@ -24,9 +24,12 @@ private actor HTTP: HTTPTransport {
     let text: String
     let delay: UInt64
     private(set) var requests = 0
+    /// Responses returned (v1.12: tests wait for this instead of a wall-clock sleep).
+    private(set) var completed = 0
     init(_ text: String, delayMs: UInt64 = 0) { self.text = text; self.delay = delayMs * 1_000_000 }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         requests += 1
+        defer { completed += 1 }
         if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
         let payload: [String: Any] = request.url!.path.contains("transcriptions") ? ["text": text] :
             ["choices": [["finish_reason": "stop", "message": ["content": text]]]]
@@ -69,8 +72,11 @@ struct MicDeadRecorderTests {
     }
 
     /// Runs a scenario at 20× until it fails or `mediaSeconds` of media time pass.
+    /// v1.12 (L4): stepped on the media clock (`manualPacing`) — no wall-clock deadline, so machine
+    /// load cannot cut a scenario short. `pcmStall` blocks every PCM callback (the RED twin's load).
     private func run(_ scenario: WAVInjectedRecorder.Scenario, mediaSeconds: Double, legacy: Bool = false,
-                     ioPolicy: WAVInjectedRecorder.IOPolicy = .v110) async throws
+                     ioPolicy: WAVInjectedRecorder.IOPolicy = .v110, realClock: Bool = false,
+                     pcmStall: TimeInterval = 0) async throws
         -> (failure: CaptureFailure?, notes: [String], pcm: [Int16], wav: [Int16], stats: AudioRecorder.CaptureStats) {
         // Longer than any run: the WAV's trailing zeros must never be what the clock sees.
         let (dir, url) = try wav(seconds: 7)
@@ -83,13 +89,27 @@ struct MicDeadRecorderTests {
         var failure: CaptureFailure?
         recorder.note = { notes.add($0) }
         recorder.mediaLimit = mediaSeconds + 0.2          // never past the 7 s WAV, however late stop() runs
-        recorder.onPCMChunk = { chunk in pcmLock.withLock { pcm += chunk } }
-        recorder.onCaptureFailure = { failure = $0 }
+        recorder.onPCMChunk = { chunk in
+            if pcmStall > 0 { Thread.sleep(forTimeInterval: pcmStall) }
+            pcmLock.withLock { pcm += chunk }
+        }
+        let failed = Lines()
+        recorder.onCaptureFailure = { failure = $0; failed.add("failed") }
+        recorder.manualPacing = !realClock
         try recorder.start()
         recorder.resetCapture()
-        let deadline = ContinuousClock.now + .milliseconds(Int(mediaSeconds * 50) + 3_000)
-        while failure == nil, pcmLock.withLock({ pcm.count }) < Int(mediaSeconds * 24_000), ContinuousClock.now < deadline {
-            try await Task.sleep(nanoseconds: 2_000_000)
+        if realClock {
+            // v1.11's wall-clock harness (the RED twin): a deadline in real time.
+            let deadline = ContinuousClock.now + .milliseconds(Int(mediaSeconds * 50) + 3_000)
+            while failure == nil, pcmLock.withLock({ pcm.count }) < Int(mediaSeconds * 24_000), ContinuousClock.now < deadline {
+                try await Task.sleep(nanoseconds: 2_000_000)
+            }
+        } else {
+            for _ in 0..<Int(mediaSeconds * 10 + 0.5) {
+                recorder.step()
+                await MainActor.run {}                     // the failure callback hops to main
+                if !failed.snapshot.isEmpty { break }
+            }
         }
         _ = recorder.stop()
         return (failure, notes.snapshot, pcmLock.withLock { pcm }, Self.tone(seconds: 7), recorder.stats)
@@ -118,12 +138,27 @@ struct MicDeadRecorderTests {
     @Test func scoTornDown250msOneReattachThenHandsOffGreen() async throws {
         let result = try await run(.scoTornDown250ms, mediaSeconds: 3)
         #expect(result.failure == nil)
-        #expect(result.stats.ioOps == "io_ops=start:2 stop:1 rebuild:0 retap:1")
-        #expect(result.stats.ioHeld == "io_held=0 config_notifications=1")
+        #expect(result.stats.ioOps == "io_ops=start:2 stop:1 rebuild:0 retap:1 attempted:4 completed:3 failed:0 framework:1")
+        #expect(result.stats.ioHeld == "io_held=0 config_notifications=1 io_obligations=1/1 io_obligation=none reattaches=1")   // v1.12 L2: stop → obligation → re-attach → IO observed
         #expect(!result.notes.contains { $0.hasPrefix("bridge_src=builtin_fallback") })
         #expect(!result.notes.contains { $0.hasPrefix("headset_restart=") })
         #expect(result.stats.bridgeSource == "builtin")             // bridged, then the headset took over
         #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))
+    }
+
+    // v1.12 L4: the same scenario under a 150 ms stall in every PCM callback (machine load). The
+    // stepped harness still sees all 3 s; v1.11's wall-clock harness hits its 3.15 s deadline first.
+    @Test func scoTornDown250msUnderStallSteppedGreen() async throws {
+        let result = try await run(.scoTornDown250ms, mediaSeconds: 3, pcmStall: 0.15)
+        #expect(result.failure == nil)
+        #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))
+    }
+
+    @Test func scoTornDown250msUnderStallRealClockRed() async throws {
+        let result = try await run(.scoTornDown250ms, mediaSeconds: 3, realClock: true, pcmStall: 0.15)
+        withKnownIssue("a starved wall-clock harness stops the scenario before 3 s of media") {
+            #expect(result.pcm.count >= 3 * 24_000)
+        }
     }
 
     // v1.10 L1 RED twin: v1.9's re-attach rebuilt the auto-stopped engine (format mismatch) — a stop
@@ -131,7 +166,7 @@ struct MicDeadRecorderTests {
     @Test func scoTornDown250msV19ReattachRebuildsRed() async throws {
         let result = try await run(.scoTornDown250ms, mediaSeconds: 3, ioPolicy: .v19)
         #expect(result.failure == nil)
-        #expect(result.stats.ioOps == "io_ops=start:2 stop:2 rebuild:1 retap:1")
+        #expect(result.stats.ioOps == "io_ops=start:2 stop:2 rebuild:1 retap:1 attempted:6 completed:5 failed:0 framework:0")
         #expect(result.notes.contains("bridge_src=builtin_fallback reason=headset_digital_silence"))
         #expect(result.stats.bridgeSource == "builtin_fallback")
         #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))   // the built-in still carries
@@ -227,6 +262,21 @@ struct MicDeadTests {
         throw URLError(.timedOut)
     }
 
+    /// v1.12 (L4): advance a `manualPacing` recorder 100 ms of media per step until `condition` holds
+    /// (or `ticks` steps ran), yielding to the main queue between steps so the engine's callbacks
+    /// run. Media time, not wall time: load cannot change what the engine heard. 10 s hang detector.
+    private func drive(_ recorder: WAVInjectedRecorder, ticks: Int = .max, until condition: () -> Bool = { false }) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        var stepped = 0
+        while ContinuousClock.now < deadline {
+            if condition() || stepped >= ticks { return }
+            if recorder.isRunning { recorder.step(); stepped += 1 }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        Issue.record("timed out")
+        throw URLError(.timedOut)
+    }
+
     /// The engine's own session notes through the real gate: a mic_dead dictation FAILs, a
     /// three-phrase dictation carried by the built-in beside a silent headset PASSes (synthetic
     /// media clock; parser + engine agreement, not live hardware proof).
@@ -252,6 +302,7 @@ struct MicDeadTests {
             let clipboard = NSPasteboard(name: .init("dictate-gate-\(UUID().uuidString)"))
             defer { clipboard.releaseGlobally() }
             let recorder = WAVInjectedRecorder(url: url, pace: 0.1, scenario: scenario)
+            recorder.manualPacing = true
             let notes = Lines()
             recorder.note = { notes.add($0) }
             let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
@@ -267,10 +318,10 @@ struct MicDeadTests {
             engine.onState = { if case .recording = $0 { levels += 1 } }
             engine.start()
             if scenario == .headsetZeros {
-                try await waitFor { levels >= 34 }                          // ≥ 3.3 s of media: all three phrases
+                try await drive(recorder) { levels >= 34 }                  // ≥ 3.3 s of media: all three phrases
                 engine.finish()
             }
-            try await waitFor { notes.snapshot.contains { $0.contains("event=end") } }
+            try await drive(recorder) { notes.snapshot.contains { $0.contains("event=end") } }
             // Stamp the engine's lines in emission order (10 ms apart) as the gate's input.
             let base = Date(timeIntervalSince1970: 1_800_000_000)
             let formatter = DateFormatter()
@@ -312,6 +363,7 @@ struct MicDeadTests {
         let clipboard = NSPasteboard(name: .init("dictate-cancel-\(UUID().uuidString)"))
         defer { clipboard.releaseGlobally() }
         let recorder = WAVInjectedRecorder(url: url, pace: 0.05)
+        recorder.manualPacing = true
         recorder.note = { _ in }
         let stt = HTTP("please send the report", delayMs: 400)
         let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
@@ -327,11 +379,15 @@ struct MicDeadTests {
         var states: [DictateAppKit.DictationState] = []
         engine.onState = { states.append($0) }
         engine.start()
-        try await Task.sleep(nanoseconds: 60_000_000)
+        try await drive(recorder, ticks: 12)                                 // 1.2 s of media, then finish
         engine.finish()
         try await waitFor { states.contains(.transcribing) }
         engine.cancel()                                                      // Escape while transcribing
-        try await Task.sleep(nanoseconds: 900_000_000)                       // the slow STT has returned by now
+        // The slow STT has returned (counted, not timed), then the main queue drained twice.
+        while await stt.completed < 1 { try await Task.sleep(nanoseconds: 2_000_000) }
+        await MainActor.run {}
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await MainActor.run {}
         let ends = notes.snapshot.filter { $0.contains("event=end") }
         #expect(ends.count == 1 && ends.first?.contains("outcome=cancel") == true)
         let log = try String(contentsOf: paths.logURL, encoding: .utf8).split(separator: "\n")
@@ -353,6 +409,7 @@ struct MicDeadTests {
             let clipboard = NSPasteboard(name: .init("dictate-micdead-\(UUID().uuidString)"))
             defer { clipboard.releaseGlobally() }
             let recorder = WAVInjectedRecorder(url: url, pace: 0.05, scenario: scenario)
+            recorder.manualPacing = true
             let notes = Lines()
             recorder.note = { notes.add($0) }
             let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
@@ -368,10 +425,10 @@ struct MicDeadTests {
             engine.onState = { states.append($0) }
             engine.start()
             if scenario == .headsetZeros {
-                try await Task.sleep(nanoseconds: 100_000_000)               // ≈ 2 s of media at 20×
+                try await drive(recorder, ticks: 20)                         // 2 s of media
                 engine.finish()
             }
-            try await waitFor { FileManager.default.fileExists(atPath: paths.logURL.path) }
+            try await drive(recorder) { FileManager.default.fileExists(atPath: paths.logURL.path) }
             let line = try String(contentsOf: paths.logURL, encoding: .utf8)
             let lines = notes.snapshot
             let start = lines.first { $0.contains("event=start") } ?? ""
