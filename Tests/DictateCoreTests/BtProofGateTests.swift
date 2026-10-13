@@ -148,4 +148,73 @@ struct BtProofGateTests {
         #expect(res.status == 1)
         #expect(res.finalLine == "BT-PROOF: FAIL missing_sessions")
     }
+
+    // MARK: - v1.11 L5 bt-proof honesty tests
+
+    @Test func redLateSignalFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-late-signal.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine.contains("drop_unrecovered@"))
+    }
+
+    @Test func redLateFallbackFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-late-fallback.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine.contains("drop_unrecovered@"))
+    }
+
+    @Test func redTruncatedIntervalsFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-truncated-intervals.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine.contains("truncated_intervals"))
+    }
+
+    @Test func redOverlappingSessionsFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-overlapping-sessions.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine.contains("ambiguous_session"))
+    }
+
+    @Test func greenBoundedRecoveryPasses() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "green-bounded-recovery.log"))
+        #expect(res.status == 0)
+        #expect(res.finalLine == "BT-PROOF: PASS")
+        #expect(res.output.contains("DROPS_SEEN=1"))
+        #expect(res.output.contains("RECOVERED=1"))
+        #expect(res.output.contains("VERDICT headset=PASS"))
+    }
+
+    @Test func greenHeadsetCarriedPasses() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "green-headset-carried.log"))
+        #expect(res.status == 0)
+        #expect(res.finalLine == "BT-PROOF: PASS")
+        #expect(res.output.contains("VERDICT headset=PASS"))
+    }
+
+    @Test func positiveControlDropCounterNonzero() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "green-bounded-recovery.log"))
+        #expect(res.status == 0)
+        #expect(res.finalLine == "BT-PROOF: PASS")
+        let dropsSeen = res.output.split(separator: "\n")
+            .compactMap { line -> Int? in
+                guard line.contains("DROPS_SEEN=") else { return nil }
+                if let match = line.range(of: "DROPS_SEEN=") {
+                    let rest = line[match.upperBound...]
+                    let numStr = rest.prefix(while: { $0.isNumber })
+                    return Int(numStr)
+                }
+                return nil
+            }.first ?? 0
+        #expect(dropsSeen >= 1)
+    }
+
+    @Test func separateVerdictsFormatted() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "green-bounded-recovery.log"))
+        #expect(res.status == 0)
+        #expect(res.output.contains("VERDICT continuity=PASS"))
+        #expect(res.output.contains("VERDICT headset=PASS"))
+        #expect(res.output.contains("VERDICT content=PASS"))
+        #expect(res.output.contains("VERDICT playback=NA"))
+    }
 }
+
