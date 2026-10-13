@@ -105,6 +105,8 @@ public struct CaptureFeed {
         public var fallbackFresh: Bool?
         public var builtinAgeMs: Int?
         public var fallbackRefused = false
+        /// v1.13 (L1): carrier changes with both peaks (`bridge_switch=… headset_peak= builtin_peak=`).
+        public var notes: [String] = []
     }
     /// One health-clock evaluation's effects, applied by the owner after its lock.
     public struct TickOutput: Equatable, Sendable {
@@ -188,8 +190,9 @@ public struct CaptureFeed {
         if source == .builtin, bridge.canSwitchBack || decision.event == .switchback {
             standby.append(frames, at: time)
         }
-        if decision.event == .switchback { output.frames += resumeBuiltin(arrivedAt: now) }
+        if decision.event == .switchback { output.frames += resumeBuiltin(arrivedAt: now, from: bridge.resumeFrom) }
         output.firstKept = !hadKept && bridge.firstKeptMs != nil
+        output.notes = bridge.takeSwitchNotes()
         return output
     }
 
@@ -207,9 +210,12 @@ public struct CaptureFeed {
     }
 
     /// The standby built-in frames from where the headset stopped (into the ring before the second tap).
-    private mutating func resumeBuiltin(arrivedAt: TimeInterval? = nil) -> [Float] {
+    /// v1.13 (L1): a witnessed switchback resumes `from` where the headset's silence began — the zeros
+    /// it fed carried nothing, so the built-in's speech from that point is kept, not lost.
+    private mutating func resumeBuiltin(arrivedAt: TimeInterval? = nil, from: TimeInterval? = nil) -> [Float] {
         let end = standby.newestEnd
-        let resumed = standby.drain(from: bridge.fedThroughTime ?? 0)
+        let continuity = bridge.fedThroughTime ?? 0
+        let resumed = standby.drain(from: min(continuity, from ?? continuity))
         guard let end, !resumed.isEmpty else { return [] }
         bridge.resumedBuiltin(frames: resumed.count, through: end)
         let start = end - Double(resumed.count) / CaptureRing.sampleRate
@@ -267,13 +273,14 @@ public struct CaptureFeed {
                 out.stopBuiltin = true
                 out.notes.append("bridge_builtin_lost=1 reason=\(problem.rawValue) state=\(before)")
             case .switchTo(.headset, let reason):
-                bridge.takeOver()
-                out.notes.append("bridge_switch=headset reason=\(reason.rawValue)")
+                bridge.takeOver(reason: reason.rawValue)
+                out.notes += bridge.takeSwitchNotes()
             case .switchTo(.builtin, let reason):
                 guard bridge.canSwitchBack else { continue }
-                bridge.headsetStalled(stale: reason != .zeros)
+                bridge.headsetStalled(stale: reason != .zeros, reason: reason.rawValue)
                 out.frames += resumeBuiltin(arrivedAt: now)
                 out.notes.append("bridge_switchback=1 reason=\(reason.rawValue)")
+                out.notes += bridge.takeSwitchNotes()
             case .warn(let reason):
                 out.warn = reason
                 out.notes.append("health=warn reason=\(reason.rawValue)")
@@ -303,5 +310,7 @@ public struct CaptureFeed {
     }
 
     public mutating func builtinFailed() { bridge.builtinFailed() }
+    /// Carrier changes the bridge logged outside `accept`/`tick` (engine failures).
+    public mutating func takeSwitchNotes() -> [String] { bridge.takeSwitchNotes() }
     public mutating func headsetRestarted(started: Bool = true) { bridge.headsetRestarted(started: started) }
 }

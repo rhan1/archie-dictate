@@ -32,6 +32,15 @@ import DictateCore
 ///   ~1.1 s (R4: `bridge_ms=1106 bridge_src=builtin`) and carries to the end. The restart the bridge
 ///   requests at 0.7 s of zeros is coalesced into the running recovery and never runs (R4 still
 ///   reported `headset_restart=1 result=still_silent`).
+///
+/// v1.13 two-stream scenarios (`Arm` sets the headset client's delivery size; the built-in AUHAL
+/// delivers 10 ms buffers; both are interleaved in arrival order inside each 100 ms media tick):
+/// - `pause_zeros` (L1 a): the headset = the WAV with `pauseLength` of exact zeros inserted at
+///   `pauseAt`; the built-in = its room floor only (never exact zeros).
+/// - `headset_drops` (L1 b): the headset = the WAV until `dropAt`, then exact zeros (a dead link);
+///   the built-in = the WAV heard from a distance (`distantGain`) over its floor.
+/// - `live_pause` (L1 c): the 10-13 A/B as modeled — the WAV with the inserted pause, through the
+///   Sony's mic gate (`gatePeak` per 20 ms → exact zeros) on the headset, distant on the built-in.
 public final class WAVInjectedRecorder: EngineRecorder {
     /// Which re-attach the `sco_torn_down_250ms` IO model runs.
     public enum IOPolicy: Sendable { case v19, v110 }
@@ -39,8 +48,37 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case plain, headsetZeros = "headset_zeros", builtinDies = "builtin_dies", builtinDrifts = "builtin_drifts"
         case scoTornDown250ms = "sco_torn_down_250ms"
         case headsetTakeover = "headset_takeover"
+        case pauseZeros = "pause_zeros", headsetDrops = "headset_drops", livePause = "live_pause"
         var hasHeadset: Bool { self != .plain }
+        /// v1.13: the headset and the built-in each play their own track.
+        public var usesTracks: Bool { self == .pauseZeros || self == .headsetDrops || self == .livePause }
     }
+    /// v1.13: the headset client modeled — only the size of the headset's deliveries differs (10-13 A/B
+    /// session lines: engine `io_callbacks=…headset:149 frames=…headset:357552` = 2400 frames per
+    /// callback; auhal 812 / 389712 = 480).
+    public enum Arm: String, Sendable, CaseIterable {
+        case engine, auhal
+        public var headsetBufferFrames: Int { self == .engine ? 2_400 : 480 }
+    }
+    /// The built-in AUHAL's deliveries (10-13: 1562 callbacks / 399864 frames ≈ 256), 10 ms here.
+    public static let builtinBufferFrames = 240
+    /// The distant built-in hears the speaker ~18 dB below the headset (A1 `rms_dbfs=builtin:-46.0,headset:-27.0`).
+    public static let distantGain: Float = 0.126
+    /// The built-in's room floor: deterministic noise within ±0.001 (−60 dBFS), never an exact zero.
+    public static let noiseFloor: Float = 0.001
+    /// The Sony's mic gate as modeled: a 20 ms window whose peak is below this arrives as exact zeros.
+    public static let gatePeak: Float = 0.02
+    public var arm: Arm = .engine
+    /// `pause_zeros` / `live_pause`: where the inserted pause starts (s into the WAV) and its length.
+    public var pauseAt: TimeInterval = 1.0
+    public var pauseLength: TimeInterval = 2.0
+    /// `headset_drops`: media time after the boundary from which the headset delivers only zeros.
+    public var dropAt: TimeInterval = 1.0
+    /// Every note with its media ms after the boundary (tests read when a switch happened).
+    public private(set) var timedNotes: [(ms: Int, line: String)] = []
+    private var headsetTrack: [Float] = []
+    private var builtinTrack: [Float] = []
+    private var trackCursor = 0
     /// Built-in frames stop after this much media time in the dying scenarios.
     public static let builtinLifetime: TimeInterval = 0.5
     /// `sco_torn_down_250ms` timing (s after the headset start; R1 01:53:08.300 + …).
@@ -181,6 +219,48 @@ public final class WAVInjectedRecorder: EngineRecorder {
         return pcmSamples
     }
 
+    /// v1.13: the two tracks a two-stream scenario plays (headset, built-in), from the WAV's samples.
+    public static func tracks(_ scenario: Scenario, wav: [Float], pauseAt: TimeInterval, pauseLength: TimeInterval,
+                              dropAt: TimeInterval) -> (headset: [Float], builtin: [Float]) {
+        let rate = AudioRecorder.sampleRate
+        func inserted(_ x: [Float]) -> [Float] {
+            let at = min(x.count, max(0, Int((pauseAt * rate).rounded())))
+            return Array(x[..<at]) + [Float](repeating: 0, count: max(0, Int((pauseLength * rate).rounded()))) + Array(x[at...])
+        }
+        func distant(_ x: [Float]) -> [Float] { x.enumerated().map { $0.element * distantGain + floorSample($0.offset) } }
+        func gated(_ x: [Float]) -> [Float] {
+            var out = x
+            for start in stride(from: 0, to: x.count, by: 480) {
+                let end = min(x.count, start + 480)
+                if !x[start..<end].contains(where: { abs($0) >= gatePeak }) {
+                    for i in start..<end { out[i] = 0 }
+                }
+            }
+            return out
+        }
+        switch scenario {
+        case .pauseZeros:
+            let headset = inserted(wav)
+            return (headset, (0..<headset.count).map(floorSample))
+        case .headsetDrops:
+            let drop = min(wav.count, max(0, Int((dropAt * rate).rounded())))
+            return (Array(wav[..<drop]) + [Float](repeating: 0, count: wav.count - drop), distant(wav))
+        case .livePause:
+            let speech = inserted(wav)
+            return (gated(speech), distant(speech))
+        default:
+            return ([], [])
+        }
+    }
+
+    /// The built-in's room floor at sample `index`: deterministic, within ±`noiseFloor`, never 0.
+    public static func floorSample(_ index: Int) -> Float {
+        var x = UInt64(truncatingIfNeeded: index) &* 0x9E37_79B9_7F4A_7C15
+        x ^= x >> 29; x &*= 0xBF58_476D_1CE4_E5B9; x ^= x >> 32
+        let unit = Float(x % 2_001) / 1_000 - 1                       // −1 … 1 in steps of 0.001
+        return (unit == 0 ? 0.5 : unit) * noiseFloor
+    }
+
     public func start(device: MicChoice = .default) throws {
         // Parse before taking the lock: a throw must never leave it held (isRunning is read next).
         try start(parsed: Self.parseWAV(at: url))
@@ -194,6 +274,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
         }
         wavSamples = parsed
         sampleCursor = 0
+        if scenario.usesTracks {
+            (headsetTrack, builtinTrack) = Self.tracks(scenario, wav: parsed.map { Float($0) / 32768.0 }, pauseAt: pauseAt,
+                                                       pauseLength: pauseLength, dropAt: dropAt)
+        }
+        trackCursor = 0
+        timedNotes = []
         firstBufferFired = false
         buffer.removeAll()
         meter.clearBatch()
@@ -373,7 +459,37 @@ public final class WAVInjectedRecorder: EngineRecorder {
         let time = mediaTime
         mediaTime += Double(chunk.count) / AudioRecorder.sampleRate
         var kept: [Float] = []
-        if scenario.hasHeadset {
+        var noteTimes: [Int] = []
+        if scenario.usesTracks {
+            // v1.13: each source plays its own track in its own buffer size, interleaved by arrival
+            // (a buffer arrives when its last frame was captured; the built-in first on a tie).
+            let n = wav.count
+            let base = trackCursor
+            trackCursor += n
+            let headset = (0..<n).map { base + $0 < headsetTrack.count ? headsetTrack[base + $0] : 0 }
+            let builtinWindow = (0..<n).map { base + $0 < builtinTrack.count ? builtinTrack[base + $0] : Self.floorSample(base + $0) }
+            var deliveries: [(start: Int, end: Int, source: CaptureBridge.Source)] = []
+            for start in stride(from: 0, to: n, by: Self.builtinBufferFrames) {
+                deliveries.append((start, min(n, start + Self.builtinBufferFrames), .builtin))
+            }
+            for start in stride(from: 0, to: n, by: arm.headsetBufferFrames) {
+                deliveries.append((start, min(n, start + arm.headsetBufferFrames), .headset))
+            }
+            deliveries.sort { $0.end != $1.end ? $0.end < $1.end : ($0.source == .builtin && $1.source == .headset) }
+            for delivery in deliveries {
+                let frames = Array((delivery.source == .builtin ? builtinWindow : headset)[delivery.start..<delivery.end])
+                let at = time + Double(delivery.start) / AudioRecorder.sampleRate
+                let arrived = time + Double(delivery.end) / AudioRecorder.sampleRate
+                let out = feed.accept(frames, source: delivery.source, at: at, arrivedAt: arrived)
+                var lines: [String] = []
+                if out.event == .fallback { lines.append("bridge_src=builtin_fallback reason=headset_digital_silence") }
+                if out.event == .switchback { lines.append("bridge_switchback=1") }
+                lines += out.notes
+                notes += lines
+                noteTimes += lines.map { _ in Int(((arrived - boundary) * 1000).rounded()) }
+                kept += out.frames
+            }
+        } else if scenario.hasHeadset {
             // Built-in = the WAV (until it dies), headset = digital zeros, same 100 ms window.
             let dying = scenario == .builtinDies || scenario == .builtinDrifts
             if dying, !builtinStopped, time - boundary >= Self.builtinLifetime {
@@ -442,6 +558,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
         // Levels only from frames the dictation kept (v1.8: none are fabricated).
         let level: Double? = kept.isEmpty ? nil : meter.level(db: WisprLevel.db(samples: kept))
 
+        let tickMs = Int(((mediaTime - boundary) * 1000).rounded())
+        for (index, line) in notes.enumerated() { timedNotes.append((index < noteTimes.count ? noteTimes[index] : tickMs, line)) }
         let firstCb = shouldFireFirst ? onFirstBuffer : nil
         let levelCb = onLevel
         let failureCb = onCaptureFailure

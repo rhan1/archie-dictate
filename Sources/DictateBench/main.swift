@@ -375,6 +375,61 @@ if args.count >= 3, args[1] == "levels" {
                  old ? "OLD" : "NEW", gainDB, 20 * log10(Double(peak)), top3.count, t[t.count / 2], a[a.count / 2], Double(pass) / Double(top3.count) * 100))
     exit(0)
 }
+// hatch <wav> <engine|auhal> [scenario] (v1.13): the WAV hatch on the production CaptureFeed, no mic, no
+// Bluetooth, no device. Prints the carrier and every bridge switch with its media ms — counts and ms only.
+// HATCH_PAUSE_AT / HATCH_PAUSE_S / HATCH_DROP_AT move the scenario's events (s); HATCH_STT=1 (key in the
+// environment, via tools/hatch-run.zsh) prints Groq whisper WORD COUNTS of the post-pause audio, never text.
+if args.count >= 4, args[1] == "hatch" {
+    let env = ProcessInfo.processInfo.environment
+    let url = URL(fileURLWithPath: args[2])
+    guard let arm = WAVInjectedRecorder.Arm(rawValue: args[3]) else { print("arm must be engine or auhal"); exit(2) }
+    guard let scenario = args.count >= 5 ? WAVInjectedRecorder.Scenario(rawValue: args[4]) : .livePause, scenario.usesTracks else {
+        print("scenario must be pause_zeros, headset_drops or live_pause"); exit(2)
+    }
+    let recorder = WAVInjectedRecorder(url: url, scenario: scenario)
+    recorder.manualPacing = true
+    recorder.arm = arm
+    recorder.pauseAt = Double(env["HATCH_PAUSE_AT"] ?? "") ?? 7.7
+    recorder.pauseLength = Double(env["HATCH_PAUSE_S"] ?? "") ?? 2.0
+    recorder.dropAt = Double(env["HATCH_DROP_AT"] ?? "") ?? 7.7
+    recorder.note = { _ in }
+    let pcmBox = PCMBox()
+    recorder.onPCMChunk = { pcmBox.append($0) }
+    let clip = try WAVInjectedRecorder.parseWAV(at: url)
+    let inserted = scenario == .headsetDrops ? 0 : recorder.pauseLength
+    try recorder.start()
+    for _ in 0..<Int((Double(clip.count) / 24_000 + inserted + 0.3) / 0.1 + 0.999) { recorder.step() }
+    recorder.stop()
+    let stats = recorder.stats
+    let midRunBuiltin = stats.carrier.split(separator: ",").dropFirst().filter { $0.hasPrefix("builtin:") }.count
+    print("hatch arm=\(arm.rawValue) scenario=\(scenario.rawValue) recording_ms=\(stats.recordingMs) carrier=\(stats.carrier)"
+          + " headset_carried_ms=\(stats.headsetCarriedMs) bridge_switchback=\(stats.bridgeSwitchback) mid_run_builtin_segments=\(midRunBuiltin)")
+    for note in recorder.timedNotes where note.line.hasPrefix("bridge_") || note.line.hasPrefix("health=") {
+        print("t_ms=\(note.ms) \(note.line)")
+    }
+    if env["HATCH_STT"] == "1", scenario != .headsetDrops {
+        let from = Int(((recorder.pauseAt + recorder.pauseLength) * 24_000).rounded())
+        let got = pcmBox.samples
+        let tracks = WAVInjectedRecorder.tracks(scenario, wav: clip.map { Float($0) / 32768 }, pauseAt: recorder.pauseAt,
+                                                pauseLength: recorder.pauseLength, dropAt: recorder.dropAt)
+        let reference = tracks.headset.map { Int16(max(-32768, min(32767, ($0 * 32768).rounded()))) }
+        let client = TranscriptionClient(transport: URLSessionTransport(timeout: 60), apiKey: { try environmentKey("GROQ_API_KEY") })
+        func words(_ pcm: [Int16]) async -> Int {
+            guard pcm.count > 2_400, let text = try? await client.transcribe(wav: WAVEncoder.encode(samples: pcm, sampleRate: 24_000), prompt: "") else { return -1 }
+            return text.split(whereSeparator: { $0 == " " || $0 == "\n" }).count
+        }
+        let post = await words(Array(got.dropFirst(from)))
+        let reference_ = await words(Array(reference.dropFirst(from)))
+        print("hatch_stt post_pause_words=\(post) reference_post_pause_words=\(reference_)")
+    }
+    exit(0)
+}
+final class PCMBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var all: [Int16] = []
+    func append(_ chunk: [Int16]) { lock.withLock { all += chunk } }
+    var samples: [Int16] { lock.withLock { all } }
+}
 // Fail before reading fixtures/stdin or contacting any provider when its key is absent.
 if args.count >= 2 {
     switch args[1] {

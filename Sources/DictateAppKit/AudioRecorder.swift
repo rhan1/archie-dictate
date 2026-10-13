@@ -296,6 +296,7 @@ public final class AudioRecorder: CaptureEngine {
             return true
         }
         guard failed else { return }
+        lock.withLock { feed.takeSwitchNotes() }.forEach { AppController.note($0) }
         lock.withLock { builtin }.stop(epoch: epoch)
         var line = "bridge_src=none reason=builtin_start_failed"
         if let error = error as? BuiltinCaptureUnit.StartError { line += " builtin_error=\(error.description)" }
@@ -763,13 +764,16 @@ public final class AudioRecorder: CaptureEngine {
         }
         if result == .failed {
             // v1.7: a headset that cannot recover is not a failed dictation while the built-in carries it.
+            var switchNotes: [String] = []
             let carried: (CaptureBridge.Event?, Bool) = lock.withLock {
                 guard engineEpoch === epoch else { return (nil, false) }
                 let out = feed.headsetFailed(at: ProcessInfo.processInfo.systemUptime)
                 deliverLocked(out.frames)
+                switchNotes = feed.takeSwitchNotes()
                 return (out.event, !out.deferred)
             }
             delivery.drain()
+            switchNotes.forEach { AppController.note($0) }
             if carried.0 == nil, !carried.1, lock.withLock({ engineEpoch === epoch }) {
                 AppController.note("headset_engine_failed=1 builtin_carries=pending_fresh")
                 return
@@ -905,8 +909,10 @@ public final class AudioRecorder: CaptureEngine {
             self.teardownEngine()
             AppController.note("headset_restart_error=\(error as NSError)")
         })
+        var switchNotes: [String] = []
         let carried: (nothing: Bool, event: CaptureBridge.Event?) = lock.withLock {
             guard engineEpoch === epoch else { return (false, nil) }
+            defer { switchNotes = feed.takeSwitchNotes() }
             feed.headsetRestarted(started: outcome.started)
             if !outcome.started { verifying = nil }
             if outcome.externalBusy { episode.settled(.externalBusy) }
@@ -924,6 +930,7 @@ public final class AudioRecorder: CaptureEngine {
             if !outcome.started { requestHeadsetRestart(epoch: epoch, path: .restart) }
         }
         // Notes reach the host's sink: never under `lock`.
+        switchNotes.forEach { AppController.note($0) }
         if let event = carried.event { Self.noteCarried(event, reason: "headset_restart_failed") }
         if carried.nothing { reportEngineFailure(epoch: epoch) }
     }
@@ -1449,9 +1456,10 @@ public final class AudioRecorder: CaptureEngine {
         switch decision.event {
         case .fallback?: AppController.note("bridge_src=builtin_fallback reason=headset_digital_silence")
         case .switchback?: AppController.note("bridge_switchback=1")
-        case .recovered?: AppController.note("bridge_switch=headset reason=recovered")
-        case nil: break
+        case .recovered?, nil: break
         }
+        // v1.13 (L1): every carrier change with both peaks (`bridge_switch=headset reason=recovered …`).
+        decision.notes.forEach { AppController.note($0) }
         if let fresh = decision.fallbackFresh {
             AppController.note("fallback_check builtin_fresh_at_fallback=\(fresh ? 1 : 0) builtin_age_ms=\(decision.builtinAgeMs.map(String.init) ?? "none")\(decision.fallbackRefused ? " refused=1" : "")")
         }
