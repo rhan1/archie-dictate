@@ -37,7 +37,7 @@ private final class Stream: @unchecked Sendable {
 /// v1.11 L1: invented sentences at a dictation's edges are dropped on audio evidence only;
 /// uncertain text is kept (GPT-6 review §F "Transcript integrity", §H; Fable 10-13).
 /// Lines marked `// v1.11-api` use v1.11 fields; the RED runs on v1.10 strip them.
-@Suite("EdgeSentenceGuard")
+@Suite("EdgeSentenceGuard", .serialized)
 struct EdgeSentenceGuardTests {
     // 220 Hz at 3000 is speech by any rule (−27 dBFS RMS); ±15 is −67 dBFS room noise (never
     // speech); a 50 ms burst is a key click (one window: no section, no speech run).
@@ -81,7 +81,7 @@ struct EdgeSentenceGuardTests {
     /// last speech section is dropped.
     @Test func tailSilenceSentenceDropped() async {
         let last = tone(2.0) + noise(1.5) + click + noise(0.25)
-        let result = await run([(tone(3.0), .init(text: report)),
+        let result = await run([(tone(1.0), .init(text: report)),
                                 (last, .init(text: "Okay, that is everything. Have a great weekend."))])
         #expect(result.text == "Send the report to Maria. Okay, that is everything.")
         #expect(result.droppedTailSentences == 1) // v1.11-api
@@ -91,7 +91,7 @@ struct EdgeSentenceGuardTests {
     /// RED on v1.10: Raza's "Thank you" after the real end of his speech.
     @Test func tailThankYouAfterLastSpeechDropped() async {
         let last = tone(2.0) + noise(1.5) + click + noise(0.25)
-        let result = await run([(tone(3.0), .init(text: "Okay, here is the plan.")),
+        let result = await run([(tone(1.0), .init(text: "Okay, here is the plan.")),
                                 (last, .init(text: "Send the report to Maria. Thank you."))])
         #expect(result.text == "Okay, here is the plan. Send the report to Maria.")
         #expect(result.droppedArtifacts == 1) // v1.11-api
@@ -100,14 +100,14 @@ struct EdgeSentenceGuardTests {
     /// RED on v1.10: the vocabulary prompt's "Dictate" on the tail's silence.
     @Test func dictateArtifactAfterSilenceDropped() async {
         let last = tone(1.5) + noise(2.0) + click + noise(0.25)
-        let result = await run([(tone(3.0), .init(text: report)), (last, .init(text: "Okay, ship it. Dictate."))])
+        let result = await run([(tone(1.0), .init(text: report)), (last, .init(text: "Okay, ship it. Dictate."))])
         #expect(result.text == "Send the report to Maria. Okay, ship it.")
         #expect(result.droppedArtifacts == 1) // v1.11-api
     }
 
     /// "Thanks" IS speech when the audio ends in speech: the passage ends inside its last section.
     @Test func thanksInsideSpeechKept() async {
-        let result = await run([(tone(3.0), .init(text: report)),
+        let result = await run([(tone(1.0), .init(text: report)),
                                 (tone(2.5) + noise(0.25), .init(text: "That is all for today. Thanks."))])
         #expect(result.text == "Send the report to Maria. That is all for today. Thanks.")
         #expect(result.droppedTailSentences + result.droppedArtifacts == 0) // v1.11-api
@@ -116,14 +116,14 @@ struct EdgeSentenceGuardTests {
     /// A click 0.4 s after the last word leaves < 1 s of non-speech: the honest ending is kept.
     @Test func honestEndingBeforeClickKept() async {
         let last = tone(2.5) + noise(0.4) + click + noise(0.25)
-        let result = await run([(tone(3.0), .init(text: report)), (last, .init(text: "Send it now. Thank you."))])
+        let result = await run([(tone(1.0), .init(text: report)), (last, .init(text: "Send it now. Thank you."))])
         #expect(result.text == "Send the report to Maria. Send it now. Thank you.")
     }
 
     /// Soft words (6 dB over the dictation's floor, under its speech threshold) veto a drop.
     @Test func softWordsVetoTheDrop() async {
         let last = tone(1.0) + noise(0.3) + tone(0.5, amplitude: 60) + noise(1.2) + click + noise(0.25)
-        let result = await run([(tone(3.0), .init(text: report)), (last, .init(text: "Send it. Then call Maria."))])
+        let result = await run([(tone(1.0), .init(text: report)), (last, .init(text: "Send it. Then call Maria."))])
         #expect(result.text == "Send the report to Maria. Send it. Then call Maria.")
     }
 
@@ -131,7 +131,7 @@ struct EdgeSentenceGuardTests {
 
     @Test func silentLastChunkDropped() async {
         let stream = Stream()
-        let result = await run([(tone(3.0), .init(text: report)), (noise(1.5), .init(text: "Thank you."))], stream: stream)
+        let result = await run([(tone(1.0), .init(text: report)), (noise(1.5), .init(text: "Thank you."))], stream: stream)
         #expect(result.text == report)
         #expect(result.droppedSilentChunks == 1) // v1.11-api
         #expect(stream.texts(1) == [""])
@@ -140,8 +140,8 @@ struct EdgeSentenceGuardTests {
     /// The silent chunk's text never reaches the incremental cleaner (it pastes as it goes).
     @Test func silentMiddleChunkNeverStreamed() async {
         let stream = Stream()
-        let result = await run([(tone(3.0), .init(text: report)), (noise(1.5), .init(text: "Dictate.")),
-                                (tone(2.0), .init(text: "Then call the bank."))], stream: stream)
+        let result = await run([(tone(1.0), .init(text: report)), (noise(1.5), .init(text: "Dictate.")),
+                                (tone(0.8), .init(text: "Then call the bank."))], stream: stream)
         #expect(result.text == "Send the report to Maria. Then call the bank.")
         #expect(stream.texts(1) == [""])
     }
@@ -158,7 +158,7 @@ struct EdgeSentenceGuardTests {
     @Test func openingArtifactBeforeFirstSpeechDropped() async {
         let first = noise(1.5) + click + noise(0.2) + tone(2.0)
         let result = await run([(first, .init(text: "Thank you. Book the flight to Denver.")),
-                                (tone(3.0), .init(text: "Then email Maria."))])
+                                (tone(1.0), .init(text: "Then email Maria."))])
         #expect(result.text == "Book the flight to Denver. Then email Maria.")
         #expect(result.droppedArtifacts == 1) // v1.11-api
     }
@@ -166,7 +166,7 @@ struct EdgeSentenceGuardTests {
     @Test func openingSentenceOverSilenceDropped() async {
         let first = noise(1.5) + click + noise(0.2) + tone(2.0)
         let result = await run([(first, .init(text: "Okay so. Book the flight to Denver.")),
-                                (tone(3.0), .init(text: "Then email Maria."))])
+                                (tone(1.0), .init(text: "Then email Maria."))])
         #expect(result.text == "Book the flight to Denver. Then email Maria.")
         #expect(result.droppedOpeningSentences == 1) // v1.11-api
     }
@@ -179,7 +179,7 @@ struct EdgeSentenceGuardTests {
         let low = tone(0.3) + noise(2.7)
         #expect(abs(LowSpeechSentenceGuard.speechRatio(of: low) - 0.10) < 0.02)
         let result = await run([(low, .init(text: "Hey. Cancel the London booking.")),
-                                (tone(3.1), .init(text: "Send the invoice tomorrow."))])
+                                (tone(1.1), .init(text: "Send the invoice tomorrow."))])
         #expect(result.text == "Hey. Cancel the London booking. Send the invoice tomorrow.")
         #expect(result.droppedLowSpeechSentences == 0)
     }
@@ -187,16 +187,16 @@ struct EdgeSentenceGuardTests {
     @Test func numbersNegationAndNamesExact() async {
         let texts = ["Wire $1,250.75 to account 4471 by 5.30 p.m.", "Do not cancel the London booking.",
                      "Ask Siobhan O'Neill and Raza Khan, version 1.11."]
-        let result = await run([(tone(3.0), .init(text: texts[0])), (tone(3.2), .init(text: texts[1])),
-                                (tone(2.6) + noise(0.25), .init(text: texts[2]))])
+        let result = await run([(tone(1.0), .init(text: texts[0])), (tone(1.2), .init(text: texts[1])),
+                                (tone(0.9) + noise(0.25), .init(text: texts[2]))])
         #expect(result.text == texts.joined(separator: " "))
     }
 
     /// Responses arrive 2, 0, 1: the text is still in chunk order.
     @Test func reorderedResponsesKeepOrder() async {
-        let result = await run([(tone(3.0), .init(text: "First this.", delayMs: 150)),
-                                (tone(3.2), .init(text: "Then that.", delayMs: 300)),
-                                (tone(2.6), .init(text: "Finally done."))], concurrent: true)
+        let result = await run([(tone(1.0), .init(text: "First this.", delayMs: 150)),
+                                (tone(1.2), .init(text: "Then that.", delayMs: 300)),
+                                (tone(0.9), .init(text: "Finally done."))], concurrent: true)
         #expect(result.text == "First this. Then that. Finally done.")
     }
 
@@ -205,8 +205,8 @@ struct EdgeSentenceGuardTests {
     @Test func earlyLaterChunkIsNeverTheComparator() async {
         let low = tone(0.3) + noise(2.7)
         let result = await run([(low, .init(text: "Hey. Cancel the London booking.", delayMs: 100)),
-                                (tone(3.2), .init(text: "The London booking was for Friday.", delayMs: 300)),
-                                (tone(2.6), .init(text: "Send the invoice tomorrow."))],
+                                (tone(1.2), .init(text: "The London booking was for Friday.", delayMs: 300)),
+                                (tone(0.9), .init(text: "Send the invoice tomorrow."))],
                                lowSpeechGuard: true, concurrent: true)
         #expect(result.text == "Hey. Cancel the London booking. The London booking was for Friday. Send the invoice tomorrow.")
         #expect(result.droppedLowSpeechSentences == 0)
@@ -214,9 +214,9 @@ struct EdgeSentenceGuardTests {
 
     /// A chunk that fails twice is missing; nothing is invented in its place and its neighbours are exact.
     @Test func missingChunkLeavesNeighboursExact() async {
-        let result = await run([(tone(3.0), .init(text: "First this.")),
-                                (tone(3.2), .init(text: "lost", status: 500)),
-                                (tone(2.6), .init(text: "Finally done."))])
+        let result = await run([(tone(1.0), .init(text: "First this.")),
+                                (tone(1.2), .init(text: "lost", status: 500)),
+                                (tone(0.9), .init(text: "Finally done."))])
         #expect(result.text == "First this. Finally done.")
         #expect(result.failedCount == 1)
     }
