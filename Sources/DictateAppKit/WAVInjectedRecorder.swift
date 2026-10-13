@@ -39,6 +39,13 @@ import DictateCore
 ///   `pauseAt`; the built-in = its room floor only (never exact zeros).
 /// - `headset_drops` (L1 b): the headset = the WAV until `dropAt`, then exact zeros (a dead link);
 ///   the built-in = the WAV heard from a distance (`distantGain`) over its floor.
+/// - `warm_hfp` (L2): the engine arm starting on a headset already on HFP (E4/W2, 10-13 15:24). The
+///   device has usable frames from `WarmModel.framesFrom`; the engine's own start draws a configuration
+///   notification at `WarmModel.notifyAt` while it runs, after which its tap delivers digital zeros until
+///   a re-attach (retap) brings IO back `WarmModel.retapLatency` later; a restart (teardown, the 300 ms
+///   idle wait, a fresh start) draws a stopping notification `WarmModel.restartStopsAfter` later and no
+///   frames. The production `HeadsetIOGuard`, `BluetoothRecoveryEpisode` and `CaptureFeed` decide every
+///   step, as the recorder does. `warmRoute` = what the recorder sampled (`route.hfpAlready()`).
 /// - `live_pause` (L1 c): the 10-13 A/B as modeled — the WAV with the inserted pause, through the
 ///   Sony's mic gate (`gatePeak` per 20 ms → exact zeros) on the headset, distant on the built-in.
 public final class WAVInjectedRecorder: EngineRecorder {
@@ -49,9 +56,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case scoTornDown250ms = "sco_torn_down_250ms"
         case headsetTakeover = "headset_takeover"
         case pauseZeros = "pause_zeros", headsetDrops = "headset_drops", livePause = "live_pause"
+        case warmHFP = "warm_hfp"
         var hasHeadset: Bool { self != .plain }
         /// v1.13: the headset and the built-in each play their own track.
-        public var usesTracks: Bool { self == .pauseZeros || self == .headsetDrops || self == .livePause }
+        public var usesTracks: Bool { self == .pauseZeros || self == .headsetDrops || self == .livePause || self == .warmHFP }
     }
     /// v1.13: the headset client modeled — only the size of the headset's deliveries differs (10-13 A/B
     /// session lines: engine `io_callbacks=…headset:149 frames=…headset:357552` = 2400 frames per
@@ -74,6 +82,32 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public var pauseLength: TimeInterval = 2.0
     /// `headset_drops`: media time after the boundary from which the headset delivers only zeros.
     public var dropAt: TimeInterval = 1.0
+    /// `warm_hfp`: the recorder found the headset already on HFP (false: the cold flag on the same IO).
+    public var warmRoute = true
+    /// `warm_hfp` IO model, from the E4 (f9fc0895) / W2 (c3e8e1f9) lines of 10-13 15:24.
+    public enum WarmModel {
+        /// The spec's warm fixture: usable headset frames from t0 + 50 ms.
+        public static let framesFrom: TimeInterval = 0.05
+        /// `bt_recovery=hands_off path=configuration engine_running=1` 116 ms after the start (W2; E4 113).
+        public static let notifyAt: TimeInterval = 0.116
+        /// Re-attach → IO: W2 `reattach path=obligation` 50.381 → `bridge_switch=headset` 50.621 = 240 ms,
+        /// less the 150 ms takeover.
+        public static let retapLatency: TimeInterval = 0.09
+        /// `headset_restart=1 … waited_ms=300` (the idle wait before the fresh start).
+        public static let restartIdleWait: TimeInterval = 0.3
+        /// The restarted engine is stopped by a notification 128 ms later (W2 49.464 → 49.592
+        /// `obligation path=configuration engine_running=0`) and delivers no frames (`result=no_frames`).
+        public static let restartStopsAfter: TimeInterval = 0.128
+    }
+    private enum WarmEvent { case notify(running: Bool), ioBack, restartStart, restart, settle(CaptureEpoch) }
+    private var warmEvents: [(at: TimeInterval, event: WarmEvent)] = []
+    private var warmRunning = true
+    private var warmTapOK = true
+    /// The restarted engine runs but delivers nothing (W2 `bt_recovery=settled path=restart result=no_frames`).
+    private var warmNoFrames = false
+    private var warmIO = HeadsetIOGuard(bluetooth: true)
+    private var warmEpisode = BluetoothRecoveryEpisode(bluetooth: true)
+    private var warmVerify: (token: CaptureEpoch, since: TimeInterval, firstFrame: TimeInterval?, signal: SustainedSignal, firstSignal: TimeInterval?)?
     /// Every note with its media ms after the boundary (tests read when a switch happened).
     public private(set) var timedNotes: [(ms: Int, line: String)] = []
     private var headsetTrack: [Float] = []
@@ -248,6 +282,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case .livePause:
             let speech = inserted(wav)
             return (gated(speech), distant(speech))
+        case .warmHFP:
+            return (wav, distant(wav))
         default:
             return ([], [])
         }
@@ -323,6 +359,16 @@ public final class WAVInjectedRecorder: EngineRecorder {
         ioSettleAt = nil
         ioRestartAt = nil
         scoKept = false
+        if scenario == .warmHFP {
+            warmRunning = true
+            warmTapOK = true
+            warmNoFrames = false
+            warmIO = HeadsetIOGuard(bluetooth: true, warmRoute: warmRoute)
+            warmEpisode = BluetoothRecoveryEpisode(bluetooth: true)
+            warmVerify = nil
+            warmEvents = arm == .engine ? [(time + WarmModel.notifyAt, .notify(running: true))] : []
+            if warmRoute { feed.setWarmRoute() }
+        }
         if scenario == .scoTornDown250ms {
             let notify = Self.scoNotifyAt
             ioEpisode = BluetoothRecoveryEpisode(bluetooth: true)
@@ -423,6 +469,143 @@ public final class WAVInjectedRecorder: EngineRecorder {
         return scoKept ? wav : [Float](repeating: 0, count: wav.count)
     }
 
+    // MARK: v1.13 (L2) warm_hfp IO model — the recorder's policy on the production guard/episode. Caller holds `lock`.
+
+    /// Applies every model event due before `end`, in time order (an event may schedule more).
+    private func warmAdvance(to end: TimeInterval) -> [String] {
+        var notes: [String] = []
+        while let next = warmEvents.enumerated().filter({ $0.element.at < end - 1e-9 }).min(by: { $0.element.at < $1.element.at }) {
+            warmEvents.remove(at: next.offset)
+            let at = next.element.at
+            switch next.element.event {
+            case .notify(let running):
+                if !running { warmRunning = false }
+                else if warmTapOK { warmTapOK = false }        // the running tap goes to digital zeros
+                warmEpisode.formatChanged(at: at)
+                let evidence = feed.headsetFormatChanged(at: at)
+                pendingWarmFrames += evidence.frames
+                notes += evidence.notes
+                switch warmIO.configurationChanged(at: at, engineRunning: running) {
+                case .leaveRunning: notes.append("bt_recovery=hands_off path=configuration engine_running=1")
+                case .reattach: notes += warmReattach(at: at, notified: true)
+                case .escalate: notes += warmRequestRestart(at: at)
+                case .pending, .none, .exhausted, .episode:
+                    notes.append("bt_recovery=obligation path=configuration engine_running=\(running ? 1 : 0) in_flight=1")
+                }
+            case .ioBack:
+                warmRunning = true
+                warmTapOK = true
+                warmNoFrames = false
+            case .restart:
+                notes += warmRestart(at: at)
+            case .restartStart:
+                warmRunning = true
+                warmNoFrames = true                            // no frames from the restarted engine …
+                warmEvents.append((at + WarmModel.restartStopsAfter, .notify(running: false)))   // … then it stops
+            case .settle(let token):
+                guard let check = warmVerify, check.token === token else { break }
+                warmVerify = nil
+                guard warmEpisode.isRunning else { break }
+                let outcome = BluetoothRecoveryEpisode.verdict(since: check.since, firstFrame: check.firstFrame,
+                                                               firstSignal: check.firstSignal)
+                warmEpisode.settled(outcome)
+                notes.append("bt_recovery=settled result=\(outcome.rawValue)")
+            }
+        }
+        return notes
+    }
+    private var pendingWarmFrames: [Float] = []
+
+    /// The engine's buffer for the window starting at `from`: digital zeros while the tap is broken,
+    /// nothing at all while the engine is stopped, zeros before the device's first frames.
+    private func warmHeadset(_ window: [Float], from: TimeInterval) -> ([Float], Bool) {
+        guard arm == .engine else {
+            return (window.enumerated().map { from + Double($0.offset) / AudioRecorder.sampleRate - boundary < WarmModel.framesFrom ? 0 : $0.element }, true)
+        }
+        guard warmRunning, !warmNoFrames else { return (window, false) }
+        let notifyOffset = warmTapOK ? Int.max : 0
+        return (window.enumerated().map { index, sample in
+            let t = from + Double(index) / AudioRecorder.sampleRate - boundary
+            return t < WarmModel.framesFrom || !warmTapOK || index >= notifyOffset ? 0 : sample
+        }, true)
+    }
+
+    /// Headset frames reached the recorder: the guard and the verification see them; the bridge may ask
+    /// for its one zero-run restart.
+    private func warmHeadsetFrames(_ frames: [Float], arrived: TimeInterval, restart: Bool) -> [String] {
+        let peak = frames.reduce(Float(0)) { max($0, abs($1)) }
+        warmIO.headsetFrames(frames.count, peak: peak, at: arrived)
+        if var check = warmVerify, arrived > check.since {
+            if check.firstFrame == nil { check.firstFrame = arrived }
+            if check.firstSignal == nil, let reached = check.signal.add(frames: frames.count, peak: peak, at: arrived) {
+                check.firstSignal = reached
+            }
+            warmVerify = check
+        }
+        guard restart else { return [] }
+        return warmRequestRestart(at: arrived)
+    }
+
+    /// The health clock's observation of the engine (the recorder's `ioGuard.observe`).
+    private func warmObserve(at now: TimeInterval) -> [String] {
+        guard scenario == .warmHFP, arm == .engine else { return [] }
+        switch warmIO.observe(at: now, engineRunning: warmRunning) {
+        case .reattach: return warmReattach(at: now, notified: false)
+        case .escalate: return ["bt_recovery=escalate path=obligation"] + warmRequestRestart(at: now)
+        default: return []
+        }
+    }
+
+    /// The obligation's one re-attach (a retap), admitted by the episode like the recorder's.
+    private func warmReattach(at now: TimeInterval, notified: Bool) -> [String] {
+        guard warmEpisode.admitReattach(at: now) else {
+            if warmEpisode.budgetSpent { warmIO.reattachUnavailable() } else { warmIO.reattachDeclined() }
+            return notified ? ["bt_recovery=obligation path=configuration engine_running=\(warmRunning ? 1 : 0) in_flight=1"] : []
+        }
+        warmIO.record(.retap)
+        warmIO.finished(.retap, ok: true)
+        warmIO.reattachFinished(started: true, at: now)
+        warmArmVerify(since: now)
+        warmEvents.append((now + WarmModel.retapLatency, .ioBack))
+        return [notified ? "bt_recovery=immediate path=configuration engine_running=\(warmRunning ? 1 : 0) after_ms=0"
+                         : "bt_recovery=reattach path=obligation"]
+    }
+
+    private func warmArmVerify(since: TimeInterval) {
+        let token = CaptureEpoch()
+        warmVerify = (token, since, nil, SustainedSignal(), nil)
+        warmEvents.append((since + BluetoothRecoveryEpisode.successWithin, .settle(token)))
+    }
+
+    /// `requestHeadsetRestart`: admitted by the episode, run when due.
+    private func warmRequestRestart(at now: TimeInterval) -> [String] {
+        switch warmEpisode.request(.restart, at: now) {
+        case .now: warmEvents.append((now, .restart)); return []
+        case .after(let wait): warmEvents.append((now + wait, .restart)); return ["bt_recovery=queued path=restart wait_ms=\(Int((wait * 1000).rounded()))"]
+        case .coalesced: return []
+        case .exhausted: return ["bt_recovery=exhausted path=restart"]
+        }
+    }
+
+    /// `restartHeadset`: hands-off wait, the stable-format debounce, then teardown, idle wait, start.
+    private func warmRestart(at now: TimeInterval) -> [String] {
+        let held = warmIO.remaining(at: now)
+        if held > 0 { warmIO.deferred(); warmEvents.append((now + held, .restart)); return [] }
+        switch warmEpisode.beginIfStable(at: now) {
+        case .notPending: return []
+        case .wait(let more): warmEvents.append((now + more, .restart)); return []
+        case .begun: break
+        }
+        warmIO.record(.stop); warmIO.finished(.stop, ok: true)
+        warmRunning = false
+        let start = now + WarmModel.restartIdleWait
+        warmIO.record(.start); warmIO.finished(.start, ok: true)
+        feed.headsetRestarted()
+        warmArmVerify(since: start)
+        warmEvents.append((start, .restartStart))
+        return ["headset_restart=1 path=restart idle=1 waited_ms=\(Int((WarmModel.restartIdleWait * 1000).rounded())) started=1"]
+    }
+
     /// Parses off the caller's actor (the controller calls this from the main actor).
     public func startAsync(device: MicChoice = .default) async throws {
         if isRunning { return }
@@ -466,13 +649,18 @@ public final class WAVInjectedRecorder: EngineRecorder {
             let n = wav.count
             let base = trackCursor
             trackCursor += n
-            let headset = (0..<n).map { base + $0 < headsetTrack.count ? headsetTrack[base + $0] : 0 }
+            var headset = (0..<n).map { base + $0 < headsetTrack.count ? headsetTrack[base + $0] : 0 }
+            var headsetDelivers = true
+            if scenario == .warmHFP {
+                notes += warmAdvance(to: time + Double(n) / AudioRecorder.sampleRate)
+                (headset, headsetDelivers) = warmHeadset(headset, from: time)
+            }
             let builtinWindow = (0..<n).map { base + $0 < builtinTrack.count ? builtinTrack[base + $0] : Self.floorSample(base + $0) }
             var deliveries: [(start: Int, end: Int, source: CaptureBridge.Source)] = []
             for start in stride(from: 0, to: n, by: Self.builtinBufferFrames) {
                 deliveries.append((start, min(n, start + Self.builtinBufferFrames), .builtin))
             }
-            for start in stride(from: 0, to: n, by: arm.headsetBufferFrames) {
+            for start in stride(from: 0, to: n, by: arm.headsetBufferFrames) where headsetDelivers {
                 deliveries.append((start, min(n, start + arm.headsetBufferFrames), .headset))
             }
             deliveries.sort { $0.end != $1.end ? $0.end < $1.end : ($0.source == .builtin && $1.source == .headset) }
@@ -482,6 +670,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 let arrived = time + Double(delivery.end) / AudioRecorder.sampleRate
                 let out = feed.accept(frames, source: delivery.source, at: at, arrivedAt: arrived)
                 var lines: [String] = []
+                if scenario == .warmHFP, delivery.source == .headset {
+                    lines += warmHeadsetFrames(frames, arrived: arrived, restart: out.restartHeadset)
+                }
                 if out.event == .fallback { lines.append("bridge_src=builtin_fallback reason=headset_digital_silence") }
                 if out.event == .switchback { lines.append("bridge_switchback=1") }
                 lines += out.notes
@@ -489,6 +680,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 noteTimes += lines.map { _ in Int(((arrived - boundary) * 1000).rounded()) }
                 kept += out.frames
             }
+            kept += pendingWarmFrames
+            pendingWarmFrames = []
         } else if scenario.hasHeadset {
             // Built-in = the WAV (until it dies), headset = digital zeros, same 100 ms window.
             let dying = scenario == .builtinDies || scenario == .builtinDrifts
@@ -538,6 +731,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             let health = feed.tick(at: mediaTime)
             kept += health.frames
             notes += health.notes
+            if scenario == .warmHFP { notes += warmObserve(at: mediaTime) }
             if let found = health.failure { failed = true; failure = found; notes.append(found.note) }
         }
         buffer.append(contentsOf: kept)

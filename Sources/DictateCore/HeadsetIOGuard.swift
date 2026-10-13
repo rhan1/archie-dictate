@@ -65,7 +65,11 @@ public struct HeadsetIOGuard: Sendable {
     }
 
     public struct Obligation: Equatable, Sendable {
-        public enum Reason: String, Sendable { case engineStopped = "engine_stopped", ioCeased = "io_ceased" }
+        public enum Reason: String, Sendable {
+            case engineStopped = "engine_stopped", ioCeased = "io_ceased"
+            /// v1.13 (L2): a format change on a warm HFP route — discharged only by sustained signal.
+            case formatChanged = "format_changed"
+        }
         public var since: TimeInterval
         public var reason: Reason
         /// Its one re-attach was given; then its one escalation.
@@ -74,6 +78,15 @@ public struct HeadsetIOGuard: Sendable {
     }
 
     public let bluetooth: Bool
+    /// v1.13 (L2): the headset was already on HFP when this dictation configured its capture (its
+    /// voice link was up before our client started). E4/W2 (10-13 15:24, engine arm): the engine's
+    /// own start drew a configuration notification at +113/+116 ms while it ran; v1.12 left a running
+    /// engine alone, its tap delivered digital zeros, and only the zero-run restart chain (0.7 s of
+    /// zeros + 300 ms settle → restart `result=no_frames` after 1.0 s → obligation re-attach) brought
+    /// signal — `carrier=builtin:0-2431` on both, identical to the ms. On a warm route there is no voice
+    /// link forming for hands-off to protect, so that notification is IO evidence: an obligation opens
+    /// and gets its one re-attach at once, discharged only by sustained signal (else it escalates).
+    public let warmRoute: Bool
     // Attempted operations, per kind (v1.10's `io_ops=start:N …` counts).
     public private(set) var starts = 0
     public private(set) var stops = 0
@@ -101,7 +114,7 @@ public struct HeadsetIOGuard: Sendable {
     private var sustained = SustainedSignal()
     private var lastHeadsetFrame: TimeInterval?
 
-    public init(bluetooth: Bool) { self.bluetooth = bluetooth }
+    public init(bluetooth: Bool, warmRoute: Bool = false) { self.bluetooth = bluetooth; self.warmRoute = bluetooth && warmRoute }
 
     public var attempted: Int { starts + stops + rebuilds + retaps + aligns }
 
@@ -120,6 +133,10 @@ public struct HeadsetIOGuard: Sendable {
             return due(at: now)
         }
         if obligation != nil { return due(at: now) }
+        if warmRoute, inFlightSince == nil {
+            open(.formatChanged, at: now)
+            return due(at: now)
+        }
         // Running and nothing owed: leave it alone until recovery settles (or the bound passes).
         if let since = inFlightSince, now < since + Self.inFlightBound { return .leaveRunning }
         return settledOnce ? .episode : .leaveRunning
@@ -131,7 +148,8 @@ public struct HeadsetIOGuard: Sendable {
     public mutating func observe(at now: TimeInterval, engineRunning: Bool) -> Reaction {
         guard bluetooth else { return .none }
         if let since = inFlightSince {
-            if engineRunning, let frame = lastHeadsetFrame, frame > since {
+            // A warm route's format-change re-attach is over only when signal is back (zeros were the fault).
+            if engineRunning, let frame = lastHeadsetFrame, frame > since, obligation?.reason != .formatChanged || settled {
                 inFlightSince = nil
                 discharge()
                 return .none
@@ -148,6 +166,10 @@ public struct HeadsetIOGuard: Sendable {
             open(.ioCeased, at: now)
         }
         guard obligation != nil else { return .none }
+        if engineRunning, obligation?.reason == .formatChanged, settled {
+            discharge()
+            return .none
+        }
         if engineRunning, obligation?.reason == .engineStopped, let frame = lastHeadsetFrame,
            frame > (obligation?.since ?? .infinity) {
             discharge()                            // IO came back on its own
