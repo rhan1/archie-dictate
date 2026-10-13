@@ -1,0 +1,6 @@
+# Bounded recovery control
+2026-10-12 10:00:10.000 dk [..] dictate: session=GBR1 event=start
+2026-10-12 10:00:11.000 coreaudiod[409:12345] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-12 10:00:11.400 coreaudiod[409:12345] [com.apple.bluetooth:BTAudio] Profile Transport operation completed operaton type = Creation
+2026-10-12 10:00:11.900 dictate: headset_signal_start=1
+2026-10-12 10:00:21.000 dictate: session=GBR1 event=end outcome=ok duration_ms=10000 bytes=480044 chars=45 recording_ms=10000 capture_intervals=120-10000 speech_sections=3 builtin_frames_after_fallback=0

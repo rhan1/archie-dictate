@@ -1,0 +1,6 @@
+# Overlapping sessions control
+2026-10-12 10:00:10.000 dk [..] dictate: session=ROS1 event=start
+2026-10-12 10:00:15.000 dk [..] dictate: session=ROS2 event=start
+2026-10-12 10:00:20.000 coreaudiod[409:12345] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-12 10:00:25.000 dictate: session=ROS1 event=end outcome=ok duration_ms=15000 bytes=720044 chars=45 recording_ms=15000 capture_intervals=120-15000 speech_sections=3 builtin_frames_after_fallback=0
+2026-10-12 10:00:30.000 dictate: session=ROS2 event=end outcome=ok duration_ms=15000 bytes=720044 chars=45 recording_ms=15000 capture_intervals=120-15000 speech_sections=3 builtin_frames_after_fallback=0
