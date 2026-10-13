@@ -27,12 +27,18 @@ import DictateCore
 ///   drops eSCO creation (07:08:26 `Dropping eSCO creation`): the headset then delivers zeros.
 ///   `.v110` re-attaches once, converts in the tap and holds every other operation for
 ///   `HeadsetIOGuard.handsOff`. Restart requests go through the production episode in both.
+/// - `headset_takeover` (v1.11 L4): R4 10-13 07:07:09 (41f98dbd). The WAV is the built-in; the
+///   Bluetooth headset delivers zeros, then the WAV from `takeoverAt` — the headset takes over at
+///   ~1.1 s (R4: `bridge_ms=1106 bridge_src=builtin`) and carries to the end. The restart the bridge
+///   requests at 0.7 s of zeros is coalesced into the running recovery and never runs (R4 still
+///   reported `headset_restart=1 result=still_silent`).
 public final class WAVInjectedRecorder: EngineRecorder {
     /// Which re-attach the `sco_torn_down_250ms` IO model runs.
     public enum IOPolicy: Sendable { case v19, v110 }
     public enum Scenario: String, Sendable {
         case plain, headsetZeros = "headset_zeros", builtinDies = "builtin_dies", builtinDrifts = "builtin_drifts"
         case scoTornDown250ms = "sco_torn_down_250ms"
+        case headsetTakeover = "headset_takeover"
         var hasHeadset: Bool { self != .plain }
     }
     /// Built-in frames stop after this much media time in the dying scenarios.
@@ -41,6 +47,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public static let scoNotifyAt: TimeInterval = 0.242
     public static let scoRetapLatency: TimeInterval = 0.134
     public static let scoRouteDisabledAt: TimeInterval = 0.45
+    /// `headset_takeover`: media time after the boundary from which the headset delivers the WAV.
+    public static let takeoverAt: TimeInterval = 0.85
     /// v1.8's admission (debounced even when the engine auto-stopped): the RED twin.
     public let legacyRecoveryTiming: Bool
     public let ioPolicy: IOPolicy
@@ -309,6 +317,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     /// The headset's buffer for the chunk at `offset` s after the boundary (nil: its engine is stopped).
     private func headsetChunk(offset: TimeInterval, wav: [Float]) -> [Float]? {
+        if scenario == .headsetTakeover { return offset + 1e-9 >= Self.takeoverAt ? wav : [Float](repeating: 0, count: wav.count) }
         guard scenario == .scoTornDown250ms, let io = scoIOAt else { return [Float](repeating: 0, count: wav.count) }
         guard offset + 0.1 > io else { return nil }
         // IO back before the teardown keeps the route: the headset hears the speaker.
@@ -376,7 +385,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 if let fresh = out.fallbackFresh {
                     notes.append("fallback_check builtin_fresh_at_fallback=\(fresh ? 1 : 0) builtin_age_ms=\(out.builtinAgeMs.map(String.init) ?? "none")\(out.fallbackRefused ? " refused=1" : "")")
                 }
-                if out.restartHeadset {
+                if out.restartHeadset, scenario == .headsetTakeover {
+                    notes.append("bt_recovery=coalesced path=restart")
+                } else if out.restartHeadset {
                     feed.headsetRestarted()
                     notes.append("headset_restart=1 simulated=1")
                     requestRestart(at: time - boundary)
@@ -458,6 +469,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
             }
             stats.ioOps = ioGuard.note
             stats.ioHeld = ioGuard.heldNote
+            stats.carrier = feed.bridge.carrierNote(endMs: stats.recordingMs)
+            stats.headsetCarriedMs = feed.bridge.headsetCarriedMs(endMs: stats.recordingMs)
+            stats.captureIntervalsTruncated = feed.evidence.truncated
             feed.cancel()
             remainder = pendingPCM
             pendingPCM.removeAll()

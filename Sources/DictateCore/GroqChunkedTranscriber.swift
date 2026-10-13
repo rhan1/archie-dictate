@@ -18,9 +18,17 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         environment["DICTATE_REJOIN_GUARD"] != "0"
     }
 
-    /// DICTATE_LOW_SPEECH_GUARD=0 turns the sentence guard off; anything else enables it.
+    /// v1.11 L1: the v1.10 novelty rule (a long sentence whose words appear in neither the
+    /// vocabulary nor the next chunk) deletes valid text — "Hey. Cancel the London booking." lost
+    /// its instruction (GPT-6 review §H). Off unless DICTATE_LOW_SPEECH_GUARD=1.
     public static func lowSpeechGuardEnabled(environment: [String: String]) -> Bool {
-        environment["DICTATE_LOW_SPEECH_GUARD"] != "0"
+        environment["DICTATE_LOW_SPEECH_GUARD"] == "1"
+    }
+
+    /// DICTATE_EDGE_GUARD=0 turns the v1.11 audio-evidence guard (silent chunks, invented opening and
+    /// trailing sentences) off; anything else enables it.
+    public static func edgeGuardEnabled(environment: [String: String]) -> Bool {
+        environment["DICTATE_EDGE_GUARD"] != "0"
     }
 
     public static func shouldRejoin(previous: String, current: String,
@@ -79,12 +87,21 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public let hedges: Int
         public let hedgeWins: Int
         public let rateLimits: RateLimits?
-        /// Long sentences removed from low-speech, non-final chunks.
+        /// Long sentences removed from low-speech, non-final chunks (v1.10 novelty rule; off by default).
         public let droppedLowSpeechSentences: Int
+        /// v1.11 L1: sentences over non-speech after the last speech section (not a known artifact).
+        public let droppedTailSentences: Int
+        /// v1.11 L1: sentences over non-speech before the first speech section (not a known artifact).
+        public let droppedOpeningSentences: Int
+        /// v1.11 L1: edge sentences over non-speech that were a known artifact ("Thank you.").
+        public let droppedArtifacts: Int
+        /// v1.11 L1: chunks with no speech window by the dictation's rule (their whole text).
+        public let droppedSilentChunks: Int
 
         public init(text: String, chunks: Int, rejoins: Int, failedCount: Int, lastChunkMs: Int, sttMs: Int,
                     calls: [Call], hedges: Int, hedgeWins: Int, rateLimits: RateLimits?,
-                    droppedLowSpeechSentences: Int = 0) {
+                    droppedLowSpeechSentences: Int = 0, droppedTailSentences: Int = 0,
+                    droppedOpeningSentences: Int = 0, droppedArtifacts: Int = 0, droppedSilentChunks: Int = 0) {
             self.text = text
             self.chunks = chunks
             self.rejoins = rejoins
@@ -96,6 +113,10 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             self.hedgeWins = hedgeWins
             self.rateLimits = rateLimits
             self.droppedLowSpeechSentences = droppedLowSpeechSentences
+            self.droppedTailSentences = droppedTailSentences
+            self.droppedOpeningSentences = droppedOpeningSentences
+            self.droppedArtifacts = droppedArtifacts
+            self.droppedSilentChunks = droppedSilentChunks
         }
     }
 
@@ -113,6 +134,17 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     /// v1.10 L3: chunks the low-speech guard already judged, and what it dropped from each.
     private var guarded: Set<Int> = []
     private var droppedByIndex: [Int: Int] = [:]
+    /// v1.11 L1: each chunk's 50 ms RMS windows (a rejoined pair's on the earlier index), the
+    /// indices rejoined into their predecessor, chunks judged for silence, and what was dropped.
+    private let edgeGuard: Bool
+    private var windowsByIndex: [Int: [Float]] = [:]
+    private var rejoined: Set<Int> = []
+    private var silenceJudged: Set<Int> = []
+    private var droppedSilent = 0
+    private var openingIndex: Int?
+    private var openingDrops: [EdgeSentenceGuard.Drop] = []
+    private var tailJudged = false
+    private var tailDrops: [EdgeSentenceGuard.Drop] = []
     private var rejoinTask: Task<Void, Never>?
     private var rejoins = 0
     private let onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)?
@@ -131,7 +163,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
                 fillerLeadIn: Bool = true, leadIn: String? = nil, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
                 hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = nil,
-                finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = true,
+                finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = false,
+                edgeGuard: Bool = true,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
@@ -146,6 +179,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         self.finalModel = finalModel
         self.rejoinGuard = rejoinGuard
         self.lowSpeechGuard = lowSpeechGuard
+        self.edgeGuard = edgeGuard
         self.onGroqRateLimit = onGroqRateLimit
         self.onChunkText = onChunkText
         chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
@@ -172,7 +206,10 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     @discardableResult
     private func enqueue(_ chunk: PauseChunker.Chunk, isFinal: Bool = false) -> Task<Void, Never> {
         if rejoinGuard { originalChunks[chunk.index] = chunk }
-        speechRatios[chunk.index] = LowSpeechSentenceGuard.speechRatio(of: chunk.samples)
+        let windows = LowSpeechSentenceGuard.windows(of: chunk.samples)
+        windowsByIndex[chunk.index] = windows
+        speechRatios[chunk.index] = windows.isEmpty ? 0 :
+            Double(CaptureEvidence.speechWindows(windows).filter { $0 }.count) / Double(windows.count)
         let model = isFinal ? finalModel ?? client.modelName : client.modelName
         let task = Task.detached { [self] in await upload(chunk, model: model, isFinal: isFinal) }
         tasks.append(task)
@@ -186,19 +223,32 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         return (0..<(pcm.count * 2 / 3)).map { output in
             let position = Double(output) * 1.5
             let center = Int(position)
+            // v1.11: an output sits on an input (phase 0) or halfway between two (phase 0.5); the
+            // taps for both phases are computed once, with the same formula, in the same order.
+            let taps = position == Double(center) ? resampleTaps.whole : resampleTaps.half
             var sum = 0.0, weight = 0.0
-            for input in (center - 15)...(center + 16) {
-                let distance = Double(input) - position
-                guard abs(distance) < 16 else { continue }
-                let x = distance * (2.0 / 3.0)
-                let sinc = abs(x) < 1e-10 ? 1 : sin(.pi * x) / (.pi * x)
-                let coefficient = (2.0 / 3.0) * sinc * (0.5 + 0.5 * cos(.pi * distance / 16))
+            for (offset, coefficient) in taps {
+                let input = center + offset
                 sum += Double(pcm[min(pcm.count - 1, max(0, input))]) * coefficient
                 weight += coefficient
             }
             return Int16(clamping: Int((sum / weight).rounded()))
         }
     }
+
+    /// (input offset from the output's center, coefficient) for each phase, in input order.
+    private static let resampleTaps: (whole: [(Int, Double)], half: [(Int, Double)]) = {
+        func taps(phase: Double) -> [(Int, Double)] {
+            (-15...16).compactMap { offset in
+                let distance = Double(offset) - phase
+                guard abs(distance) < 16 else { return nil }
+                let x = distance * (2.0 / 3.0)
+                let sinc = abs(x) < 1e-10 ? 1 : sin(.pi * x) / (.pi * x)
+                return (offset, (2.0 / 3.0) * sinc * (0.5 + 0.5 * cos(.pi * distance / 16)))
+            }
+        }
+        return (taps(phase: 0), taps(phase: 0.5))
+    }()
 
     private struct Response: Sendable {
         let text: String?
@@ -316,11 +366,16 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             if let text = outcome.text {
                 // v1.10 L3: the incremental cleaner cleans a chunk once the next one arrives, so a
                 // low-speech chunk's dropped sentence is replaced BEFORE the next chunk is emitted.
-                let replacements = lock.withLock {
-                    [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
+                // v1.11 L1: a chunk with no speech, or the opening's invented sentence, is removed
+                // before the text is ever streamed.
+                let (replacements, current) = lock.withLock {
+                    silenceLocked(chunk.index)
+                    openingLocked(chunk.index)
+                    let replaced = [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
+                    return (replaced, texts[chunk.index] ?? text)
                 }
                 for (index, filtered) in replacements where index < chunk.index { onChunkText?(index, filtered) }
-                onChunkText?(chunk.index, replacements.first { $0.0 == chunk.index }?.1 ?? text)
+                onChunkText?(chunk.index, current)
                 return
             }
         }
@@ -350,6 +405,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             return task
         }
         await guardTask?.value
+        // v1.11 L1: the last chunk's invented ending, judged once every chunk (and rejoin) is in.
+        // The incremental cleaner holds the last chunk back until its own finish, which runs after.
+        if let (index, filtered) = lock.withLock({ tailLocked() }) { onChunkText?(index, filtered) }
         return lock.withLock {
             let start = finishAt!
             let lastMs = lastResponse.map { $0 > start ? Int(($0 - start) / 1_000_000) : 0 } ?? 0
@@ -360,15 +418,75 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           sttMs: Self.ms(from: start), calls: calls,
                           hedges: calls.filter { $0.hedgeFired }.count,
                           hedgeWins: calls.filter { $0.winningRequest == 2 }.count, rateLimits: limits,
-                          droppedLowSpeechSentences: dropped)
+                          droppedLowSpeechSentences: dropped,
+                          droppedTailSentences: tailDrops.filter { $0 == .lowSpeech }.count,
+                          droppedOpeningSentences: openingDrops.filter { $0 == .lowSpeech }.count,
+                          droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
+                          droppedSilentChunks: droppedSilent)
         }
+    }
+
+    /// The first non-empty text after `index`, or nil while an index between them is still in flight.
+    private func adjacentNextTextLocked(after index: Int) -> String? {
+        guard let last = windowsByIndex.keys.max(), last > index else { return nil }
+        for candidate in (index + 1)...last {
+            if failures.contains(candidate) { continue }
+            guard let text = texts[candidate] else { return nil }
+            if !text.isEmpty { return text }
+        }
+        return nil
+    }
+
+    /// Every window of the dictation so far: the reference its contrast threshold is taken from.
+    private var referenceWindowsLocked: [Float] {
+        windowsByIndex.keys.sorted().flatMap { windowsByIndex[$0] ?? [] }
+    }
+
+    /// v1.11 L1: empties chunk `index` when none of its windows is speech by the dictation's rule. Lock held.
+    private func silenceLocked(_ index: Int) {
+        guard edgeGuard, !silenceJudged.contains(index), let windows = windowsByIndex[index],
+              let text = texts[index], !text.isEmpty else { return }
+        silenceJudged.insert(index)
+        guard EdgeSentenceGuard.isSilent(windows, reference: referenceWindowsLocked) else { return }
+        texts[index] = ""
+        droppedSilent += 1
+    }
+
+    /// v1.11 L1: the dictation's first chunk (index 0) loses an invented opening sentence when its
+    /// text arrives. Lock held.
+    private func openingLocked(_ index: Int) {
+        guard edgeGuard, index == 0, openingIndex == nil, let text = texts[index], !text.isEmpty,
+              let windows = windowsByIndex[index] else { return }
+        openingIndex = index
+        let result = EdgeSentenceGuard.filter(text, edge: .opening, windows: windows, reference: referenceWindowsLocked)
+        guard !result.drops.isEmpty else { return }
+        texts[index] = result.text
+        openingDrops = result.drops
+    }
+
+    /// v1.11 L1: judges the last chunk's ending (a rejoined last pair as one) once. Returns the
+    /// replacement text when a sentence was dropped. A chunk whose opening was already cut is left
+    /// alone (its letters no longer match its audio). Lock held.
+    private func tailLocked() -> (Int, String)? {
+        guard edgeGuard, !cancelled, !tailJudged, var index = windowsByIndex.keys.max() else { return nil }
+        tailJudged = true
+        while rejoined.contains(index) { index -= 1 }
+        guard let text = texts[index], !text.isEmpty, let windows = windowsByIndex[index],
+              !(index == openingIndex && !openingDrops.isEmpty) else { return nil }
+        let result = EdgeSentenceGuard.filter(text, edge: .tail, windows: windows, reference: referenceWindowsLocked)
+        guard !result.drops.isEmpty else { return nil }
+        texts[index] = result.text
+        tailDrops = result.drops
+        return (index, result.text)
     }
 
     /// v1.10 L3: judges chunk `index` once its next non-empty chunk text is known (the last chunk
     /// never is). Stores the filtered text and returns it when a sentence was dropped. Lock held.
+    /// v1.11 L1: the comparator is the ADJACENT next text: every index after `index` up to it must
+    /// have arrived (or failed), so a later chunk that answers early never stands in for it.
     private func guardLocked(_ index: Int) -> String? {
         guard lowSpeechGuard, index >= 0, !guarded.contains(index), let text = texts[index], !text.isEmpty,
-              let next = texts.keys.sorted().first(where: { $0 > index && !(texts[$0] ?? "").isEmpty }).flatMap({ texts[$0] })
+              let next = adjacentNextTextLocked(after: index)
         else { return nil }
         guarded.insert(index)
         // A chunk without a measured ratio is never treated as low speech.
@@ -433,6 +551,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 if let previousRatio = speechRatios[index - 1], let currentRatio = speechRatios[index] {
                     speechRatios[index - 1] = min(previousRatio, currentRatio)
                 }
+                windowsByIndex[index - 1, default: []] += windowsByIndex[index] ?? []
+                windowsByIndex[index] = []
+                rejoined.insert(index)
                 guarded.remove(index - 1)          // the joined text is judged afresh at finish
                 droppedByIndex[index - 1] = nil
                 return text
