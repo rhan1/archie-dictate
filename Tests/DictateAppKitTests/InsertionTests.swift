@@ -104,26 +104,29 @@ struct InsertionTests {
         #expect(pb.string(forType: .string) == "ORIGINAL")
     }
 
-    /// RED twin: the v1.11 wall-clock form under a 1.2 s main-thread stall (machine load) — the
-    /// test's own 750 ms wait elapses before the 600 ms reader could run, so its bound breaks.
+    /// RED twin: the v1.11 wall-clock form under a 1.2 s stall of the queue the restore window runs
+    /// on (a private queue standing in for a loaded main queue — never stall the shared main queue
+    /// in a parallel suite): the 750 ms wall-clock wait elapses before the 600 ms reader could run.
     @Test func recipientReadsDictationAfter600MillisecondsRealClockUnderStallRed() async {
         let pb = seededPasteboard()
         defer { pb.releaseGlobally() }
         let box = ReaderBox()
+        let loaded = DispatchQueue(label: "insertion-tests.loaded")
         let inserter = TextInserter(pasteboard: pb, postKeystroke: {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { box.value = pb.string(forType: .string) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { Thread.sleep(forTimeInterval: 1.2) }   // the stall: main busy 0.1–1.3 s
-        })
+            loaded.asyncAfter(deadline: .now() + 0.6) { box.value = pb.string(forType: .string) }
+            loaded.asyncAfter(deadline: .now() + 0.1) { Thread.sleep(forTimeInterval: 1.2) }   // the stall: busy 0.1–1.3 s
+        }, schedule: { delay, work in loaded.asyncAfter(deadline: .now() + delay, execute: work) })
         inserter.insert("DICTATION")
-        // The wall-clock wait runs off the main queue (as a loaded runner's continuation can).
         let seen = await Task.detached { () -> String? in
             try? await Task.sleep(nanoseconds: 750_000_000)
             return box.value
         }.value
-        withKnownIssue("a loaded main queue breaks the wall-clock reader bound") {
+        withKnownIssue("a loaded queue breaks the wall-clock reader bound") {
             #expect(seen == "DICTATION")
         }
-        try? await Task.sleep(nanoseconds: 1_600_000_000)      // no callback outlives this pasteboard
+        loaded.sync {}                                         // no callback outlives this pasteboard
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        loaded.sync {}
     }
     final class ReaderBox: @unchecked Sendable { var value: String? }
 }

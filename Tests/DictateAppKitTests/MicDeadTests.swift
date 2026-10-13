@@ -24,9 +24,12 @@ private actor HTTP: HTTPTransport {
     let text: String
     let delay: UInt64
     private(set) var requests = 0
+    /// Responses returned (v1.12: tests wait for this instead of a wall-clock sleep).
+    private(set) var completed = 0
     init(_ text: String, delayMs: UInt64 = 0) { self.text = text; self.delay = delayMs * 1_000_000 }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         requests += 1
+        defer { completed += 1 }
         if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
         let payload: [String: Any] = request.url!.path.contains("transcriptions") ? ["text": text] :
             ["choices": [["finish_reason": "stop", "message": ["content": text]]]]
@@ -259,6 +262,21 @@ struct MicDeadTests {
         throw URLError(.timedOut)
     }
 
+    /// v1.12 (L4): advance a `manualPacing` recorder 100 ms of media per step until `condition` holds
+    /// (or `ticks` steps ran), yielding to the main queue between steps so the engine's callbacks
+    /// run. Media time, not wall time: load cannot change what the engine heard. 10 s hang detector.
+    private func drive(_ recorder: WAVInjectedRecorder, ticks: Int = .max, until condition: () -> Bool = { false }) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        var stepped = 0
+        while ContinuousClock.now < deadline {
+            if condition() || stepped >= ticks { return }
+            if recorder.isRunning { recorder.step(); stepped += 1 }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        Issue.record("timed out")
+        throw URLError(.timedOut)
+    }
+
     /// The engine's own session notes through the real gate: a mic_dead dictation FAILs, a
     /// three-phrase dictation carried by the built-in beside a silent headset PASSes (synthetic
     /// media clock; parser + engine agreement, not live hardware proof).
@@ -284,6 +302,7 @@ struct MicDeadTests {
             let clipboard = NSPasteboard(name: .init("dictate-gate-\(UUID().uuidString)"))
             defer { clipboard.releaseGlobally() }
             let recorder = WAVInjectedRecorder(url: url, pace: 0.1, scenario: scenario)
+            recorder.manualPacing = true
             let notes = Lines()
             recorder.note = { notes.add($0) }
             let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
@@ -299,10 +318,10 @@ struct MicDeadTests {
             engine.onState = { if case .recording = $0 { levels += 1 } }
             engine.start()
             if scenario == .headsetZeros {
-                try await waitFor { levels >= 34 }                          // ≥ 3.3 s of media: all three phrases
+                try await drive(recorder) { levels >= 34 }                  // ≥ 3.3 s of media: all three phrases
                 engine.finish()
             }
-            try await waitFor { notes.snapshot.contains { $0.contains("event=end") } }
+            try await drive(recorder) { notes.snapshot.contains { $0.contains("event=end") } }
             // Stamp the engine's lines in emission order (10 ms apart) as the gate's input.
             let base = Date(timeIntervalSince1970: 1_800_000_000)
             let formatter = DateFormatter()
@@ -344,6 +363,7 @@ struct MicDeadTests {
         let clipboard = NSPasteboard(name: .init("dictate-cancel-\(UUID().uuidString)"))
         defer { clipboard.releaseGlobally() }
         let recorder = WAVInjectedRecorder(url: url, pace: 0.05)
+        recorder.manualPacing = true
         recorder.note = { _ in }
         let stt = HTTP("please send the report", delayMs: 400)
         let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
@@ -359,11 +379,15 @@ struct MicDeadTests {
         var states: [DictateAppKit.DictationState] = []
         engine.onState = { states.append($0) }
         engine.start()
-        try await Task.sleep(nanoseconds: 60_000_000)
+        try await drive(recorder, ticks: 12)                                 // 1.2 s of media, then finish
         engine.finish()
         try await waitFor { states.contains(.transcribing) }
         engine.cancel()                                                      // Escape while transcribing
-        try await Task.sleep(nanoseconds: 900_000_000)                       // the slow STT has returned by now
+        // The slow STT has returned (counted, not timed), then the main queue drained twice.
+        while await stt.completed < 1 { try await Task.sleep(nanoseconds: 2_000_000) }
+        await MainActor.run {}
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await MainActor.run {}
         let ends = notes.snapshot.filter { $0.contains("event=end") }
         #expect(ends.count == 1 && ends.first?.contains("outcome=cancel") == true)
         let log = try String(contentsOf: paths.logURL, encoding: .utf8).split(separator: "\n")
@@ -385,6 +409,7 @@ struct MicDeadTests {
             let clipboard = NSPasteboard(name: .init("dictate-micdead-\(UUID().uuidString)"))
             defer { clipboard.releaseGlobally() }
             let recorder = WAVInjectedRecorder(url: url, pace: 0.05, scenario: scenario)
+            recorder.manualPacing = true
             let notes = Lines()
             recorder.note = { notes.add($0) }
             let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple("please send the report") },
@@ -400,10 +425,10 @@ struct MicDeadTests {
             engine.onState = { states.append($0) }
             engine.start()
             if scenario == .headsetZeros {
-                try await Task.sleep(nanoseconds: 100_000_000)               // ≈ 2 s of media at 20×
+                try await drive(recorder, ticks: 20)                         // 2 s of media
                 engine.finish()
             }
-            try await waitFor { FileManager.default.fileExists(atPath: paths.logURL.path) }
+            try await drive(recorder) { FileManager.default.fileExists(atPath: paths.logURL.path) }
             let line = try String(contentsOf: paths.logURL, encoding: .utf8)
             let lines = notes.snapshot
             let start = lines.first { $0.contains("event=start") } ?? ""

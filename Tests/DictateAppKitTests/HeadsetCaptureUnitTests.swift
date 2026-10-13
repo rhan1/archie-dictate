@@ -153,7 +153,7 @@ struct HeadsetCaptureUnitTests {
         let fakeHostTime: UInt64 = 12_345_678
         fake.push(samples: sine, hostTime: fakeHostTime)
 
-        let deadline = Date().addingTimeInterval(1.0)
+        let deadline = Date().addingTimeInterval(10.0)
         while Date() < deadline {
             let count = lock.withLock { delivered.count }
             if count >= 2400 - 256 { break }
@@ -187,7 +187,7 @@ struct HeadsetCaptureUnitTests {
 
         fake.changeFormat(sampleRate: 16000, channels: 1)
 
-        let deadline1 = Date().addingTimeInterval(1.0)
+        let deadline1 = Date().addingTimeInterval(10.0)
         while Date() < deadline1 {
             let changed = lock.withLock {
                 events.contains(.formatChanged(generation: 2, sampleRate: 16000, channels: 1))
@@ -203,7 +203,7 @@ struct HeadsetCaptureUnitTests {
         let sine = FakeHALDriver.sine(count: 1600, sampleRate: 16000)
         fake.push(samples: sine, hostTime: 10_000_000)
 
-        let deadline2 = Date().addingTimeInterval(1.0)
+        let deadline2 = Date().addingTimeInterval(10.0)
         while Date() < deadline2 {
             let count = lock.withLock { delivered.count }
             if count >= 2400 - 256 { break }
@@ -231,7 +231,7 @@ struct HeadsetCaptureUnitTests {
         fake.changeFormat(sampleRate: 0, channels: 1)
         fake.fireListener()
 
-        let deadline1 = Date().addingTimeInterval(0.5)
+        let deadline1 = Date().addingTimeInterval(10.0)
         while Date() < deadline1 {
             let hasInvalid = lock.withLock { events.contains(.formatInvalid(generation: 1)) }
             if hasInvalid { break }
@@ -250,7 +250,7 @@ struct HeadsetCaptureUnitTests {
         // Switch to 16000 Hz
         fake.changeFormat(sampleRate: 16000, channels: 1)
 
-        let deadline2 = Date().addingTimeInterval(0.5)
+        let deadline2 = Date().addingTimeInterval(10.0)
         while Date() < deadline2 {
             let hasChanged = lock.withLock { events.contains(.formatChanged(generation: 2, sampleRate: 16000, channels: 1)) }
             if hasChanged { break }
@@ -263,7 +263,7 @@ struct HeadsetCaptureUnitTests {
         let sine = FakeHALDriver.sine(count: 1600, sampleRate: 16000)
         fake.push(samples: sine)
 
-        let deadline3 = Date().addingTimeInterval(0.5)
+        let deadline3 = Date().addingTimeInterval(10.0)
         while Date() < deadline3 {
             let count = lock.withLock { delivered.count }
             if count >= 2400 - 256 { break }
@@ -290,7 +290,7 @@ struct HeadsetCaptureUnitTests {
         fake.fireListener()
         fake.fireListener()
 
-        let deadline = Date().addingTimeInterval(0.5)
+        let deadline = Date().addingTimeInterval(10.0)
         while Date() < deadline {
             let lostCount = lock.withLock { events.filter { $0 == .deviceLost }.count }
             if lostCount >= 1 { break }
@@ -304,41 +304,43 @@ struct HeadsetCaptureUnitTests {
         unit.stop()
     }
 
+    /// On an injected clock: the stall is measured in the unit's own time, so machine load cannot
+    /// make it fire early or late (the loops below are hang detectors, not timing bounds).
     @Test func callbackCessationIsReported() throws {
+        final class TestClock: @unchecked Sendable {
+            private let lock = NSLock()
+            private var t: TimeInterval = 100
+            var now: TimeInterval { lock.withLock { t } }
+            func advance(_ d: TimeInterval) { lock.withLock { t += d } }
+        }
+        let clock = TestClock()
         let fake = FakeHALDriver()
-        let unit = HeadsetCaptureUnit(driver: fake, workerInterval: 0.005)
+        let unit = HeadsetCaptureUnit(driver: fake, clock: { clock.now }, workerInterval: 0.005)
         var events: [HeadsetCaptureEvent] = []
         let lock = NSLock()
         unit.onEvent = { event, _ in lock.withLock { events.append(event) } }
+        func waitFor(_ condition: () -> Bool) {
+            let deadline = Date().addingTimeInterval(10.0)
+            while Date() < deadline, !condition() { Thread.sleep(forTimeInterval: 0.005) }
+        }
+        func stalls() -> Int { lock.withLock { events.filter { $0 == .callbacksStopped }.count } }
 
         let epoch = CaptureEpoch()
         try unit.start(deviceUID: "test-uid", epoch: epoch)
-
         fake.push(samples: [0.1, 0.2, 0.3])
+        waitFor { unit.counters.callbacks == 1 }                  // the worker saw the callback
+        clock.advance(HeadsetCaptureUnit.callbackStall - 0.01)
+        Thread.sleep(forTimeInterval: 0.05)                         // several worker ticks
+        #expect(stalls() == 0)                                      // 490 ms of unit time: not yet
+        clock.advance(0.02)
+        waitFor { stalls() == 1 }
+        #expect(stalls() == 1)
 
-        let maxWait = HeadsetCaptureUnit.callbackStall + 0.3
-        let deadline1 = Date().addingTimeInterval(maxWait)
-        while Date() < deadline1 {
-            let stopped = lock.withLock { events.contains(.callbacksStopped) }
-            if stopped { break }
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-
-        let count1 = lock.withLock { events.filter { $0 == .callbacksStopped }.count }
-        #expect(count1 == 1)
-
-        // Push again to reset latch, then stop pushing
-        fake.push(samples: [0.1, 0.2, 0.3])
-
-        let deadline2 = Date().addingTimeInterval(maxWait)
-        while Date() < deadline2 {
-            let count2 = lock.withLock { events.filter { $0 == .callbacksStopped }.count }
-            if count2 == 2 { break }
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-
-        let count2 = lock.withLock { events.filter { $0 == .callbacksStopped }.count }
-        #expect(count2 == 2)
+        fake.push(samples: [0.1, 0.2, 0.3])                         // callbacks resume: latch reset
+        waitFor { unit.counters.callbacks == 2 }
+        clock.advance(HeadsetCaptureUnit.callbackStall + 0.01)
+        waitFor { stalls() == 2 }
+        #expect(stalls() == 2)
 
         unit.stop()
     }
@@ -456,7 +458,7 @@ struct HeadsetCaptureUnitTests {
         let sineB = FakeHALDriver.sine(count: 4410, sampleRate: 44100)
         fake.push(samples: sineB)
 
-        let deadline = Date().addingTimeInterval(1.0)
+        let deadline = Date().addingTimeInterval(10.0)
         while Date() < deadline {
             let count = lock.withLock { deliveries.count }
             if count >= 1 { break }
