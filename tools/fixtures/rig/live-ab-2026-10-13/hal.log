@@ -1,0 +1,134 @@
+2026-10-13 15:06:49.413 Df coreaudiod[409:407e43dd] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:06:50.837 Df coreaudiod[409:407e43dd] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:06:51.196 Df coreaudiod[409:407e5b0e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:06:51.196 Df coreaudiod[409:407e5b0e] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:06:51.196 Df coreaudiod[409:407e5b0e] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:06:59.319 Df coreaudiod[409:407e5b0e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:06:59.329 Df bluetoothd[393:407e1e8d] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:07:01.489 Df coreaudiod[409:407eaf96] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:07:10.804 Df coreaudiod[409:407eaf96] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:07:16.235 Df coreaudiod[409:407f3457] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:18.360 Df coreaudiod[409:407f3457] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:18.366 Df bluetoothd[393:407e24f8] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:07:18.777 Df coreaudiod[409:407f4ea1] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:31.601 Df coreaudiod[409:407f4ea1] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:31.606 Df bluetoothd[393:407e1e8d] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:07:56.809 Df coreaudiod[409:4080aec5] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:57.632 Df coreaudiod[409:4080aec5] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:57.975 Df bluetoothd[393:407eb07a] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:07:57.997 Df coreaudiod[409:4080b61f] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:57.997 Df coreaudiod[409:4080b61f] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:07:57.997 Df coreaudiod[409:4080b61f] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:07:58.138 Df coreaudiod[409:4080b61f] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.209 Df coreaudiod[409:4080b63a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:07:58.345 Df coreaudiod[409:4080b63a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:07:58.388 Df coreaudiod[409:4080b734] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.392 Df coreaudiod[409:4080b734] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.401 Df coreaudiod[409:4080b742] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.443 Df coreaudiod[409:4080b742] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.450 Df coreaudiod[409:4080b79a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.470 Df coreaudiod[409:4080b79a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:07:58.475 Df coreaudiod[409:4080b7ca] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:08:12.038 Df coreaudiod[409:4080b7ca] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:08:12.043 Df bluetoothd[393:407e24f8] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:09:42.567 Df coreaudiod[409:40846ac5] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:09:43.390 Df coreaudiod[409:40846ac5] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:09:43.398 Df bluetoothd[393:4082038c] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:09:43.804 Df coreaudiod[409:40847028] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:09:43.827 Df coreaudiod[409:40847028] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:09:44.786 Df coreaudiod[409:40847e2e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:09:44.786 Df coreaudiod[409:40847e2e] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:09:44.787 Df coreaudiod[409:40847e2e] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:09:58.991 Df coreaudiod[409:40847e2e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:09:59.001 Df bluetoothd[393:40843533] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:10:18.844 Df coreaudiod[409:4085b53a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:10:23.196 Df coreaudiod[409:4085b53a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:10:23.259 Df coreaudiod[409:4085db06] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:23.261 Df coreaudiod[409:4085db06] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:23.266 Df coreaudiod[409:4085db1a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:23.310 Df coreaudiod[409:4085db1a] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:23.325 Df coreaudiod[409:4085db92] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:30.654 Df bluetoothd[393:4085816f] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:10:30.817 Df coreaudiod[409:4085ef46] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:30.873 Df coreaudiod[409:4086221e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:10:31.023 Df coreaudiod[409:4086221e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:10:31.082 Df coreaudiod[409:40862243] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:31.104 Df coreaudiod[409:40862243] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:31.115 Df coreaudiod[409:4086224e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:38.341 Df bluetoothd[393:408621f2] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:10:38.496 Df coreaudiod[409:40862256] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:10:38.556 Df coreaudiod[409:408665cb] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:10:38.799 Df coreaudiod[409:408665cb] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:10:38.824 Df coreaudiod[409:40866963] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:11:06.522 Df coreaudiod[409:40866963] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:11:06.586 Df coreaudiod[409:40876e48] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:11:06.627 Df coreaudiod[409:40876e48] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:11:06.636 Df coreaudiod[409:40876e79] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:11:21.457 Df bluetoothd[393:4086222b] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:11:21.606 Df coreaudiod[409:40876e79] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:11:21.662 Df coreaudiod[409:4087f574] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:11:21.866 Df coreaudiod[409:4087f574] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:11:21.892 Df coreaudiod[409:4087f580] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:11:56.325 Df coreaudiod[409:4088a233] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:11:56.930 Df coreaudiod[409:40893db8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:02.152 Df coreaudiod[409:40893db8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:02.160 Df bluetoothd[393:4087f507] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:12:02.970 Df coreaudiod[409:408972ff] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:12:12.344 Df coreaudiod[409:408972ff] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:12:14.103 Df coreaudiod[409:4089d191] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:14.925 Df coreaudiod[409:4089d191] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:14.932 Df bluetoothd[393:408969af] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:12:15.347 Df coreaudiod[409:4089e253] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:15.369 Df coreaudiod[409:4089e253] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:16.307 Df coreaudiod[409:4089e4c8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:16.307 Df coreaudiod[409:4089e4c8] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:12:16.308 Df coreaudiod[409:4089e4c8] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:12:33.571 Df coreaudiod[409:4089e4c8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:12:33.578 Df bluetoothd[393:4087f507] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:19:04.993 Df coreaudiod[409:409a6a1e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO bypass, waiting i/o codec synchronzied 1
+2026-10-13 15:19:06.107 Df coreaudiod[409:409a79b7] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:19:10.931 Df bluetoothd[393:40990b43] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:19:11.053 Df bluetoothd[393:40990b43] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:19:17.870 Df coreaudiod[409:409b0da8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO bypass, waiting i/o codec synchronzied 1
+2026-10-13 15:19:18.998 Df coreaudiod[409:409b1c46] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:19:36.638 Df bluetoothd[393:409b1289] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:19:36.760 Df bluetoothd[393:409b1289] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:20:06.308 Df coreaudiod[409:409d5777] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO bypass, waiting i/o codec synchronzied 1
+2026-10-13 15:20:07.428 Df coreaudiod[409:409d60a6] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:20:26.247 Df bluetoothd[393:409829de] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:20:26.372 Df bluetoothd[393:409829de] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:20:47.711 Df coreaudiod[409:409f546e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO bypass, waiting i/o codec synchronzied 1
+2026-10-13 15:20:48.833 Df coreaudiod[409:409f6449] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:21:07.554 Df bluetoothd[393:409bfb8d] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:21:07.677 Df bluetoothd[393:409bfb8d] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:22:32.563 Df coreaudiod[409:40a442a9] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO bypass, waiting i/o codec synchronzied 1
+2026-10-13 15:22:33.671 Df coreaudiod[409:40a454b3] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:22:49.980 Df coreaudiod[409:40a517b6] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = No
+2026-10-13 15:23:07.445 Df bluetoothd[393:40a03e94] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:23:07.566 Df bluetoothd[393:40a03e94] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:23:32.500 Df coreaudiod[409:40a7232e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:23:33.426 Df coreaudiod[409:40a7232e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tacl
+2026-10-13 15:23:35.668 Df coreaudiod[409:40a74b48] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:13.695 Df coreaudiod[409:40a74b48] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO bypass, waiting i/o codec synchronzied StartIO bypass counter 4
+2026-10-13 15:24:13.699 Df bluetoothd[393:409829de] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:24:28.070 Df coreaudiod[409:40a9b141] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:28.894 Df coreaudiod[409:40a9b141] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO bypass, waiting i/o codec synchronzied StartIO bypass counter 3
+2026-10-13 15:24:28.898 Df bluetoothd[393:40a6ab61] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:24:29.334 Df coreaudiod[409:40a9b8e8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:29.356 Df coreaudiod[409:40a9b8e8] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO bypass, waiting i/o codec synchronzied StartIO bypass counter 2
+2026-10-13 15:24:30.282 Df coreaudiod[409:40a9bd42] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:30.282 Df coreaudiod[409:40a9bd42] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:24:30.282 Df coreaudiod[409:40a9bd42] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:24:45.528 Df coreaudiod[409:40a9bd42] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO bypass, waiting i/o codec synchronzied StartIO bypass counter 1
+2026-10-13 15:24:45.529 Df bluetoothd[393:40a4ed15] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:24:48.199 Df coreaudiod[409:40aa3133] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:49.022 Df coreaudiod[409:40aa3133] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO bypass, waiting i/o codec synchronzied StartIO bypass counter 0
+2026-10-13 15:24:49.030 Df bluetoothd[393:40a822ee] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:24:49.461 Df coreaudiod[409:40aa36a7] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:49.483 Df coreaudiod[409:40aa36a7] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:50.420 Df coreaudiod[409:40aa3d4e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:24:50.420 Df coreaudiod[409:40aa3d4e] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:24:50.420 Df coreaudiod[409:40aa3d4e] [com.apple.bluetooth:BTAudio] TriggerSCOAudio: Dropping eSCO creation , IO Ongoing = YES
+2026-10-13 15:25:03.102 Df coreaudiod[409:40aa3d4e] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StopIO activeIO:0 [312] delegate Current Device  58:18:62:21:1C:6A-tsco
+2026-10-13 15:25:03.109 Df bluetoothd[393:40a4ed15] [com.apple.bluetooth:Server.Handsfree] Sco route is disabled for device 58:18:62:21:1C:6A
+2026-10-13 15:25:39.823 Df coreaudiod[409:40ac2533] [com.apple.bluetooth:BTAudio] BTUnifiedAudioDevice: StartIO activeIO:0 [312] delegate to current Device  58:18:62:21:1C:6A-tsco
