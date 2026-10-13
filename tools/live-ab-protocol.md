@@ -1,4 +1,4 @@
-# Live A/B Protocol — headset backend (DictateKit v1.12; second crossover on v1.13, §9)
+# Live A/B Protocol — headset backend (DictateKit v1.12; second crossover on v1.13, §9; unattended rig v1.14, §10)
 
 The GPT-6 review's §B deciding experiment, step by step: one operator-supervised, instrumented
 crossover between the two headset clients DictateKit v1.12 can run (v1.13 for the second crossover, §9), on the same MacBook and the
@@ -262,3 +262,60 @@ For each run, capture and record the following metrics in the session notes:
 - [ ] **Tail speech preserved**: final sentence "crossed Lisbon at noon" fully delivered when chord lands after the word.
 - [ ] **Clean bt-proof gate**: `tools/bt-proof.sh` reports `VERDICT pause=PASS` (or `NA`) across all runs with `PEAKS_SEEN=` confirmed.
 
+
+---
+
+## 10. Unattended rig (v1.14)
+
+`tools/rig/live-rig.zsh` runs §3's crossover (ABBA + W rows, `tools/rig/plan-abba.tsv`) with §2's idle profile
+before every cold row, and fills `tools/rig/out/table.md` — without an operator at the desk. It plays the recorded
+passage (`tools/fixtures/voice/raza-passage.wav`) through the MacBook's **built-in speaker** into the headset lying on the
+desk, and performs ⌥⌥ through a test-only trigger file, never a synthetic keystroke.
+
+**What Raza does:** put the headset on the desk next to the MacBook (on, connected, nothing playing), step away, and
+create the GO file — `touch ~/.claude/run-status/rig.GO` — then start the rig (`zsh tools/rig/live-rig.zsh`) or ask the
+architect to. **What Raza never does during the run:** nothing — no typing, no media, no calls; the rig stops itself.
+
+### Preconditions (printed and checked; any failure stops before the first row)
+
+1. The GO file `~/.claude/run-status/rig.GO` exists (Raza creates it; the rig consumes it, so every run needs a new go).
+2. The headset is connected (`system_profiler SPBluetoothDataType` lists it under Connected).
+3. Archie is the host: exactly one `Archie` process, no standalone `Dictate`; its DictateKit pin is v1.14 or later
+   **and** the Archie-side `enableRig` line is in (else the relaunch never logs `rig=on` and the rig aborts).
+4. No dictation or conversation in flight (the relaunch guard prints `CLEAR`).
+5. Nothing playing (`pmset -g assertions`: no `audio-out` resource, no "Playing audio").
+
+### What it does per row
+
+Arm: `launchctl setenv DICTATE_HEADSET_BACKEND <arm>` plus `DICTATE_RIG=1` and `DICTATE_RIG_DIR`, then a guarded relaunch
+of the **same** installed Archie bundle (kill + open; version and binary hash checked before and after; the output volume
+is read before and after, never written — a difference aborts the whole run). Cold rows wait for
+`bt_after3s=a2dp bt_profile=a2dp engine_allocated=false` and a released lease, then 30 s; warm rows start within 2 s of the
+previous row's end. Then: chord → `session=… event=start` → the passage through the built-in speaker (its own engine bound
+to the built-in output by UID, peak −12 dBFS; the default output device and the system volume are never changed) →
+chord at clip end + 300 ms → `session=… event=end` (which must carry `rig=1`). The paste goes to
+`tools/rig/out/<row>.txt` (git-ignored), never to the frontmost app; the table scores it against
+`tools/fixtures/voice/raza-passage.ref.txt` (git-ignored; without it the words column reads `no-ref`).
+
+Abort rules: an unexpected state VOIDs the row with its reason and the rig moves to the next row; it never improvises.
+A volume or bundle change, or a host without the rig hook, stops the whole run. On exit (normal, error or Ctrl-C) the
+rig removes the trigger file and unsets `DICTATE_RIG`, `DICTATE_RIG_DIR` and `DICTATE_HEADSET_BACKEND`.
+
+### The hooks are inert by default
+
+The host reads nothing from the trigger directory and pastes normally unless it was **launched** with `DICTATE_RIG=1`
+and an absolute `DICTATE_RIG_DIR` (`RigInertTests`: RED when the gate ignores the variable). After the rig, relaunch
+Archie normally (§8) so the next launch has neither variable.
+
+### Dry run (offline; no audio device, no host, no system change)
+
+```bash
+zsh tools/rig/live-rig.zsh --dry-run | tail -1        # DRY-RUN PASS rows=11
+```
+
+Replays the 10-13 15:05–15:25 crossover (`tools/fixtures/rig/live-ab-2026-10-13/`: the Archie `dk` lines and HAL lines
+of `archie-v35-work/raw/live-ab-2026-10-13-1504-1526.log`) through every step: the trigger file is consumed by a fake
+host, the speaker is `rig-play --fake` (asserts `engine_opened=0`), the WAV hatch stands in for the microphone, and the
+table must reproduce the eleven rows of `live-protocol-results.md` (§2026-10-13) literally. The word column uses
+synthetic stand-in pastes (no transcript is committed). RED: `--voice-log tools/fixtures/rig/red-missing-backend.voice.log`
+(row A2's end line without `headset_backend=`) → A2 `VOID no_backend`, `DRY-RUN FAIL`.

@@ -163,6 +163,10 @@ A session achieves `BT-PROOF: PASS` only when all of the following hold:
 
 Missing sessions, duplicate session IDs, missing outcomes, or log errors fail (`BT-PROOF: FAIL <reason>`). Before the final line the gate prints its positive-control counters (`DROPS_SEEN= RECOVERED= FALLBACKS=`) and separate verdicts: `VERDICT continuity=`, `VERDICT headset=` (PASS only when the headset actually carried: `headset_carried_ms>0` or a bounded recovery), `VERDICT content=`, and `VERDICT playback=NA` (dictation logs hold no playback evidence). The logs carry no device UID on session or event lines, so events are matched to sessions by time window only. Live testing on a Bluetooth headset follows the protocol in [tools/live-protocol.md](tools/live-protocol.md).
 
+### Unattended headset rig (`tools/rig/live-rig.zsh`, v1.14)
+
+Runs the live A/B crossover without an operator: plays the recorded passage through the built-in speaker into the headset on the desk, performs ⌥⌥ through a test-only 0600 trigger file, and fills `tools/rig/out/table.md` (git-ignored). Live only on Raza's GO file; `--dry-run` replays the 10-13 crossover offline (`DRY-RUN PASS rows=11`). The host hooks are inert unless the host was launched with `DICTATE_RIG=1` and an absolute `DICTATE_RIG_DIR`; a host opts in with `engine.enableRig(launchEnvironment:gesture:)`. Details: [tools/live-ab-protocol.md §10](tools/live-ab-protocol.md).
+
 ## Embedding (DictateKit)
 
 The `DictateKit` library product exposes the same engine to another app (`DictationEngine`, no pill or menu required). See [docs/HOSTING.md](docs/HOSTING.md), including the frozen `AudioRecorder` capture contract (v1.11) for hosts that run their own capture. Hosts should wire their single ⌥ tap to `engine.tap()` (it pre-starts the microphone) and tee `engine.onDiagnostic` into their own log.
