@@ -1,0 +1,13 @@
+# Live run R4 (session 41f98dbd), Archie 38.0 + DictateKit v1.9, 2026-10-13 07:07:09–07:07:25 +08 — headset carried (transcript-free counts-only lines)
+2026-10-13 07:07:09.196 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:07:09.205Z] dictate: session=41f98dbd event=start
+2026-10-13 07:07:09.205 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:07:09.214Z] dictate: tap2_to_first_kept_buffer_ms=0 kept_src=ring preroll_frames=1784
+2026-10-13 07:07:09.318 Df Archie[57913:0x3b83815d] [com.razakhan.archie:voice] dk [2026-10-12T23:07:09.327Z] dictate: bt_recovery=queued path=configuration wait_ms=200
+2026-10-13 07:07:10.311 Df Archie[57913:0x3b819d18] [com.razakhan.archie:voice] dk [2026-10-12T23:07:10.320Z] dictate: headset_signal_start=1
+2026-10-13 07:07:10.312 Df Archie[57913:0x3b819d18] [com.razakhan.archie:voice] dk [2026-10-12T23:07:10.321Z] dictate: bridge_ms=1106 bridge_src=builtin builtin_frames=28100
+2026-10-13 07:07:10.523 Df Archie[57913:0x3b83fd84] [com.razakhan.archie:voice] dk [2026-10-12T23:07:10.532Z] dictate: bt_recovery=settled path=configuration result=frames
+2026-10-13 07:07:16.512 Df Archie[57913:0x3b83fbe0] [com.razakhan.archie:voice] dk [2026-10-12T23:07:16.521Z] dictate: headset_signal_start=1
+2026-10-13 07:07:21.812 Df Archie[57913:0x3b822367] [com.razakhan.archie:voice] dk [2026-10-12T23:07:21.821Z] dictate: headset_signal_start=1
+2026-10-13 07:07:24.315 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:07:24.325Z] dictate: headset_restart=1 result=still_silent
+2026-10-13 07:07:24.944 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dict_levels n=101 max=1.0000 mean=0.8474 outcome=pasted
+2026-10-13 07:07:24.944 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dict_bridge bridge_src=builtin headset_restart=1 result=still_silent bridge_device_check=ok
+2026-10-13 07:07:24.952 Df Archie[57913:0x3a634989] [com.razakhan.archie:voice] dk [2026-10-12T23:07:24.961Z] dictate: session=41f98dbd event=end outcome=ok duration_ms=15118 bytes=728918 chars=216 recording_ms=15110 capture_intervals=0-15105 speech_sections=5 builtin_frames_after_fallback=0 builtin_backend=auhal carrier=builtin:0-1106,headset:1106-15110 headset_carried_ms=14004
