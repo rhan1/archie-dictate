@@ -646,6 +646,7 @@ public final class AppController {
                 }, prompt: prompt,
                    rejoinGuard: GroqChunkedTranscriber.rejoinGuardEnabled(environment: ProcessInfo.processInfo.environment),
                    lowSpeechGuard: GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: ProcessInfo.processInfo.environment),
+                   edgeGuard: GroqChunkedTranscriber.edgeGuardEnabled(environment: ProcessInfo.processInfo.environment),
                    onChunkText: { index, text in incremental?.append(index: index, text: text) },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
@@ -967,6 +968,14 @@ public final class AppController {
 
     /// One stderr line per dictation: where the time went. Counts and ms only.
     struct Timeline {
+        /// v1.11 L1: where low-speech sentences left the text: `none`, `chunk` (the v1.10 novelty
+        /// rule, off by default), `opening`, `tail`, or a `+` join (counts only).
+        static func droppedPosition(_ chunked: GroqChunkedTranscriber.Result) -> String {
+            let positions = [(chunked.droppedLowSpeechSentences, "chunk"), (chunked.droppedOpeningSentences, "opening"),
+                             (chunked.droppedTailSentences, "tail")].filter { $0.0 > 0 }.map(\.1)
+            return positions.isEmpty ? "none" : positions.joined(separator: "+")
+        }
+
         var media: String
         var warmMs: Int?
         var capture: AudioRecorder.CaptureStats
@@ -1010,7 +1019,10 @@ public final class AppController {
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
-                           "stt_dropped_low_speech_sentence=\(chunked.droppedLowSpeechSentences)",
+                           "stt_dropped_low_speech_sentence=\(chunked.droppedLowSpeechSentences + chunked.droppedOpeningSentences + chunked.droppedTailSentences)",
+                           "stt_dropped_low_speech_pos=\(Self.droppedPosition(chunked))",
+                           "stt_dropped_artifact=\(chunked.droppedArtifacts)",
+                           "stt_dropped_silent_chunk=\(chunked.droppedSilentChunks)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
                            "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
                 for call in chunked.calls {
