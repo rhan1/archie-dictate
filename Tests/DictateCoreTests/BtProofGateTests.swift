@@ -216,5 +216,29 @@ struct BtProofGateTests {
         #expect(res.output.contains("VERDICT content=PASS"))
         #expect(res.output.contains("VERDICT playback=NA"))
     }
+
+    // MARK: - v1.13 L1 bt-proof pause gating tests
+
+    @Test func greenPausePeaksPass() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "green-pause-kept.log"))
+        #expect(res.status == 0)
+        #expect(res.finalLine == "BT-PROOF: PASS")
+        #expect(res.output.contains("PEAKS_SEEN=1"))
+        #expect(res.output.contains("VERDICT pause=PASS"))
+        #expect(res.output.contains("SWITCH session=41f98dbd to=headset reason=takeover"))
+    }
+
+    @Test func redPauseSwitchFails() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "red-pause-switch.log"))
+        #expect(res.status == 1)
+        #expect(res.finalLine.contains("pause_switch@"))
+    }
+
+    @Test func legacyLogPauseVerdictNA() throws {
+        let res = try runGate(fixturePath: fixtureURL(named: "green-headset-carried.log"))
+        #expect(res.status == 0)
+        #expect(res.output.contains("PEAKS_SEEN=0"))
+        #expect(res.output.contains("VERDICT pause=NA"))
+    }
 }
 
