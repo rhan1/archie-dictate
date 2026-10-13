@@ -1,7 +1,7 @@
-# Live A/B Protocol — headset backend (DictateKit v1.12)
+# Live A/B Protocol — headset backend (DictateKit v1.12; second crossover on v1.13, §9)
 
 The GPT-6 review's §B deciding experiment, step by step: one operator-supervised, instrumented
-crossover between the two headset clients DictateKit v1.12 can run, on the same MacBook and the
+crossover between the two headset clients DictateKit v1.12 can run (v1.13 for the second crossover, §9), on the same MacBook and the
 same Sony WH-1000XM6, in the same session.
 
 - **Arm E — `engine`** (default, v1.0–v1.11): the AVAudioEngine input node, which follows the
@@ -20,6 +20,18 @@ instrumentation on the session line.
 > behaviour of either arm is **unproven** until this protocol has been executed.
 > One session locates the failing **layer**. It cannot estimate a failure **rate**, so never
 > report a handful of passes as reliability.
+
+---
+
+## Results so far
+
+2026-10-13 15:05–15:25, Archie 42.0 on DictateKit v1.12 (1514a63), Sony WH-1000XM6: eleven runs — table in `~/.claude/handoffs/archie-v35-work/live-protocol-results.md` (section "2026-10-13 15:05–15:25"), raw log `archie-v35-work/raw/live-ab-2026-10-13-1504-1526.log`.
+
+- **Both arms carried on the headset**: exact zeros were received from the Sony on both arms (`zeros=…headset:` 49811/389712 auhal A1, 53684/357552 engine row 1, 19704–51926 on other engine runs) across delivery sizes of 480 frames (`io_callbacks=headset:812` auhal) vs 2400 frames (`149` engine).
+- **AUHAL dip at the two-second pause**: A1–A4 each showed a 0.2–0.7 s built-in segment at the passage's pause (`bridge_switchback=1` triggered after > 0.5 s of headset digital silence alone), then `bridge_switch=headset reason=recovered` 150 ms+ into the next word ("We need" → "When you need"); engine dipped once at the pause (row 4 `builtin:7135-8537`).
+- **Engine warm HFP waited 2431 ms**: E4 and W2 waited `carrier=builtin:0-2431` identically to the millisecond via `hands_off path=configuration engine_running=1` (+116/+113 ms) → 0.7 s zeros → `headset_restart=1 path=restart idle=1 waited_ms=300` → `obligation path=configuration engine_running=0` (+128 ms) → `settled path=restart result=no_frames` (+1.0 s) → `reattach path=obligation reason=engine_stopped` → signal 240 ms later → `bridge_switch=headset reason=recovered`.
+- **Handover misses**: both engine-arm misses sit on source switches (run 1 "so for" → "if you're a fan of" across `builtin:0-910,headset:910-1924,builtin:1924-3353`; run 2 "draft" → "drop" at the 2318 ms takeover). A timestamp splice repeats the headset's transit lag at a takeover and drops it at a switchback (hatch-modeled; the live lag is unmeasured — v1.13 logs it as `splice_align_ms=`).
+- **A4 tail**: A4 delivered frames until 7 ms before the stop (`recording_ms=15881 capture_intervals=0-15874`); `AudioRecorder.stop()` keeps everything delivered. The missing final "Thanks" is either the chord landing on the word or audio still in Bluetooth transit at the chord — the counts cannot tell which (§9 records it).
 
 ---
 
@@ -225,3 +237,28 @@ pkill -x Dictate; sleep 2   # then relaunch normally / bootstrap the LaunchAgent
 - The headset returns to A2DP (`bt_after3s=a2dp`).
 - The table and the raw logs under `~/.claude/handoffs/dictate-ab-work/` are matched to session ids and
   to the build hash from §1. Nothing from this protocol is committed to the repository.
+
+---
+
+## 9. Second crossover after v1.13
+
+Run the same sequence and protocol steps (§§ 0–6) as the first crossover, now executed on DictateKit v1.13 (tag `v1.13` of `https://github.com/rhan1/archie-dictate`; the host's pin is the revision in the `FINAL:` line of `~/.claude/handoffs/dictate-v11.report.md` — check `Package.resolved` against it before the first run).
+
+### What to record per run (in addition to §5)
+
+For each run, capture and record the following metrics in the session notes:
+1. **Bridge switches and peaks**: every `bridge_switch=<to> reason=<why> headset_peak=<f> builtin_peak=<f>` line logged during the session.
+2. **Splice alignment**: `splice_align_ms=` and `corr=` at the first takeover decision.
+3. **Warm engine recovery**: on warm starts (arm E, W rows), record whether `bt_recovery=immediate … reason=warm_format_change` appears and the first headset millisecond in `carrier=` (expected `takeover_ms` ≤ 300 ms).
+4. **Pause carrier continuity**: verify whether a mid-run `builtin:` segment appears at the passage's two-second pause. Expected: none, unless the switch log explicitly shows `reason=witness` with `builtin_peak` ≥ 0.01.
+5. **Finishing chord landing**: the operator's note recording whether the finishing chord (second ⌥) landed on the last word ("noon") or after it (used to decide the L4 v1.14 candidate for Bluetooth transit tail drain).
+6. **Bluetooth proof gate**: run `tools/bt-proof.sh --log-window …` and record `SWITCH`, `PEAKS_SEEN=`, and `VERDICT pause=PASS|FAIL|NA` (must report `PASS` or `NA`, with no `BT-PROOF: FAIL pause_switch@`).
+
+### Success criteria checklist
+
+- [ ] **No false switchback at pause**: zero mid-run `builtin:` carrier segments during the 2 s pause on both arms, with `bridge_switchback=0` (or witnessed switch only if `builtin_peak` ≥ 0.01).
+- [ ] **Immediate warm HFP takeover**: warm engine arm takes over with `takeover_ms` ≤ 300 ms (via `bt_recovery=immediate … reason=warm_format_change`), matching AUHAL warm performance.
+- [ ] **Seamless content splice**: `splice_align_ms` cross-correlation reported (`corr` ≥ 0.60) with no clipped words or duplicate syllables at handover ("Banana first", "Then the number").
+- [ ] **Tail speech preserved**: final sentence "crossed Lisbon at noon" fully delivered when chord lands after the word.
+- [ ] **Clean bt-proof gate**: `tools/bt-proof.sh` reports `VERDICT pause=PASS` (or `NA`) across all runs with `PEAKS_SEEN=` confirmed.
+
