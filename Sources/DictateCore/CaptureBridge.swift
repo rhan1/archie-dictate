@@ -96,8 +96,10 @@ public struct CaptureBridge {
     private var headsetSignalFrames = 0
     private var headsetSilentFrames = 0
     private var fallbackRefusedNoted = false
-    /// v1.13 (L1): consecutive built-in frames at speech level (`witnessPeak`).
+    /// v1.13 (L1): consecutive built-in frames at speech level (`witnessPeak`), and when that run began.
     private var builtinSpeechFrames = 0
+    private var builtinSpeechSince: TimeInterval?
+    private var lastBuiltinEnd: TimeInterval?
     /// Sample time of the first frame of the headset's current digital-silence run.
     private var headsetSilentSince: TimeInterval?
     private var lastHeadsetPeak: Float = 0
@@ -196,11 +198,17 @@ public struct CaptureBridge {
         return switchNotes
     }
 
-    /// The built-in witnesses speech while the carrying headset is digitally silent (v1.13 L1).
+    /// The built-in witnesses speech while the carrying headset is digitally silent (v1.13 L1): on the
+    /// shared sample clock, the headset's silence and the built-in's speech overlap for `witnessSilence`
+    /// and the built-in's run is at least `CaptureHealth.switchSignal` long. Compared as intervals (L3), a
+    /// headset whose buffers trail the built-in's is never "silent" at the next word's onset merely
+    /// because its frames have not arrived yet.
     private var witnessed: Bool {
-        guard headsetSilentSince != nil else { return false }
-        return Double(headsetSilentFrames) / Self.rate >= Self.witnessSilence - 0.000_001
-            && Double(builtinSpeechFrames) / Self.rate >= CaptureHealth.switchSignal - 0.000_001
+        guard let silentSince = headsetSilentSince, let headsetEnd = lastHeadsetEnd,
+              let speechSince = builtinSpeechSince, let builtinEnd = lastBuiltinEnd else { return false }
+        let overlap = min(headsetEnd, builtinEnd) - max(silentSince, speechSince)
+        return overlap >= Self.witnessSilence - 0.000_001
+            && builtinEnd - speechSince >= CaptureHealth.switchSignal - 0.000_001
     }
 
     /// `builtin:0-1106,headset:1106-15110` (ms from the second tap; the last runs to `endMs`), or `none`.
@@ -233,7 +241,14 @@ public struct CaptureBridge {
         resumeFrom = nil
         if source == .builtin {
             lastBuiltinPeak = peak
-            builtinSpeechFrames = peak >= Self.witnessPeak ? builtinSpeechFrames + frames : 0
+            if peak >= Self.witnessPeak {
+                if builtinSpeechFrames == 0 { builtinSpeechSince = time }
+                builtinSpeechFrames += frames
+            } else {
+                builtinSpeechFrames = 0
+                builtinSpeechSince = nil
+            }
+            lastBuiltinEnd = time + Double(frames) / Self.rate
         }
         if source == .headset, bluetooth { arbitrate(&result, at: time, frames: frames,
                                                      arrivedAt: arrivedAt, peak: peak, builtinFresh: builtinFresh) }
@@ -402,6 +417,11 @@ public struct CaptureBridge {
     public var canSwitchBack: Bool { state == .switched && builtinAlive }
     public var fedThroughTime: TimeInterval? { fedThrough }
     public var isRecording: Bool { recordingStart != nil }
+
+    /// v1.13 (L3): headset history frames the owner fed ahead of a takeover buffer (a leading headset).
+    public mutating func resumedHeadset(through end: TimeInterval) {
+        fedThrough = max(fedThrough ?? end, end)
+    }
 
     /// Standby built-in frames that continue the dictation exactly at the switchback.
     public mutating func resumedBuiltin(frames: Int, through end: TimeInterval) {
