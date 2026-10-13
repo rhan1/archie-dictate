@@ -60,7 +60,7 @@ struct CarrierReplayTests {
     }
 
     @Test func takeoverRecorderReportsTheHeadsetCarrier() async throws {
-        let (dir, url) = try wav(seconds: 7)
+        let (dir, url) = try wav(seconds: 3.5)
         defer { try? FileManager.default.removeItem(at: dir) }
         let recorder = WAVInjectedRecorder(url: url, pace: 0.05, scenario: .headsetTakeover)
         let notes = Lines()
@@ -83,11 +83,11 @@ struct CarrierReplayTests {
         #expect(stats.headsetRestart == "skipped")
         #expect(notes.snapshot.contains("bt_recovery=coalesced path=restart"))
         let got = lock.withLock { pcm }
-        #expect(Array(got.prefix(3 * 24_000)) == Array(Self.tone(seconds: 7).prefix(3 * 24_000)))   // no loss or duplicate at the takeover
+        #expect(Array(got.prefix(3 * 24_000)) == Array(Self.tone(seconds: 3.5).prefix(3 * 24_000)))   // no loss or duplicate at the takeover
     }
 
     @MainActor @Test func takeoverSessionEndLineNamesKindAndCarrier() async throws {
-        let (dir, url) = try wav(seconds: 7)
+        let (dir, url) = try wav(seconds: 3.5)
         defer { try? FileManager.default.removeItem(at: dir) }
         let paths = AppPaths(home: dir.appendingPathComponent("home"))
         let keys = KeyStore(reader: { _ in "fixture" })

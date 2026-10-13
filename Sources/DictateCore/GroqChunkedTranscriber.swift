@@ -223,19 +223,32 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         return (0..<(pcm.count * 2 / 3)).map { output in
             let position = Double(output) * 1.5
             let center = Int(position)
+            // v1.11: an output sits on an input (phase 0) or halfway between two (phase 0.5); the
+            // taps for both phases are computed once, with the same formula, in the same order.
+            let taps = position == Double(center) ? resampleTaps.whole : resampleTaps.half
             var sum = 0.0, weight = 0.0
-            for input in (center - 15)...(center + 16) {
-                let distance = Double(input) - position
-                guard abs(distance) < 16 else { continue }
-                let x = distance * (2.0 / 3.0)
-                let sinc = abs(x) < 1e-10 ? 1 : sin(.pi * x) / (.pi * x)
-                let coefficient = (2.0 / 3.0) * sinc * (0.5 + 0.5 * cos(.pi * distance / 16))
+            for (offset, coefficient) in taps {
+                let input = center + offset
                 sum += Double(pcm[min(pcm.count - 1, max(0, input))]) * coefficient
                 weight += coefficient
             }
             return Int16(clamping: Int((sum / weight).rounded()))
         }
     }
+
+    /// (input offset from the output's center, coefficient) for each phase, in input order.
+    private static let resampleTaps: (whole: [(Int, Double)], half: [(Int, Double)]) = {
+        func taps(phase: Double) -> [(Int, Double)] {
+            (-15...16).compactMap { offset in
+                let distance = Double(offset) - phase
+                guard abs(distance) < 16 else { return nil }
+                let x = distance * (2.0 / 3.0)
+                let sinc = abs(x) < 1e-10 ? 1 : sin(.pi * x) / (.pi * x)
+                return (offset, (2.0 / 3.0) * sinc * (0.5 + 0.5 * cos(.pi * distance / 16)))
+            }
+        }
+        return (taps(phase: 0), taps(phase: 0.5))
+    }()
 
     private struct Response: Sendable {
         let text: String?
