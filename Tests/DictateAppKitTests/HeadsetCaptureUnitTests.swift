@@ -430,6 +430,19 @@ struct HeadsetCaptureUnitTests {
         #expect(deliveredAfterStop == 0)
     }
 
+    /// Review F1: a frame callback that tears capture down runs ON the worker; stop() must not
+    /// sync onto the worker from there (GCD deadlock).
+    @Test func stopFromInsideAFrameCallbackDoesNotDeadlock() throws {
+        let fake = FakeHALDriver()
+        let unit = HeadsetCaptureUnit(driver: fake, workerInterval: 0.005)
+        let stopped = DispatchSemaphore(value: 0)
+        unit.onFrames = { _, _, _ in unit.stop(); stopped.signal() }
+        try unit.start(deviceUID: "test-uid", epoch: CaptureEpoch())
+        fake.push(samples: FakeHALDriver.sine(count: 4410, sampleRate: 44100))
+        #expect(stopped.wait(timeout: .now() + 10) == .success)
+        #expect(!unit.isRunning)
+    }
+
     @Test func lateFramesFromAnOldEpochAreDropped() throws {
         let fake = FakeHALDriver()
         let unit = HeadsetCaptureUnit(driver: fake, workerInterval: 0.005)

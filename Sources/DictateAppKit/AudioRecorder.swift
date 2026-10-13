@@ -484,6 +484,10 @@ public final class AudioRecorder: CaptureEngine {
             } catch {
                 teardownEngine()
                 lock.withLock { if engineEpoch === epoch, episode.isRunning { episode.settled(.failed) } }
+                // v1.12 (L1): a start that failed for this session ends it — the built-in unit is
+                // stopped and the lease released — so a host that does not call stop() after a
+                // thrown startAsync cannot leave the microphone owned forever.
+                if lock.withLock({ engineEpoch === epoch && lease != nil }) { _ = stop() }
                 completion(.failure(error))
             }
         }
@@ -657,7 +661,7 @@ public final class AudioRecorder: CaptureEngine {
                     return
                 case .reattach:
                     guard lock.withLock({ episode.admitReattach(at: now) }) else {
-                        lock.withLock { ioGuard.reattachDeclined() }
+                        lock.withLock { if episode.budgetSpent { ioGuard.reattachUnavailable() } else { ioGuard.reattachDeclined() } }
                         AppController.note("bt_recovery=obligation path=configuration engine_running=0 in_flight=1")
                         return
                     }
@@ -1180,7 +1184,7 @@ public final class AudioRecorder: CaptureEngine {
              engineEpoch === epoch && captureRunning && !restarting && (engine != nil || headsetUnitActive))
         }
         guard live, recording, lock.withLock({ episode.admitReattach(at: now) }) else {
-            lock.withLock { ioGuard.reattachDeclined() }
+            lock.withLock { if episode.budgetSpent { ioGuard.reattachUnavailable() } else { ioGuard.reattachDeclined() } }
             return
         }
         AppController.note("bt_recovery=reattach path=obligation reason=\(reason)")

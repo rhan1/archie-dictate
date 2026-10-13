@@ -135,6 +135,22 @@ struct CaptureLeaseTests {
         #expect(!next.admits(stuck.token) && broker.quarantined == 1)
     }
 
+    /// Review F4: with nobody asking for the microphone again, a stuck release must still settle
+    /// (`awaitRelease()` callers would otherwise wait forever).
+    @Test func aStuckReleaseQuarantinesWithoutAnyNewRequest() {
+        let clock = Clock()
+        let broker = Self.broker(clock)
+        guard let stuck = Self.lease(broker.tryAcquire(.dictation)) else { Issue.record("no lease"); return }
+        stuck.started(.headset)
+        let settled = Box<CaptureLease.State>()
+        stuck.whenSettled { settled.append($0) }
+        stuck.release(at: 0)
+        clock.advance(to: CaptureLeaseBroker.quarantineAfter - 0.01)
+        #expect(settled.all.isEmpty)
+        clock.advance(to: CaptureLeaseBroker.quarantineAfter)
+        #expect(settled.all == [.quarantined] && stuck.state == .quarantined && broker.holder == nil)
+    }
+
     @Test func aWaiterIsAdmittedWhenTheStuckReleaseIsQuarantined() {
         let clock = Clock()
         let broker = Self.broker(clock)

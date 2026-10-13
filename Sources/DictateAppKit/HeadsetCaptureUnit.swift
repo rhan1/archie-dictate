@@ -25,7 +25,12 @@ final class HeadsetCaptureUnit: HeadsetCapture {
     private let lock = NSLock()
     /// Recursive: a failed start tears down (stop) while start still holds it.
     private let unitLock = NSRecursiveLock()
-    private let worker = DispatchQueue(label: "dictate.headset.worker")
+    private let worker: DispatchQueue = {
+        let queue = DispatchQueue(label: "dictate.headset.worker")
+        queue.setSpecific(key: HeadsetCaptureUnit.workerKey, value: ())
+        return queue
+    }()
+    private static let workerKey = DispatchSpecificKey<Void>()
     private let context = HeadsetRenderContext()
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate,
                                              channels: 1, interleaved: false)!
@@ -216,13 +221,15 @@ final class HeadsetCaptureUnit: HeadsetCapture {
             driver.unlisten(token)
         }
         timer?.cancel()
+        // Flush the worker BEFORE the driver is disposed: an in-flight drain may still read the
+        // unit's format or reconfigure it. Never sync onto the worker from the worker itself (a
+        // frame/event callback that tears capture down would deadlock).
+        if DispatchQueue.getSpecific(key: Self.workerKey) == nil { worker.sync {} }
 
         let errors = driver.stop()
         for error in errors {
             note("headset_teardown_error=\(error)")
         }
-
-        worker.sync {}
 
         if wasActive {
             onEvent?(.stopped, epochToken)

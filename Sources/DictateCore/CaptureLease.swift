@@ -210,6 +210,9 @@ public final class CaptureLeaseBroker: @unchecked Sendable {
 
     fileprivate func withLock<T>(_ body: () -> T) -> T { lock.withLock(body) }
     fileprivate func now() -> TimeInterval { clock() }
+    fileprivate func scheduleQuarantineCheck() {
+        schedule(Self.quarantineAfter) { [weak self] in self?.quarantineIfOverdue() }
+    }
 
     /// Settle callbacks of a quarantined lease, collected under the lock and run after it.
     private var notifications: [@Sendable () -> Void] = []
@@ -297,15 +300,18 @@ public final class CaptureLease: @unchecked Sendable {
     /// release completes at once. Idempotent.
     public func release(at time: TimeInterval? = nil) {
         let now = time ?? broker.now()
-        let done: Bool = broker.withLock {
-            guard stateLocked == .active else { return false }
+        let (done, pendingRelease): (Bool, Bool) = broker.withLock {
+            guard stateLocked == .active else { return (false, false) }
             mute = false
             releaseBegan = now
             pending = started
             stateLocked = .releasing(since: now)
-            if pending.isEmpty { stateLocked = .released; releaseDone = now; return true }
-            return false
+            if pending.isEmpty { stateLocked = .released; releaseDone = now; return (true, false) }
+            return (false, true)
         }
+        // A release that never completes is quarantined even if no one asks for the microphone
+        // again (an `awaitRelease()` caller must never wait forever).
+        if pendingRelease { broker.scheduleQuarantineCheck() }
         if done { finish() }
     }
 
