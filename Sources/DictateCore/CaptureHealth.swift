@@ -50,6 +50,8 @@ public struct CaptureHealth: Sendable {
         var lastAt: TimeInterval?
         var zeroSince: TimeInterval?
         var signalRun: TimeInterval = 0
+        /// v1.13 (L1): consecutive seconds at speech level (`CaptureBridge.witnessPeak`).
+        var speechRun: TimeInterval = 0
         var problem: Problem?
         var everSignal = false
     }
@@ -100,6 +102,7 @@ public struct CaptureHealth: Sendable {
             if s.firstAt == nil { s.firstAt = time }
             s.lastAt = time
             let seconds = Double(frames) / Self.rate
+            s.speechRun = peak >= CaptureBridge.witnessPeak ? s.speechRun + seconds : 0
             if peak < Self.silencePeak {
                 if s.zeroSince == nil { s.zeroSince = time - seconds }
                 s.signalRun = 0
@@ -193,6 +196,12 @@ public struct CaptureHealth: Sendable {
             else { reason = carrying == .builtin ? .staleBuiltin : .staleHeadset }
         }
         if let reason, isFresh(other, at: now) {
+            // v1.13 (L1): a digitally silent headset is a pause unless the built-in witnesses speech;
+            // with a live built-in beside it nothing is failing, so no warning and no deadline.
+            if reason == .zeros, carrying == .headset, state(other).speechRun < Self.switchSignal - 0.000_001 {
+                warned = nil
+                return actions
+            }
             actions.append(.switchTo(other, reason: reason))
             warned = nil
             return actions
