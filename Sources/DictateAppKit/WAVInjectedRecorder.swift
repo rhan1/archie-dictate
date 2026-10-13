@@ -277,6 +277,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         }
         while let next = ioPending.first, next.at <= offset {
             ioGuard.record(next.op)
+            ioGuard.finished(next.op, ok: true)             // the model's operations all return
             ioPending.removeFirst()
         }
     }
@@ -367,6 +368,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
             advanceIO(to: time - boundary)
             if !builtinStopped { outs.append(feed.accept(wav, source: .builtin, at: time)) }
             if let headset = headsetChunk(offset: time - boundary, wav: wav) {
+                if scenario == .scoTornDown250ms {
+                    // v1.12 (L2): IO observed again discharges the stopped engine's obligation.
+                    ioGuard.headsetFrames(headset.count, peak: headset.reduce(Float(0)) { max($0, abs($1)) },
+                                          at: time - boundary + 0.1)
+                    _ = ioGuard.observe(at: time - boundary + 0.1, engineRunning: true)
+                }
                 outs.append(feed.accept(headset, source: .headset, at: time))
             }
             for out in outs {
@@ -458,6 +465,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             }
             stats.ioOps = ioGuard.note
             stats.ioHeld = ioGuard.heldNote
+            stats.carrier = feed.timeline.note
             feed.cancel()
             remainder = pendingPCM
             pendingPCM.removeAll()

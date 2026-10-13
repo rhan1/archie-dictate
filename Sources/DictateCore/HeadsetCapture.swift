@@ -98,15 +98,17 @@ public struct CaptureInstrumentation: Equatable, Sendable {
         public var generation: Int
         public var sampleRate: Double
         public var channels: Int
-        public var atMs: Int
+        /// Host-clock time the format was first seen.
+        public var at: TimeInterval
     }
     public var backend: HeadsetBackend
     public var routeUID: String?
     public private(set) var formatEpochs: [FormatEpoch] = []
     public private(set) var builtin = SourceCounters()
     public private(set) var headset = SourceCounters()
-    public private(set) var takeoverMs: [Int] = []
-    public private(set) var fallbackMs: [Int] = []
+    /// Host-clock times of headset takeovers and built-in fallbacks/switchbacks.
+    public private(set) var takeovers: [TimeInterval] = []
+    public private(set) var fallbacks: [TimeInterval] = []
     /// At most this many epochs are listed (a notification storm is counted, not printed).
     public static let maxEpochs = 8
     public private(set) var epochsDropped = 0
@@ -119,30 +121,33 @@ public struct CaptureInstrumentation: Equatable, Sendable {
     public mutating func frames(_ source: CaptureBridge.Source, _ samples: [Float]) {
         if source == .builtin { builtin.frames(samples) } else { headset.frames(samples) }
     }
-    /// The headset's format at `atMs`: recorded only when it differs from the last epoch.
-    public mutating func format(sampleRate: Double, channels: Int, atMs: Int) {
+    /// The headset's format at host time `at`: recorded only when it differs from the last epoch.
+    public mutating func format(sampleRate: Double, channels: Int, at: TimeInterval) {
         if let last = formatEpochs.last, last.sampleRate == sampleRate, last.channels == channels { return }
         guard formatEpochs.count < Self.maxEpochs else { epochsDropped += 1; return }
         formatEpochs.append(FormatEpoch(generation: formatEpochs.count + 1 + epochsDropped,
-                                        sampleRate: sampleRate, channels: channels, atMs: atMs))
+                                        sampleRate: sampleRate, channels: channels, at: at))
     }
-    public mutating func takeover(atMs: Int) { takeoverMs.append(atMs) }
-    public mutating func fallback(atMs: Int) { fallbackMs.append(atMs) }
+    public mutating func takeover(at time: TimeInterval) { if takeovers.count < Self.maxEpochs { takeovers.append(time) } }
+    public mutating func fallback(at time: TimeInterval) { if fallbacks.count < Self.maxEpochs { fallbacks.append(time) } }
 
-    public var note: String {
-        func list(_ values: [Int]) -> String { values.isEmpty ? "-" : values.map(String.init).joined(separator: ",") }
+    /// Times render as ms from `boundary` (the recording boundary; nil → from the first epoch).
+    public func note(boundary: TimeInterval?) -> String {
+        let origin = boundary ?? formatEpochs.first?.at ?? 0
+        func ms(_ t: TimeInterval) -> Int { Int(((t - origin) * 1000).rounded()) }
+        func list(_ values: [TimeInterval]) -> String { values.isEmpty ? "-" : values.map { String(ms($0)) }.joined(separator: ",") }
         func db(_ value: Double?) -> String {
             guard let value else { return "-" }
             return value.isFinite ? String(format: "%.1f", value) : "-inf"
         }
         let epochs = formatEpochs.isEmpty ? "-" : formatEpochs.map {
-            "\($0.generation):\(Int($0.sampleRate))Hz/\($0.channels)ch@\($0.atMs)"
+            "\($0.generation):\(Int($0.sampleRate))Hz/\($0.channels)ch@\(ms($0.at))"
         }.joined(separator: ",") + (epochsDropped > 0 ? ",+\(epochsDropped)" : "")
         return "headset_backend=\(backend.rawValue) route_uid=\(routeUID ?? "-") fmt_epochs=\(epochs)"
             + " io_callbacks=builtin:\(builtin.callbacks),headset:\(headset.callbacks)"
             + " frames=builtin:\(builtin.frames),headset:\(headset.frames)"
             + " zeros=builtin:\(builtin.zeros),headset:\(headset.zeros)"
             + " rms_dbfs=builtin:\(db(builtin.rmsDBFS)),headset:\(db(headset.rmsDBFS))"
-            + " takeover_ms=\(list(takeoverMs)) fallback_ms=\(list(fallbackMs))"
+            + " takeover_ms=\(list(takeovers)) fallback_ms=\(list(fallbacks))"
     }
 }
