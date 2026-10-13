@@ -98,7 +98,8 @@ struct CaptureLeaseRecorderTests {
 
     static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
-    static func waitUntil(_ timeout: TimeInterval = 2, _ condition: () -> Bool) async -> Bool {
+    /// A hang detector, not a timing bound (10 s).
+    static func waitUntil(_ timeout: TimeInterval = 10, _ condition: () -> Bool) async -> Bool {
         let deadline = now() + timeout
         while now() < deadline {
             if condition() { return true }
@@ -200,7 +201,8 @@ struct CaptureLeaseRecorderTests {
             if step >= 3 { headset.deliver(0.1, at: t) }           // signal from 300 ms: takeover after 150 ms
             t += 0.1
         }
-        #expect(await Self.waitUntil { firstBuffer.all == ["first"] })     // the lifecycle's watchdog hears it
+        await MainActor.run {}                                    // FIFO: the first-buffer hop to main ran before this
+        #expect(firstBuffer.all == ["first"])                     // the lifecycle's watchdog hears it
         _ = recorder.stop()
         #expect(recorder.stats.firstBufferMs != nil)
         let line = recorder.stats.instrumentation

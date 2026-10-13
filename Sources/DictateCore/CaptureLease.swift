@@ -244,7 +244,9 @@ public final class CaptureLease: @unchecked Sendable {
     public let waitedMs: Int
     /// The previous lease was quarantined (its release never completed).
     public let afterQuarantine: Bool
-    private unowned let broker: CaptureLeaseBroker
+    // Strong: a late part acknowledgement may outlive every other reference to the broker (the
+    // broker holds a lease only while it is current, so the cycle ends at release).
+    private let broker: CaptureLeaseBroker
     fileprivate var stateLocked: State = .active
     private var started: Set<Part> = []
     private var pending: Set<Part> = []
