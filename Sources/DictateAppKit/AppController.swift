@@ -1110,7 +1110,10 @@ public final class AppController {
 
     /// `session=<id> event=end outcome=… duration_ms=… bytes=… chars=… recording_ms=…
     /// capture_intervals=… speech_sections=… builtin_frames_after_fallback=… [builtin_backend=…]
-    /// io_ops=start:N stop:N rebuild:N retap:N io_held=N config_notifications=N` (counts only).
+    /// io_ops=start:N stop:N rebuild:N retap:N attempted:N completed:N failed:N framework:N io_held=N
+    /// config_notifications=N io_obligations=O/D io_obligation=… reattaches=N carrier=… headset_carried_ms=N
+    /// lease=N lease_kind=… lease_wait_ms=N headset_backend=… route_uid=… fmt_epochs=… io_callbacks=…
+    /// frames=… zeros=… rms_dbfs=… takeover_ms=… fallback_ms=…` (counts only, v1.12).
     private func noteSessionEnd(id: String, stats: AudioRecorder.CaptureStats, outcome: String, entry: DictationLogEntry?) {
         var line = "session=\(id) event=end outcome=\(outcome)"
         if let entry {
@@ -1120,6 +1123,7 @@ public final class AppController {
         line += " speech_sections=\(stats.speechSections) builtin_frames_after_fallback=\(stats.builtinFramesAfterFallback)"
         if let backend = stats.builtinBackend { line += " builtin_backend=\(backend)" }
         line += " \(stats.ioOps) \(stats.ioHeld)"
+        line += " \(stats.carrier) \(stats.lease) \(stats.instrumentation)"
         sessionNote(line)
     }
 

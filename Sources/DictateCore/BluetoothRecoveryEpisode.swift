@@ -57,8 +57,9 @@ public struct BluetoothRecoveryEpisode: Sendable {
         case frames, silentFrames = "silent_frames", noFrames = "no_frames", skipped, failed, externalBusy = "external_busy"
     }
 
-    /// v1.9 (L1): an attempt succeeded only if a buffer with signal (peak ≥
-    /// `CaptureBridge.silencePeak`) arrived within `successWithin` of `since`; zeros never count.
+    /// v1.9 (L1): an attempt succeeded only if signal arrived within `successWithin` of `since`;
+    /// zeros never count. v1.12 (L2): `firstSignal` is when SUSTAINED usable signal was reached
+    /// (`SustainedSignal`: the bridge's takeover test), never one nonzero buffer.
     public static func verdict(since: TimeInterval, firstFrame: TimeInterval?, firstSignal: TimeInterval?) -> Outcome {
         if let firstSignal, firstSignal <= since + successWithin { return .frames }
         if let firstFrame, firstFrame <= since + successWithin { return .silentFrames }
@@ -142,6 +143,24 @@ public struct BluetoothRecoveryEpisode: Sendable {
             return .wait(stable - now)
         }
         return begin(at: now) ? .begun : .notPending
+    }
+
+    /// v1.12 (L2): a stopped engine's recovery obligation (`HeadsetIOGuard`) is due: one
+    /// re-attach now, superseding a queued debounced attempt and counted against `maxAttempts`.
+    /// False while an attempt is still being verified (the guard re-asks on the next health tick)
+    /// or when the budget is spent.
+    public mutating func admitReattach(at now: TimeInterval) -> Bool {
+        guard bluetooth else { attempts += 1; return true }
+        guard !running, attempts < Self.maxAttempts, !(externalBusySeen && attemptsAfterBusy >= 1) else { return false }
+        requests += 1
+        pendingDue = nil
+        windowStart = now
+        usedInWindow = true
+        running = true
+        attempts += 1
+        immediateAttempts += 1
+        if externalBusySeen { attemptsAfterBusy += 1 }
+        return true
     }
 
     /// The queued attempt is no longer needed (healthy signal, replaced engine, new epoch):
