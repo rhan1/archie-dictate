@@ -22,6 +22,8 @@ public final class AppController {
     private var keepWarm: GroqKeepWarm?
     var keepWarmScheduled: Bool { keepWarm != nil }
     var keepWarmPings: Int { keepWarm?.pings ?? 0 }
+    /// v1.12.1 (L7): the host's read-only PCM tap (`DictationEngine.onPCMTap`).
+    let pcmTap = PCMTapRelay()
     var engineOnGroqRateLimit: ((GroqRateLimit) -> Void)? {
         get { MainActor.assumeIsolated { rateLimitRelay.callback } }
         set { MainActor.assumeIsolated { rateLimitRelay.callback = newValue } }
@@ -650,19 +652,23 @@ public final class AppController {
                    onChunkText: { index, text in incremental?.append(index: index, text: text) },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
-                recorder.onPCMChunk = { pcm in
+                recorder.onPCMChunk = { [pcmTap] pcm in
                     engine.append(pcm)
                     streaming.append(pcm)
+                    pcmTap.send(pcm)
                 }
             } else {
-                recorder.onPCMChunk = { pcm in engine.append(pcm) }
+                recorder.onPCMChunk = { [pcmTap] pcm in
+                    engine.append(pcm)
+                    pcmTap.send(pcm)
+                }
             }
             Task { try? await engine.start() }
             if sessionPolicy.usesCleanup, sessionPolicy.usesGroqCleanup {
                 Task { [groqCleaner] in await groqCleaner.warmUp() }
             }
         } else {
-            recorder.onPCMChunk = nil
+            recorder.onPCMChunk = { [pcmTap] pcm in pcmTap.send(pcm) }
         }
     }
 
@@ -1185,4 +1191,23 @@ public final class AppController {
         FileHandle.standardError.write(Data((line + "\n").utf8))
         noteLock.withLock { noteSink }?(line)
     }
+}
+
+/// v1.12.1 (L7): a host's read-only copy of the PCM the transcribers receive. Each chunk is handed to a
+/// private serial utility queue as it is appended to the transcribers — same chunks, same order — so a
+/// slow host closure never blocks capture. Nothing is stored; no handler, no work.
+final class PCMTapRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "dictate.pcm-tap", qos: .utility)
+    private var handler: (([Int16]) -> Void)?
+
+    func set(_ handler: (([Int16]) -> Void)?) { lock.withLock { self.handler = handler } }
+
+    func send(_ pcm: [Int16]) {
+        guard let handler = lock.withLock({ handler }) else { return }
+        queue.async { handler(pcm) }
+    }
+
+    /// Tests: returns once every chunk sent so far has reached the handler.
+    func drain() { queue.sync {} }
 }

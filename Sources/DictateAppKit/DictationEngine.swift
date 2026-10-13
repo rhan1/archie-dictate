@@ -39,6 +39,12 @@ public struct DictationTimeline: Sendable, Equatable {
     public var onState: (DictationState) -> Void = { _ in }
     public var onTranscript: (String, DictationTimeline) -> Void = { _, _ in }
     public var onGroqRateLimit: ((GroqRateLimit) -> Void)?
+    /// v1.12.1 (L7): a read-only copy of every PCM chunk the transcribers receive (24 kHz mono pcm16) —
+    /// the same chunks in the same order, delivered on a private serial utility queue so a slow host
+    /// never blocks capture. Nil by default. Nothing is stored; the pill meter is unaffected.
+    public var onPCMTap: (([Int16]) -> Void)? {
+        didSet { controller.pcmTap.set(onPCMTap) }
+    }
     /// Every diagnostic line (timeline, keys, bridge, media; counts only, never text), on any
     /// thread. Standalone Dictate writes these to its stderr log; a host should tee them to its own.
     /// Process-wide: the most recently set engine's sink receives them.
