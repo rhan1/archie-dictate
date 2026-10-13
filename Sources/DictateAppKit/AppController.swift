@@ -1120,19 +1120,15 @@ public final class AppController {
         } catch { /* Same best-effort diagnostic behavior as DictationLog. */ }
     }
 
-    /// `session=<id> event=end outcome=… duration_ms=… bytes=… chars=… recording_ms=…
-    /// capture_intervals=… speech_sections=… builtin_frames_after_fallback=… [builtin_backend=…]
-    /// io_ops=start:N stop:N rebuild:N retap:N io_held=N config_notifications=N` (counts only).
+    /// `session=<id> event=end outcome=… duration_ms=… bytes=… chars=…` + the capture's
+    /// `CaptureStats.sessionEndFields` (kind=… recording_ms=… … carrier=… headset_carried_ms=… io_ops=…
+    /// io_held=…; counts only). A host writing its own session line appends the same fields.
     private func noteSessionEnd(id: String, stats: AudioRecorder.CaptureStats, outcome: String, entry: DictationLogEntry?) {
         var line = "session=\(id) event=end outcome=\(outcome)"
         if let entry {
             line += " duration_ms=\(Int((entry.durationSeconds * 1000).rounded())) bytes=\(entry.audioBytes) chars=\(entry.chars)"
         }
-        line += " recording_ms=\(stats.recordingMs) capture_intervals=\(stats.captureIntervals)"
-        line += " speech_sections=\(stats.speechSections) builtin_frames_after_fallback=\(stats.builtinFramesAfterFallback)"
-        if let backend = stats.builtinBackend { line += " builtin_backend=\(backend)" }
-        line += " \(stats.ioOps) \(stats.ioHeld)"
-        sessionNote(line)
+        sessionNote(line + " " + stats.sessionEndFields)
     }
 
     private func traceFocus(_ event: String) {
