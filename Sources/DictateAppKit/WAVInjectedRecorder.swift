@@ -74,8 +74,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public private(set) var levelEnvelope: [Float] = []
     public var bridgeHasAudio: Bool { false }
 
-    public var isRunning: Bool { lock.withLock { timer != nil } }
-    public var isAllocated: Bool { lock.withLock { timer != nil } }
+    public var isRunning: Bool { lock.withLock { timer != nil || manualRunning } }
+    public var isAllocated: Bool { lock.withLock { timer != nil || manualRunning } }
+    /// Test harness (v1.12 L4): no timer — the test advances the media clock with `step()`, so a
+    /// starved runner can never cut a scenario short (the suite's wall-clock flake).
+    public var manualPacing = false
+    private var manualRunning = false
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "dictate.capture.injected")
@@ -184,7 +188,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     private func start(parsed: [Int16]) throws {
         lock.lock()
-        if timer != nil {
+        if timer != nil || manualRunning {
             lock.unlock()
             return
         }
@@ -199,6 +203,11 @@ public final class WAVInjectedRecorder: EngineRecorder {
         if scenario.hasHeadset { feed.sourceStarted(.builtin, at: mediaTime) }
         feed.sourceStarted(.headset, at: mediaTime)
         boundaryAt(mediaTime)
+        if manualPacing {
+            manualRunning = true
+            lock.unlock()
+            return
+        }
 
         let timerSource = DispatchSource.makeTimerSource(queue: queue)
         let intervalSeconds = 0.1 * pace
@@ -211,6 +220,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
         timerSource.resume()
         lock.unlock()
     }
+
+    /// `manualPacing`: one 100 ms media tick on the caller's thread (no-op when not running).
+    public func step() { queue.sync { tick() } }
 
     /// Caller holds `lock`.
     private func boundaryAt(_ time: TimeInterval) {
@@ -285,6 +297,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         }
         while let next = ioPending.first, next.at <= offset {
             ioGuard.record(next.op)
+            ioGuard.finished(next.op, ok: true)             // the model's operations all return
             ioPending.removeFirst()
         }
     }
@@ -334,7 +347,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     private func tick() {
         lock.lock()
-        guard timer != nil, mediaLimit.map({ mediaTime - boundary < $0 - 1e-9 }) ?? true else {
+        guard timer != nil || manualRunning, mediaLimit.map({ mediaTime - boundary < $0 - 1e-9 }) ?? true else {
             lock.unlock()
             return
         }
@@ -376,6 +389,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
             advanceIO(to: time - boundary)
             if !builtinStopped { outs.append(feed.accept(wav, source: .builtin, at: time)) }
             if let headset = headsetChunk(offset: time - boundary, wav: wav) {
+                if scenario == .scoTornDown250ms {
+                    // v1.12 (L2): IO observed again discharges the stopped engine's obligation.
+                    ioGuard.headsetFrames(headset.count, peak: headset.reduce(Float(0)) { max($0, abs($1)) },
+                                          at: time - boundary + 0.1)
+                    _ = ioGuard.observe(at: time - boundary + 0.1, engineRunning: true)
+                }
                 outs.append(feed.accept(headset, source: .headset, at: time))
             }
             for out in outs {
@@ -447,6 +466,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             t.cancel()
             timer = nil
         }
+        manualRunning = false
         let captured = buffer
         buffer.removeAll()
         firstBufferFired = false
@@ -469,9 +489,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
             }
             stats.ioOps = ioGuard.note
             stats.ioHeld = ioGuard.heldNote
-            stats.carrier = feed.bridge.carrierNote(endMs: stats.recordingMs)
-            stats.headsetCarriedMs = feed.bridge.headsetCarriedMs(endMs: stats.recordingMs)
+            stats.carrier = feed.timeline.carrierIntervals(endMs: stats.recordingMs)
+            stats.headsetCarriedMs = feed.timeline.headsetIntervalMs(endMs: stats.recordingMs)
             stats.captureIntervalsTruncated = feed.evidence.truncated
+            stats.carrierFrames = feed.timeline.framesNote
             feed.cancel()
             remainder = pendingPCM
             pendingPCM.removeAll()
