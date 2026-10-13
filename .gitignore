@@ -6,3 +6,4 @@
 build.env
 Resources/vocab-hints.txt
 .swarm/
+tools/fixtures/voice/
