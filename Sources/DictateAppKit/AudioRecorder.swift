@@ -227,7 +227,10 @@ public final class AudioRecorder: CaptureEngine {
             if let reason { AppController.note("bridge_src=none reason=\(reason)") }
             return
         }
-        unit.onFrames = { [weak self] chunk, time, _ in
+        // v1.12 (L1): per-callback identity — the unit stamps every callback with the epoch it was
+        // started for; a reused unit's late callback from an earlier session never enters this one.
+        unit.onFrames = { [weak self] chunk, time, stamped in
+            guard stamped === epoch else { return }
             self?.acceptConverted(chunk, at: time, source: .builtin, epoch: epoch)
         }
         unit.onDeviceLost = { [weak self] _ in
@@ -850,7 +853,7 @@ public final class AudioRecorder: CaptureEngine {
             self.teardownEngine()
             return self.lock.withLock { self.engine == nil }
         }, isRunningSomewhere: {
-            device.flatMap { AudioDevices.isRunningSomewhere($0) }
+            device.flatMap { self.route.isRunningSomewhere($0) }
         }, sleep: { Thread.sleep(forTimeInterval: $0) }, start: {
             guard self.lock.withLock({ self.engineEpoch === epoch }) else { throw CancellationError() }
             self.verifyFrames(epoch: epoch, since: ProcessInfo.processInfo.systemUptime, path: path)    // armed before the start
@@ -1027,10 +1030,14 @@ public final class AudioRecorder: CaptureEngine {
             tapEpoch = token
             return headsetUnit!
         }
-        unit.onFrames = { [weak self] chunk, time, _ in
+        unit.onFrames = { [weak self] chunk, time, stamped in
+            guard stamped === epoch else { return }
             self?.acceptConverted(chunk, at: time, source: .headset, epoch: epoch, tap: token)
         }
-        unit.onEvent = { [weak self] event, _ in self?.headsetUnitEvent(event, epoch: epoch, token: token) }
+        unit.onEvent = { [weak self] event, stamped in
+            guard stamped === epoch else { return }
+            self?.headsetUnitEvent(event, epoch: epoch, token: token)
+        }
         do {
             try ioOp(.start) { try unit.start(deviceUID: uid, epoch: epoch) }
         } catch {
