@@ -104,6 +104,9 @@ public final class AppController {
     private func takeSessionForOutcome() -> SessionEnd? {
         takeOpenSession() ?? consumeFinishing(generation)
     }
+    /// v1.14: the unattended rig's trigger watcher and paste sink. nil (off) unless a host enabled it
+    /// with a launch environment carrying DICTATE_RIG=1 (`engineEnableRig`).
+    private(set) var rig: RigWatcher?
     /// Tests: this controller's session/failure notes (the process-wide note sink is shared).
     var onSessionNote: ((String) -> Void)?
     private func sessionNote(_ line: String) {
@@ -206,6 +209,10 @@ public final class AppController {
             retryTapUntilGranted()
         }
         if !trusted { watchAccessibilityGrant() }
+        // v1.14: the rig's chord takes the hotkey's own path (inert without DICTATE_RIG=1 at launch).
+        _ = engineEnableRig(launchEnvironment: ProcessInfo.processInfo.environment) { [weak self] gesture in
+            MainActor.assumeIsolated { self?.facade.handle(gesture == .tap ? .tap : .doubleTap) }
+        }
         AppController.note(keepWarm == nil ? "keepwarm=off" : "keepwarm=on interval_s=\(Int(GroqKeepWarm.interval)) idle_cap_s=\(Int(GroqKeepWarm.idleCap))")
         if fakeTranscript == nil {
             warmLocalModel()
@@ -253,6 +260,17 @@ public final class AppController {
         doubleTap()
     }
     func engineFinish() { finishButton() }
+    /// v1.14: turns the rig on only when `launchEnvironment` enables it (RigConfig); otherwise nothing
+    /// is created, watched or redirected and this returns false.
+    func engineEnableRig(launchEnvironment: [String: String], gesture: @escaping (RigGesture) -> Void) -> Bool {
+        guard rig == nil else { return true }
+        guard let config = RigConfig.fromLaunchEnvironment(launchEnvironment) else { return false }
+        let watcher = RigWatcher(config: config, note: { AppController.note($0) }, gesture: gesture)
+        rig = watcher
+        watcher.start()
+        AppController.note("rig=on")
+        return true
+    }
     /// Tests: a finish before the mic start completes is discarded by design (BT3); wait this out.
     var micStartPending: Bool { micStarting }
     /// The explicit URL wins; else a non-empty `DICTATE_INJECT_WAV` path.
@@ -875,6 +893,21 @@ public final class AppController {
                         cleanup_ms: report.cleanupMs, chunks: report.chunks, path: report.path,
                         cleanup_mode: policy.usesCleanup ? report.cleanupMode : "none", fallback: policy.fallbackLabel)
                     policy.deliver(text, transcript: { self.engineOnTranscript?($0, publicTimeline) }, paste: { text in
+                        // v1.14: under the rig the paste goes to the row's file, never to the frontmost app.
+                        if let rig = self.rig {
+                            let row = rig.row ?? "none"
+                            do {
+                                try RigSink.write(text, row: row, config: rig.config)
+                                Self.note("rig_sink=file row=\(row) chars=\(text.count)")
+                                self.showOutcome(.ok)
+                                self.appendLog(entry(text.count, "rig", .ok), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
+                            } catch {
+                                Self.note("rig_sink=error row=\(row)")
+                                self.showOutcome(.held("rig_sink"), text: text)
+                                self.appendLog(entry(text.count, "rig", .held("rig_sink")), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
+                            }
+                            return
+                        }
                         self.inserter.insert(text, shouldInsert: {
                             let now = self.currentTarget()
                             let app = now?.bundleID ?? ""
@@ -1134,7 +1167,7 @@ public final class AppController {
         if let entry {
             line += " duration_ms=\(Int((entry.durationSeconds * 1000).rounded())) bytes=\(entry.audioBytes) chars=\(entry.chars)"
         }
-        sessionNote(line + " " + stats.sessionEndFields)
+        sessionNote(line + " " + stats.sessionEndFields + (rig.map { " rig=1 rig_row=\($0.row ?? "none")" } ?? ""))
     }
 
     private func traceFocus(_ event: String) {

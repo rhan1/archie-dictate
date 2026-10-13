@@ -424,6 +424,26 @@ if args.count >= 4, args[1] == "hatch" {
     }
     exit(0)
 }
+// rig-play <wav> [--level-dbfs -12] [--fake] (v1.14): the unattended rig's speaker — the clip through the
+// BUILT-IN output bound by UID on a private engine, peak at the given dBFS; never the default output, never
+// the volume. --fake (the dry run) looks up no device and constructs no engine: engine_opened=0.
+if args.count >= 3, args[1] == "rig-play" {
+    var level = -12.0, fake = false
+    var rest = Array(args.dropFirst(3))
+    while let flag = rest.first {
+        rest.removeFirst()
+        switch flag {
+        case "--fake": fake = true
+        case "--level-dbfs":
+            guard let value = rest.first.flatMap(Double.init) else { print("rig_play result=bad_args"); exit(2) }
+            level = value; rest.removeFirst()
+        default: print("rig_play result=bad_args"); exit(2)
+        }
+    }
+    let result = RigSpeaker.play(wav: URL(fileURLWithPath: args[2]), levelDBFS: level, fake: fake)
+    print(result.line)
+    exit(result.outcome == "ok" ? 0 : 1)
+}
 final class PCMBox: @unchecked Sendable {
     private let lock = NSLock()
     private var all: [Int16] = []

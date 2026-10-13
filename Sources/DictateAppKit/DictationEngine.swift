@@ -102,6 +102,15 @@ public struct DictationTimeline: Sendable, Equatable {
     @discardableResult public func recoverStaleMute() -> String? { controller.engineRecoverStaleMute() }
     public func cancel() { controller.engineCancel() }
     public func escape() { controller.engineEscape() }
+    /// v1.14 (test-only): the unattended headset rig (`tools/rig/live-rig.zsh`). Pass the host's own launch
+    /// environment and a `gesture` that does exactly what the host's ⌥ tap (`.tap`) and ⌥⌥ (`.doubleTap`) do.
+    /// Inert by default: unless that environment has DICTATE_RIG=1 and an absolute DICTATE_RIG_DIR it
+    /// creates nothing, watches nothing and returns false. When on, a 0600 `<dir>/trigger` holding
+    /// `chord <row>` performs ⌥⌥, the paste goes to `<dir>/out/<row>.txt`, and session-end lines carry `rig=1`.
+    @discardableResult
+    public func enableRig(launchEnvironment: [String: String], gesture: @escaping @MainActor (RigGesture) -> Void) -> Bool {
+        controller.engineEnableRig(launchEnvironment: launchEnvironment) { g in MainActor.assumeIsolated { gesture(g) } }
+    }
     public func pasteHeld() { controller.enginePasteHeld() }
     public func copyHeld() { controller.engineCopyHeld() }
 
