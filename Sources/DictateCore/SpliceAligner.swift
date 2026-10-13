@@ -37,6 +37,9 @@ public enum SpliceAligner {
     /// lower (a periodic envelope has many equal peaks and gives no estimate).
     public static let minMargin = 0.1
     public static let uniqueBeyond: TimeInterval = 0.03
+    /// Share of the lag candidates that must have built-in audio to meet (early in a dictation the
+    /// largest lags cannot yet).
+    public static let minCoverage = 0.6
 
     public struct Estimate: Equatable, Sendable {
         /// Seconds the headset's content trails its timestamps relative to the built-in's (negative: leads).
@@ -71,9 +74,13 @@ public enum SpliceAligner {
             guard first >= 0, first + hw.count <= b.count else { continue }
             scores.append((lagBins, pearson(hw, b[first..<(first + hw.count)])))
         }
-        guard let top = scores.max(by: { $0.c < $1.c }), top.c >= minCorrelation else { return nil }
+        // Most candidates must have been evaluable, and some rival beyond `uniqueBeyond`: a missing rival
+        // is not evidence of uniqueness (review #9).
+        guard Double(scores.count) >= minCoverage * Double(leadBins + maxBins + 1),
+              let top = scores.max(by: { $0.c < $1.c }), top.c >= minCorrelation else { return nil }
         let away = Int((uniqueBeyond / bin).rounded())
-        let rival = scores.filter { abs($0.lag - top.lag) > away }.map(\.c).max() ?? -1
+        let rivals = scores.filter { abs($0.lag - top.lag) > away }.map(\.c)
+        guard let rival = rivals.max() else { return nil }
         guard top.c - rival >= minMargin else { return nil }
         return Estimate(lag: Double(top.lag) * bin, correlation: top.c)
     }
