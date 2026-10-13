@@ -11,10 +11,14 @@ public final class TextInserter {
     // Accessed only on the main queue, including reentrant completion calls.
     private var pending: [(text: String, shouldInsert: (() -> Bool)?, completion: (() -> Void)?)] = []
     private var inFlight = false
+    /// Runs `work` on the main queue after a delay (v1.12: injectable so tests run on a manual clock).
+    private let schedule: (TimeInterval, @escaping () -> Void) -> Void
 
-    public init(pasteboard: NSPasteboard = .general, postKeystroke: (() -> Void)? = nil) {
+    public init(pasteboard: NSPasteboard = .general, postKeystroke: (() -> Void)? = nil,
+                schedule: ((TimeInterval, @escaping () -> Void) -> Void)? = nil) {
         self.pasteboard = pasteboard
         self.postKeystroke = postKeystroke ?? TextInserter.postCommandV
+        self.schedule = schedule ?? { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) }
     }
 
     /// Pastes `text` verbatim at the cursor of the frontmost app. `completion`
@@ -43,7 +47,7 @@ public final class TextInserter {
         pasteboard.setString(text, forType: .string)
         let ourChangeCount = pasteboard.changeCount
         postKeystroke()
-        DispatchQueue.main.asyncAfter(deadline: .now() + TextInserter.restoreDelay) {
+        schedule(TextInserter.restoreDelay) {
             saved.restore(to: self.pasteboard, ifUnchangedSince: ourChangeCount)
             completion?()
             self.inFlight = false
