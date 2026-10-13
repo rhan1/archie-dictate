@@ -94,5 +94,13 @@ A host that runs its own capture session (Archie's ⌘⌘ conversation) uses `Au
 - `stats: AudioRecorder.CaptureStats`: `bridgeSource`, `bridgeMs`, `ioOps`, `ioHeld`, `speechSections`, `recordingMs` (plus, v1.11, `carrier`, `headsetCarriedMs`, `captureIntervalsTruncated`, `kind`).
 - `kind: CaptureKind` (`.dictation` default, `.conversation`): a label set before `startAsync`. Capture is identical; `stats.sessionEndFields` begins `kind=…`, so a host writing `session=<id> event=end outcome=… ` + `stats.sessionEndFields` logs the same line Dictate does.
 
-The muter, the refusal of a second capture and the arbitration between hosts' features live in the host.
+The muter and the arbitration between a host's own features live in the host.
+
+### v1.12 additions (the contract above is unchanged)
+
+- **One capture owner per process.** `startAsync` acquires the process-wide `CaptureLeaseBroker` lease (kind = `kind`). It throws `CaptureLeaseBroker.Refusal.busy(holder:)` when another capture (any `AudioRecorder` in the process, e.g. the host's dictation while a conversation runs) is live — map it to your own refusal (`prestart_skipped=…`) — and `.releasePending(holder:)` when the previous owner's hardware release did not complete within 2.0 s. While a release is pending it waits; the first waiter is admitted once the hardware acknowledged.
+- `stop()` still returns at once. `await recorder.awaitRelease()` (`CaptureLease.State?`: `.released`, or `.quarantined` when the teardown never completed) is the boundary after which another feature may treat the microphone as free. Do not treat `stop()` returning as that boundary.
+- `currentLease: CaptureLease?`: `claimMute()` (only the active lease may own the media mute; relinquished at release), `grantNote`, `note`.
+- `init(headsetBackend: HeadsetBackend)` (`.engine` default, `.auhal` = the explicit-device AUHAL headset client; otherwise `DICTATE_HEADSET_BACKEND`). Experimental until the live A/B (`tools/live-ab-protocol.md`).
+- `stats` adds `carrierFrames`, `lease`, `instrumentation`; `stats.sessionEndFields` appends them after `io_held=…`, and `ioOps`/`ioHeld` carry the v1.12 split (`attempted/completed/failed/framework`, `io_obligations=`).
 
