@@ -9,6 +9,10 @@ import DictateCore
 /// v1.8: an independent 100 ms health clock (L2) watches every carrying source and ends a
 /// dictation that hears nothing with `mic_dead`; one Bluetooth recovery episode (L3) admits
 /// every headset restart; PCM leaves the state lock in sequence order (GPT-6 B1).
+/// v1.11 (L2): what a capture session is for, as written on its session-end line. Labels only:
+/// a conversation captures exactly like a dictation.
+public enum CaptureKind: String, Sendable { case dictation, conversation }
+
 public final class AudioRecorder: CaptureEngine {
     public static let sampleRate: Double = 24_000
     /// 100 ms of pcm16 per streamed chunk (v1.1 A1).
@@ -42,6 +46,7 @@ public final class AudioRecorder: CaptureEngine {
         /// v1.7: the headset went digital-zero mid-dictation and the built-in took over again.
         public var bridgeSwitchback = 0
         /// v1.7: the one headset restart's result (`signal` | `still_silent`), when one ran.
+        /// v1.11 (L4): `skipped` when it was requested but never ran.
         public var headsetRestart: String?
         /// v1.8: kept sample-time intervals (ms from the recording boundary) and speech sections.
         public var captureIntervals = "none"
@@ -53,8 +58,35 @@ public final class AudioRecorder: CaptureEngine {
         /// ones the hands-off window held back (`HeadsetIOGuard`).
         public var ioOps = HeadsetIOGuard(bluetooth: false).note
         public var ioHeld = HeadsetIOGuard(bluetooth: false).heldNote
+        /// v1.11 (L4): the carrying source over time (`builtin:0-1106,headset:1106-15110`, ms from
+        /// the second tap) and the ms the Bluetooth headset carried.
+        public var carrier = "none"
+        public var headsetCarriedMs = 0
+        /// v1.11 (L4): `capture_intervals` hit CaptureEvidence's cap; its last interval absorbed the
+        /// rest, so it is not coverage.
+        public var captureIntervalsTruncated = false
+        /// v1.11 (L2): the session's kind (the recorder's `kind` when it stopped).
+        public var kind: CaptureKind = .dictation
         public init() {}
+
+        /// The capture part of the session-end line (counts only), shared by Dictate and hosts:
+        /// `kind=… recording_ms=… capture_intervals=… [capture_intervals_truncated=1] speech_sections=…
+        /// builtin_frames_after_fallback=… [builtin_backend=…] carrier=… headset_carried_ms=… io_ops=… io_held=…`.
+        public var sessionEndFields: String {
+            var line = "kind=\(kind.rawValue) recording_ms=\(recordingMs) capture_intervals=\(captureIntervals)"
+            if captureIntervalsTruncated { line += " capture_intervals_truncated=1" }
+            line += " speech_sections=\(speechSections) builtin_frames_after_fallback=\(builtinFramesAfterFallback)"
+            if let backend = builtinBackend { line += " builtin_backend=\(backend)" }
+            line += " carrier=\(carrier) headset_carried_ms=\(headsetCarriedMs)"
+            return line + " \(ioOps) \(ioHeld)"
+        }
     }
+    /// v1.11 (L2): set by a host before `startAsync`; written as `kind=` on the session-end line.
+    public var kind: CaptureKind {
+        get { lock.withLock { captureKind } }
+        set { lock.withLock { captureKind = newValue } }
+    }
+    private var captureKind: CaptureKind = .dictation
     public private(set) var stats = CaptureStats()
     /// Called on the main queue when the first headset buffer arrives after `start()`
     /// (a Bluetooth headset can take ~1.6 s to deliver it).
@@ -942,6 +974,10 @@ public final class AudioRecorder: CaptureEngine {
             if engine != nil { ioGuard.record(.stop) }
             stats.ioOps = ioGuard.note
             stats.ioHeld = ioGuard.heldNote
+            stats.carrier = feed.bridge.carrierNote(endMs: stats.recordingMs)
+            stats.headsetCarriedMs = feed.bridge.headsetCarriedMs(endMs: stats.recordingMs)
+            stats.captureIntervalsTruncated = feed.evidence.truncated
+            stats.kind = captureKind
         }
         let restartResult = live ? feed.bridge.restart?.result : nil
         feed.cancel() // a lone tap's ring is discarded here
