@@ -118,6 +118,8 @@ public struct CaptureFeed {
     public private(set) var ring: CaptureRing
     public private(set) var health = CaptureHealth()
     public private(set) var evidence = CaptureEvidence()
+    /// v1.12 (L1): which source carried every kept frame (the session line's `carrier=`).
+    public private(set) var timeline = SourceTimeline()
     /// While the headset carries, the built-in's latest frames wait here so a switchback
     /// resumes exactly where the headset stopped (the buffer that crossed the switch
     /// arrived before the decision). 1.5 s covers the stale-headset wait (1.0 s) plus one buffer.
@@ -134,6 +136,8 @@ public struct CaptureFeed {
         standby.removeAll()
         health = CaptureHealth()
         evidence = CaptureEvidence()
+        timeline = SourceTimeline()
+        timeline.headsetLabel = defaultInput == .bluetooth ? "headset" : "default_input"
     }
 
     /// The owner asked a source's hardware to start (its startup grace runs from here).
@@ -180,7 +184,7 @@ public struct CaptureFeed {
         }
         let fed = trimmed.prefix(decision.framesToFeed)
         output.frames = Array(fed)
-        keep(fed, at: time + Double(decision.dropFrames) / CaptureRing.sampleRate, arrivedAt: now)
+        keep(fed, source: source, at: time + Double(decision.dropFrames) / CaptureRing.sampleRate, arrivedAt: now)
         if source == .builtin, bridge.canSwitchBack || decision.event == .switchback {
             standby.append(frames, at: time)
         }
@@ -193,10 +197,12 @@ public struct CaptureFeed {
         frames.reduce(Float(0)) { max($0, abs($1)) }
     }
 
-    /// Frames that entered the dictation: evidence + useful-delivery time.
-    private mutating func keep(_ frames: ArraySlice<Float>, at time: TimeInterval, arrivedAt: TimeInterval) {
+    /// Frames that entered the dictation: evidence, the source timeline + useful-delivery time.
+    private mutating func keep(_ frames: ArraySlice<Float>, source: CaptureBridge.Source, at time: TimeInterval,
+                               arrivedAt: TimeInterval) {
         guard bridge.isRecording, !frames.isEmpty else { return }
         evidence.append(frames, at: time)
+        timeline.append(source, frames: frames.count, at: time)
         health.kept(at: arrivedAt, peak: Self.peak(frames))
     }
 
@@ -208,7 +214,7 @@ public struct CaptureFeed {
         bridge.resumedBuiltin(frames: resumed.count, through: end)
         let start = end - Double(resumed.count) / CaptureRing.sampleRate
         if bridge.isRecording {
-            keep(resumed[...], at: start, arrivedAt: arrivedAt ?? end)
+            keep(resumed[...], source: .builtin, at: start, arrivedAt: arrivedAt ?? end)
             return resumed
         }
         ring.append(resumed, at: start)
@@ -237,8 +243,12 @@ public struct CaptureFeed {
         bridge.recordingStarted(at: time, preRoll: preRoll, keptFrames: kept.count)
         health.recordingStarted(at: time)
         evidence.start(at: time)
+        timeline.start(at: time)
         if let end, !kept.isEmpty {
-            keep(kept[...], at: end - Double(kept.count) / CaptureRing.sampleRate, arrivedAt: time)
+            // The ring holds what the arbitration fed before the boundary: the carrying source's
+            // frames (a handover inside the 150 ms pre-roll is attributed to the source at the boundary).
+            keep(kept[...], source: carrying ?? .builtin, at: end - Double(kept.count) / CaptureRing.sampleRate,
+                 arrivedAt: time)
         }
         return kept
     }

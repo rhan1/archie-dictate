@@ -67,22 +67,68 @@ struct InsertionTests {
         #expect(pb.string(forType: .string) == "ORIGINAL")
     }
 
-    @Test func recipientReadsDictationAfter600Milliseconds() async {
+    /// v1.12 (L4): the restore window on a manual main-queue clock — a recipient that reads the
+    /// clipboard 600 ms after ⌘V gets the dictation, whatever the machine load; the original is back
+    /// exactly at `restoreDelay`.
+    final class ManualMainScheduler: @unchecked Sendable {
+        private(set) var now: TimeInterval = 0
+        private(set) var items: [(at: TimeInterval, work: () -> Void)] = []
+        func schedule(_ delay: TimeInterval, _ work: @escaping () -> Void) { items.append((now + delay, work)) }
+        /// Runs every item due by `t` in time order (call on the main queue).
+        func advance(to t: TimeInterval) {
+            while let index = items.indices.filter({ items[$0].at <= t + 1e-9 }).min(by: { items[$0].at < items[$1].at }) {
+                let item = items.remove(at: index)
+                now = item.at
+                item.work()
+            }
+            now = t
+        }
+    }
+
+    @MainActor @Test func recipientReadsDictationAfter600Milliseconds() async {
         let pb = seededPasteboard()
         defer { pb.releaseGlobally() }
+        let clock = ManualMainScheduler()
         var slowReader: String?
         let inserter = TextInserter(pasteboard: pb, postKeystroke: {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                slowReader = pb.string(forType: .string)
-            }
-        })
+            clock.schedule(0.6) { slowReader = pb.string(forType: .string) }
+        }, schedule: clock.schedule)
         inserter.insert("DICTATION")
-        try? await Task.sleep(nanoseconds: 750_000_000)
+        for _ in 0..<500 where clock.items.count < 2 { await Task.yield(); try? await Task.sleep(nanoseconds: 1_000_000) }
+        #expect(clock.items.count == 2)                       // the reader and the restore, nothing ran yet
+        clock.advance(to: 0.6)
         #expect(slowReader == "DICTATION")
-        // Wait for the restore as well, so no callback outlives this pasteboard.
-        try? await Task.sleep(nanoseconds: 400_000_000)
+        clock.advance(to: TextInserter.restoreDelay - 0.001)
+        #expect(pb.string(forType: .string) == "DICTATION")
+        clock.advance(to: TextInserter.restoreDelay)
         #expect(pb.string(forType: .string) == "ORIGINAL")
     }
+
+    /// RED twin: the v1.11 wall-clock form under a 1.2 s stall of the queue the restore window runs
+    /// on (a private queue standing in for a loaded main queue — never stall the shared main queue
+    /// in a parallel suite): the 750 ms wall-clock wait elapses before the 600 ms reader could run.
+    @Test func recipientReadsDictationAfter600MillisecondsRealClockUnderStallRed() async {
+        let pb = seededPasteboard()
+        defer { pb.releaseGlobally() }
+        let box = ReaderBox()
+        let loaded = DispatchQueue(label: "insertion-tests.loaded")
+        let inserter = TextInserter(pasteboard: pb, postKeystroke: {
+            loaded.asyncAfter(deadline: .now() + 0.6) { box.value = pb.string(forType: .string) }
+            loaded.asyncAfter(deadline: .now() + 0.1) { Thread.sleep(forTimeInterval: 1.2) }   // the stall: busy 0.1–1.3 s
+        }, schedule: { delay, work in loaded.asyncAfter(deadline: .now() + delay, execute: work) })
+        inserter.insert("DICTATION")
+        let seen = await Task.detached { () -> String? in
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            return box.value
+        }.value
+        withKnownIssue("a loaded queue breaks the wall-clock reader bound") {
+            #expect(seen == "DICTATION")
+        }
+        loaded.sync {}                                         // no callback outlives this pasteboard
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        loaded.sync {}
+    }
+    final class ReaderBox: @unchecked Sendable { var value: String? }
 }
 
 /// F1 initially has no helper to call. Check the actual controller's contract

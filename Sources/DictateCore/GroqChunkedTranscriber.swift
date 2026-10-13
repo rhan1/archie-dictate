@@ -124,6 +124,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let client: TranscriptionClient
     private let vocabulary: String
     private let hedgeAfterMs: Int
+    private let clock: any DictateClock
     private let finalSplitSeconds: Double?
     private let leadIn: String
     private let finalModel: String?
@@ -166,12 +167,14 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = false,
                 edgeGuard: Bool = true,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil,
-                onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil) {
+                onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
+                clock: any DictateClock = SystemClock()) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
         self.client = client
         self.hedgeAfterMs = max(0, hedgeAfterMs)
+        self.clock = clock
         self.finalSplitSeconds = finalSplitSeconds
         // Cap only vocabulary: preserve the lead-in and the bounded previous tail.
         vocabulary = String(prompt.prefix(Vocabulary.maxPromptLength))
@@ -284,9 +287,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         let primary = Task.detached { [self] in
             continuation.yield(.response(1, await send(request)))
         }
-        let timer: Task<Void, Never>? = hedged ? Task.detached { [hedgeAfterMs] in
+        let timer: Task<Void, Never>? = hedged ? Task.detached { [clock, hedgeAfterMs] in
             do {
-                try await Task.sleep(for: .milliseconds(hedgeAfterMs))
+                try await clock.sleep(until: clock.now().advanced(by: .milliseconds(hedgeAfterMs)))
                 if !Task.isCancelled { continuation.yield(.hedge) }
             } catch {}
         } : nil
