@@ -69,8 +69,11 @@ struct MicDeadRecorderTests {
     }
 
     /// Runs a scenario at 20× until it fails or `mediaSeconds` of media time pass.
+    /// v1.12 (L4): stepped on the media clock (`manualPacing`) — no wall-clock deadline, so machine
+    /// load cannot cut a scenario short. `pcmStall` blocks every PCM callback (the RED twin's load).
     private func run(_ scenario: WAVInjectedRecorder.Scenario, mediaSeconds: Double, legacy: Bool = false,
-                     ioPolicy: WAVInjectedRecorder.IOPolicy = .v110) async throws
+                     ioPolicy: WAVInjectedRecorder.IOPolicy = .v110, realClock: Bool = false,
+                     pcmStall: TimeInterval = 0) async throws
         -> (failure: CaptureFailure?, notes: [String], pcm: [Int16], wav: [Int16], stats: AudioRecorder.CaptureStats) {
         // Longer than any run: the WAV's trailing zeros must never be what the clock sees.
         let (dir, url) = try wav(seconds: 7)
@@ -83,13 +86,27 @@ struct MicDeadRecorderTests {
         var failure: CaptureFailure?
         recorder.note = { notes.add($0) }
         recorder.mediaLimit = mediaSeconds + 0.2          // never past the 7 s WAV, however late stop() runs
-        recorder.onPCMChunk = { chunk in pcmLock.withLock { pcm += chunk } }
-        recorder.onCaptureFailure = { failure = $0 }
+        recorder.onPCMChunk = { chunk in
+            if pcmStall > 0 { Thread.sleep(forTimeInterval: pcmStall) }
+            pcmLock.withLock { pcm += chunk }
+        }
+        let failed = Lines()
+        recorder.onCaptureFailure = { failure = $0; failed.add("failed") }
+        recorder.manualPacing = !realClock
         try recorder.start()
         recorder.resetCapture()
-        let deadline = ContinuousClock.now + .milliseconds(Int(mediaSeconds * 50) + 3_000)
-        while failure == nil, pcmLock.withLock({ pcm.count }) < Int(mediaSeconds * 24_000), ContinuousClock.now < deadline {
-            try await Task.sleep(nanoseconds: 2_000_000)
+        if realClock {
+            // v1.11's wall-clock harness (the RED twin): a deadline in real time.
+            let deadline = ContinuousClock.now + .milliseconds(Int(mediaSeconds * 50) + 3_000)
+            while failure == nil, pcmLock.withLock({ pcm.count }) < Int(mediaSeconds * 24_000), ContinuousClock.now < deadline {
+                try await Task.sleep(nanoseconds: 2_000_000)
+            }
+        } else {
+            for _ in 0..<Int(mediaSeconds * 10 + 0.5) {
+                recorder.step()
+                await MainActor.run {}                     // the failure callback hops to main
+                if !failed.snapshot.isEmpty { break }
+            }
         }
         _ = recorder.stop()
         return (failure, notes.snapshot, pcmLock.withLock { pcm }, Self.tone(seconds: 7), recorder.stats)
@@ -124,6 +141,21 @@ struct MicDeadRecorderTests {
         #expect(!result.notes.contains { $0.hasPrefix("headset_restart=") })
         #expect(result.stats.bridgeSource == "builtin")             // bridged, then the headset took over
         #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))
+    }
+
+    // v1.12 L4: the same scenario under a 150 ms stall in every PCM callback (machine load). The
+    // stepped harness still sees all 3 s; v1.11's wall-clock harness hits its 3.15 s deadline first.
+    @Test func scoTornDown250msUnderStallSteppedGreen() async throws {
+        let result = try await run(.scoTornDown250ms, mediaSeconds: 3, pcmStall: 0.15)
+        #expect(result.failure == nil)
+        #expect(Array(result.pcm.prefix(3 * 24_000)) == Array(result.wav.prefix(3 * 24_000)))
+    }
+
+    @Test func scoTornDown250msUnderStallRealClockRed() async throws {
+        let result = try await run(.scoTornDown250ms, mediaSeconds: 3, realClock: true, pcmStall: 0.15)
+        withKnownIssue("a starved wall-clock harness stops the scenario before 3 s of media") {
+            #expect(result.pcm.count >= 3 * 24_000)
+        }
     }
 
     // v1.10 L1 RED twin: v1.9's re-attach rebuilt the auto-stopped engine (format mismatch) — a stop
