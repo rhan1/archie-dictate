@@ -61,13 +61,21 @@ private actor ChunkTransport: HTTPTransport {
 private actor HedgeTransport: HTTPTransport {
     enum Plan { case duplicateWins, primaryWins, fast, failures, duplicateFails, primaryFails }
     let plan: Plan
+    private let clock: (any DictateClock)?
     private(set) var requests: [URLRequest] = []
+    private(set) var requestTimes: [Duration] = []
     private(set) var cancelled: Set<Int> = []
-    init(_ plan: Plan) { self.plan = plan }
+    init(_ plan: Plan, clock: (any DictateClock)? = nil) {
+        self.plan = plan
+        self.clock = clock
+    }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let number = requests.count + 1
         requests.append(request)
+        if let manual = clock as? ManualClock {
+            requestTimes.append(manual.elapsed)
+        }
         let delay: Int
         switch plan {
         case .fast: delay = 10
@@ -78,7 +86,13 @@ private actor HedgeTransport: HTTPTransport {
         case .duplicateFails: delay = number == 1 ? 100 : 1
         case .primaryFails: delay = number == 1 ? 70 : 40
         }
-        do { try await Task.sleep(for: .milliseconds(delay)) }
+        do {
+            if let clock {
+                try await clock.sleep(until: clock.now().advanced(by: .milliseconds(delay)))
+            } else {
+                try await Task.sleep(for: .milliseconds(delay))
+            }
+        }
         catch { cancelled.insert(number); throw error }
         let fails = plan == .failures || (plan == .duplicateFails && number == 2) ||
                     (plan == .primaryFails && number == 1)
@@ -338,13 +352,20 @@ struct GroqChunkedTests {
     }
 
     @Test func hedgeFiresOnSlowChunkAndFirstWins() async throws {
-        let transport = HedgeTransport(.duplicateWins)
+        let manual = ManualClock()
+        let transport = HedgeTransport(.duplicateWins, clock: manual)
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
-                                            prompt: "fixture", hedgeAfterMs: 50)
+                                            prompt: "fixture", hedgeAfterMs: 50, clock: manual)
         engine.submit(chunk(0, tag: 1000))
-        let start = ContinuousClock.now
-        let result = await engine.finish()
-        #expect(start.duration(to: .now) < .milliseconds(1_000))
+        let finishTask = Task { await engine.finish() }
+        #expect(await manual.waitForSleepers(2))
+        manual.advance(by: .milliseconds(50))
+        #expect(await manual.waitForSleepers(2))
+        manual.advance(by: .milliseconds(1))
+        let result = await finishTask.value
+        #expect(manual.elapsed < .milliseconds(1_000))
+        let requestTimes = await transport.requestTimes
+        #expect(requestTimes.count >= 2 && requestTimes[1] == .milliseconds(50))
         #expect(result.text == "duplicate")
         #expect(result.hedges == 1)
         #expect(result.hedgeWins == 1)
