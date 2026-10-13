@@ -111,6 +111,18 @@ public struct CaptureEvidence: Sendable {
         }
     }
 
+    /// v1.11 L1: windows that MAY hold speech — above −40 dBFS, or `minContrastDB` over the floor of
+    /// `reference` (the whole dictation so far; never the chunk alone, whose own contrast a key
+    /// click supplies). Deleting text needs the absence of even this; soft words veto a drop.
+    public static func possibleSpeechWindows(_ windows: [Float], reference: [Float]) -> [Bool] {
+        let audible = reference.filter { $0 >= digitalSilenceRMS }.sorted()
+        let floor = audible.isEmpty ? nil : audible[Int((Double(audible.count - 1) * 0.1).rounded(.down))]
+        let threshold = floor.map { $0 * pow(10, minContrastDB / 20) }
+        return windows.map { rms in
+            rms >= speechRMS || (rms >= quietSpeechFloor && threshold.map { rms >= $0 } ?? false)
+        }
+    }
+
     /// The relative speech threshold, or nil when the windows hold no contrast.
     static func relativeThreshold(_ windows: [Float]) -> Float? {
         let audible = windows.filter { $0 >= digitalSilenceRMS }.sorted()
