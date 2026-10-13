@@ -48,11 +48,15 @@ private actor IncrementalTransport: HTTPTransport {
 
 private actor RaceIncrementalTransport: HTTPTransport {
     let midMs: Int
+    private let clock: (any DictateClock)?
     private var count = 0
     private var started = false
     private var cancelled = false
     private var anchorAt: ContinuousClock.Instant?
-    init(midMs: Int) { self.midMs = midMs }
+    init(midMs: Int, clock: (any DictateClock)? = nil) {
+        self.midMs = midMs
+        self.clock = clock
+    }
     func anchor(_ instant: ContinuousClock.Instant) { anchorAt = instant }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         count += 1
@@ -62,8 +66,13 @@ private actor RaceIncrementalTransport: HTTPTransport {
         // so suite load between start and finish cannot shrink the race margin.
         do {
             if mid {
-                while anchorAt == nil { try await Task.sleep(for: .milliseconds(1)) }
-                try await Task.sleep(until: anchorAt! + .milliseconds(midMs))
+                if let clock {
+                    while anchorAt == nil { try await Task.sleep(for: .milliseconds(1)) }
+                    try await clock.sleep(until: anchorAt!.advanced(by: .milliseconds(midMs)))
+                } else {
+                    while anchorAt == nil { try await Task.sleep(for: .milliseconds(1)) }
+                    try await Task.sleep(until: anchorAt! + .milliseconds(midMs))
+                }
             } else { try await Task.sleep(for: .milliseconds(1)) }
         } catch { cancelled = true; throw error }
         let content = mid ? "Send the updated report to the team." :
@@ -89,14 +98,28 @@ private actor RaceIncrementalTransport: HTTPTransport {
 
 private actor SingleProbe {
     let delayMs: Int
+    private let clock: (any DictateClock)?
     private(set) var startedAt: ContinuousClock.Instant?
+    private(set) var startedAtElapsed: Duration?
     private(set) var raw: String?
     private var cancelled = false
-    init(delayMs: Int) { self.delayMs = delayMs }
+    init(delayMs: Int, clock: (any DictateClock)? = nil) {
+        self.delayMs = delayMs
+        self.clock = clock
+    }
     func clean(_ text: String) async -> IncrementalCleaner.SingleResult {
         raw = text
-        startedAt = .now
-        do { try await Task.sleep(for: .milliseconds(delayMs)) }
+        startedAt = clock?.now() ?? .now
+        startedAtElapsed = (clock as? ManualClock)?.elapsed ?? .zero
+        do {
+            if delayMs > 0 {
+                if let clock {
+                    try await clock.sleep(until: clock.now().advanced(by: .milliseconds(delayMs)))
+                } else {
+                    try await Task.sleep(for: .milliseconds(delayMs))
+                }
+            }
+        }
         catch { cancelled = true }
         return .init(text: "Single winner.", label: "ok", model: "fake", stats: nil, calls: 1)
     }
@@ -147,45 +170,59 @@ struct IncrementalCleanupTests {
     }
 
     @Test(arguments: [true, false]) func raceStartsSingleAfter600AndFirstWins(singleWins: Bool) async throws {
-        let transport = RaceIncrementalTransport(midMs: singleWins ? 1_000 : 640)
+        let manual = ManualClock()
+        let transport = RaceIncrementalTransport(midMs: singleWins ? 1_000 : 640, clock: manual)
         let incremental = IncrementalCleaner(cleaner: TranscriptCleaner(
-            transport: transport, vocabulary: "", apiKey: { "hermetic-key" }))
+            transport: transport, vocabulary: "", apiKey: { "hermetic-key" }), clock: manual)
         incremental.append(index: 0, text: chunkText)
         incremental.append(index: 1, text: chunkText)
         try await transport.waitForStart()
         incremental.seal()
         incremental.append(index: 2, text: chunkText)
-        let single = SingleProbe(delayMs: singleWins ? 5 : 1_000)
-        let start = ContinuousClock.now
+        let single = SingleProbe(delayMs: singleWins ? 5 : 1_000, clock: manual)
+        let start = manual.now()
         await transport.anchor(start)
-        let result = await incremental.finish(totalChunks: 3, rawText: chunkText + " " + chunkText + " " + chunkText,
-            single: { raw in await single.clean(raw) })
+        let finishTask = Task {
+            await incremental.finish(totalChunks: 3, rawText: chunkText + " " + chunkText + " " + chunkText,
+                single: { raw in await single.clean(raw) })
+        }
+        #expect(await manual.waitForSleepers(2))
+        manual.advance(by: .milliseconds(599))
+        #expect(await single.startedAtElapsed == nil)
+        manual.advance(by: .milliseconds(1))
+        #expect(await manual.waitForSleepers(2))
+        manual.advance(by: .milliseconds(singleWins ? 10 : 50))
+        let result = await finishTask.value
         #expect(result.mode == (singleWins ? "race_single" : "race_incremental"))
         #expect(result.text == (singleWins ? "Single winner." : "Send the updated report to the team. Send the updated report to the team. Send the updated report to the team."))
         #expect(result.calls == (singleWins ? 2 : 3))
         #expect(result.fallbackReason == "mid_slow_at_finish")
-        #expect(start.duration(to: .now) < .milliseconds(850))
-        let delay = try #require(await single.startedAt)
-        #expect(start.duration(to: delay) >= .milliseconds(580))
+        #expect(manual.elapsed < .milliseconds(850))
+        let delay = try #require(await single.startedAtElapsed)
+        #expect(delay >= .milliseconds(600) && delay < .milliseconds(650))
         #expect(await single.raw == chunkText + " " + chunkText + " " + chunkText)
         if singleWins { try await transport.waitForCancellation() }
         else { try await single.waitForCancellation() }
     }
 
     @Test func failedMidStartsSingleImmediately() async throws {
+        let manual = ManualClock()
         let transport = IncrementalTransport()
-        let incremental = IncrementalCleaner(cleaner: cleaner(transport), raceAfterMs: 30)
+        let incremental = IncrementalCleaner(cleaner: cleaner(transport), raceAfterMs: 30, clock: manual)
         for index in 0..<2 { incremental.append(index: index, text: chunkText) }
         try await transport.wait(1)
         await transport.fail(0)
         await incremental.waitForPending()
         incremental.seal()
         incremental.append(index: 2, text: chunkText)
-        let single = SingleProbe(delayMs: 1)
-        let start = ContinuousClock.now
+        let single = SingleProbe(delayMs: 0, clock: manual)
+        var singleStartedAtElapsed: Duration?
         let result = await incremental.finish(totalChunks: 3, rawText: "full raw fixture",
-            single: { raw in await single.clean(raw) })
-        #expect(start.duration(to: .now) < .milliseconds(150))
+            single: { raw in
+                singleStartedAtElapsed = manual.elapsed
+                return await single.clean(raw)
+            })
+        #expect(singleStartedAtElapsed == .zero)
         #expect(result.mode == "incremental_fallback")
         #expect(result.fallbackReason == "mid_network_timedOut")
         #expect(result.text == "Single winner.")
