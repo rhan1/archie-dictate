@@ -53,6 +53,14 @@ and the session falls back to Apple STT + local cleanup (`fallback=no_key`).
 `peak_dbfs`; `keys=`; `media=`), on any thread, counts only. In a host those lines
 otherwise go to the host's own stderr; tee them into the host's log.
 
+Test-only (v1.14), for `tools/rig/live-rig.zsh`: after wiring the hotkeys, a host may call
+`engine.enableRig(launchEnvironment: ProcessInfo.processInfo.environment) { g in g == .tap ? <your ⌥ tap> : <your ⌥⌥> }`.
+It is inert — returns false, watches nothing, pastes normally — unless the host was launched with
+`DICTATE_RIG=1` and an absolute `DICTATE_RIG_DIR`. When on, a 0600 `<dir>/trigger` holding `chord <row>`
+performs your own ⌥ tap then ⌥⌥ 200 ms later, the text goes to `<dir>/out/<row>.txt` instead of the
+frontmost app, and session-end lines end ` rig=1 rig_row=<row>`. Route the gesture through the same
+handlers your hotkey monitor calls, so the rig exercises the host's real ⌥⌥ path.
+
 A host that mutes media for its own capture can reuse the same mute logic:
 `OutputMuter(device: SystemOutputMute(), stateFile: <its own muted.state>)` — mute FLAG
 only (never volume), verified restore, 5 s settle re-check across Bluetooth profile
