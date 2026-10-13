@@ -9,6 +9,9 @@ public protocol OutputMuteDevice: AnyObject {
     func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation?
     /// v1.9: the same watch, telling which property changed (for the `mute_reapplied` note).
     func observeOutputChanges(uid: String, _ action: @escaping (OutputChange) -> Void) -> CaptureCancellation?
+    /// v1.12.1 (L6): the Bluetooth profile the output's flag currently belongs to (`hfp`, `a2dp`; nil:
+    /// unknown or not Bluetooth). A headset keeps one mute flag per profile.
+    func outputProfile(uid: String) -> String?
 }
 
 /// What changed on the output side while a dictation holds the mute (v1.9 L2).
@@ -19,25 +22,39 @@ public enum OutputChange: String, Sendable {
 public extension OutputMuteDevice {
     func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation? { nil }
     func observeOutputChanges(uid: String, _ action: @escaping (OutputChange) -> Void) -> CaptureCancellation? { nil }
+    func outputProfile(uid: String) -> String? { nil }
 }
 
 /// Owns crash records until restoration is verified and its settle window ends.
 /// All calls, clock callbacks and device notifications must be serialized.
+///
+/// v1.12.1 (L6): RESTORE MAY ONLY UNMUTE. 10-13 15:33 (Archie 42.0, XM6): the headset was already on
+/// HFP when `mute()` read its flag; the HFP-side flag read 1 (a residue of an earlier session), so
+/// prior=1 was owned, `restore()` wrote muted=1 and counted it verified, macOS flipped the A2DP side to
+/// 0, and every settle check logged `restore_failed`; the record `…:output\t1` stayed on disk, every
+/// dictation re-poisoned it, and a host launch would have written muted=1 to the headset. Now an output
+/// that already reads muted is never owned (nothing is written, nothing recorded), a crash record with
+/// prior 1 is dropped unread, and a record taken on another profile than the device's current one is
+/// ignored. The only flag this class ever writes besides the mute itself is 0.
 public final class OutputMuter {
     public enum Event: String, Sendable {
         case muted, restored = "restored(verified)", unmuteRecovered = "mute_recovered=1"
         case unsupported, none, restoreFailed = "restore_failed", muteReasserted = "mute_reasserted=1"
+        /// v1.12.1 (L6): the output already read muted: nothing was written or owned.
+        case alreadyMuted = "already_muted"
         public static var restorePending: Event { .restoreFailed }
     }
 
     private final class State {
         let uid: String
         let prior: Bool
+        /// v1.12.1 (L6): the profile the flag was read on (nil: unknown; legacy two-field records).
+        let profile: String?
         var deadline: TimeInterval?
         var clean = false
         var timers: [CaptureCancellation] = []
         var observation: CaptureCancellation?
-        init(uid: String, prior: Bool) { self.uid = uid; self.prior = prior }
+        init(uid: String, prior: Bool, profile: String? = nil) { self.uid = uid; self.prior = prior; self.profile = profile }
         func cancel() {
             timers.forEach { $0.cancel() }; timers = []
             observation?.cancel(); observation = nil
@@ -80,7 +97,13 @@ public final class OutputMuter {
         guard let uid = device.defaultOutputUID() else { return .none }
         guard let current = device.isMuted(uid: uid) else { return .unsupported }
         let old = settling[uid]
-        let state = State(uid: uid, prior: prior(old, current: current))
+        guard !prior(old, current: current) else {
+            // L6: already muted (the user's flag, or a stale per-profile flag): not ours to restore.
+            // An expired window's record for this output is superseded by what it reads now.
+            if let old { old.cancel(); settling[uid] = nil; persistRemaining() }
+            return .alreadyMuted
+        }
+        let state = State(uid: uid, prior: false, profile: device.outputProfile(uid: uid))
         // Persist before mutating, including other devices still settling.
         var records = settling
         records[uid] = state
@@ -127,7 +150,9 @@ public final class OutputMuter {
         guard let uid = device.defaultOutputUID(), !active.contains(where: { $0.uid == uid }) else { return }
         guard let current = device.isMuted(uid: uid) else { noteUnsupported(uid); return }
         let old = settling[uid]
-        let state = State(uid: uid, prior: prior(old, current: current))
+        // L6: a new default output that already reads muted is left alone and never owned.
+        guard !prior(old, current: current) else { return }
+        let state = State(uid: uid, prior: false, profile: device.outputProfile(uid: uid))
         var records = settling
         records[uid] = state
         active.forEach { records[$0.uid] = $0 }
@@ -185,14 +210,26 @@ public final class OutputMuter {
               FileManager.default.fileExists(atPath: stateFile.path) else { return nil }
         guard let text = try? String(contentsOf: stateFile, encoding: .utf8) else { return .restoreFailed }
         var records: [String: State] = [:]
+        var parsed = Set<String>()
         for line in text.split(separator: "\n") {
             let parts = line.split(separator: "\t", omittingEmptySubsequences: false)
-            guard parts.count == 2, !parts[0].isEmpty, parts[1] == "0" || parts[1] == "1" else { return .restoreFailed }
+            guard parts.count == 2 || parts.count == 3, !parts[0].isEmpty, parts[1] == "0" || parts[1] == "1",
+                  parts.count == 2 || !parts[2].isEmpty else { return .restoreFailed }
             let uid = String(parts[0])
-            guard records[uid] == nil else { return .restoreFailed }
-            records[uid] = State(uid: uid, prior: parts[1] == "1")
+            guard parsed.insert(uid).inserted else { return .restoreFailed }
+            // L6: a crash record may only unmute — prior 1 is dropped, never written back.
+            guard parts[1] == "0" else { continue }
+            let profile = parts.count == 3 ? String(parts[2]) : nil
+            // L6: a record taken on another profile describes another flag: ignored.
+            if let profile, let now = device.outputProfile(uid: uid), now != profile { continue }
+            records[uid] = State(uid: uid, prior: false, profile: profile)
         }
-        guard !records.isEmpty else { return .restoreFailed }
+        guard !parsed.isEmpty else { return .restoreFailed }
+        guard !records.isEmpty else {
+            settling = [:]
+            persistRemaining()
+            return nil
+        }
         settling.values.forEach { $0.cancel() }
         settling = records // Keep all records, including any device that disappeared.
         var verified = true
@@ -277,7 +314,9 @@ public final class OutputMuter {
     private func writeState(_ records: [String: State]) -> Bool {
         do {
             try FileManager.default.createDirectory(at: stateFile.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let text = records.keys.sorted().map { uid in "\(uid)\t\(records[uid]!.prior ? 1 : 0)" }.joined(separator: "\n")
+            let text = records.keys.sorted().map { uid in
+                "\(uid)\t\(records[uid]!.prior ? 1 : 0)" + (records[uid]!.profile.map { "\t\($0)" } ?? "")
+            }.joined(separator: "\n")
             try text.write(to: stateFile, atomically: true, encoding: .utf8)
             return true
         } catch { return false }

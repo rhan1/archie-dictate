@@ -50,6 +50,21 @@ public final class SystemOutputMute: OutputMuteDevice {
         return ok
     }
 
+    /// v1.12.1 (L6): read-only — the profile whose mute flag the output exposes now (`hfp`/`a2dp`).
+    public func outputProfile(uid: String) -> String? {
+        guard let device = device(for: uid) else { return nil }
+        var rateAddr = Self.address(kAudioDevicePropertyNominalSampleRate, scope: kAudioObjectPropertyScopeGlobal)
+        var rate = Float64(0)
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        var transportAddr = Self.address(kAudioDevicePropertyTransportType, scope: kAudioObjectPropertyScopeGlobal)
+        var transport = UInt32(0)
+        var transportSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &rateAddr, 0, nil, &rateSize, &rate) == noErr,
+              AudioObjectGetPropertyData(device, &transportAddr, 0, nil, &transportSize, &transport) == noErr else { return nil }
+        let profile = BluetoothProfile.profile(transport: transport, rate: rate)
+        return profile == "none" ? nil : profile
+    }
+
     /// Watch the muted UID even when it is no longer the default output.
     /// Rebind its rate listener when CoreAudio replaces its object on reconnect.
     public func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation? {

@@ -38,6 +38,9 @@ final class FakeOutput: OutputMuteDevice {
     var onWrite: (() -> Void)?
     var profile = "a2dp"
     var capturedA2DPMute = false
+    /// v1.12.1 (L6): report `profile` as the output's profile (off: unknown, as before).
+    var reportsProfile = false
+    func outputProfile(uid: String) -> String? { reportsProfile ? profile : nil }
     private var observers: [UUID: () -> Void] = [:]
     private var outputObservers: [UUID: (OutputChange) -> Void] = [:]
     private final class Observation: CaptureCancellation {
@@ -119,9 +122,11 @@ struct OutputMuterTests {
         h.out.onWrite = nil
     }
     @Test func priorMutedStaysMuted() {
+        // v1.12.1 (L6): an output that already reads muted is not owned — nothing is written or restored.
         let h = MuteHarness(); h.out.mute["headset"] = true
-        #expect(h.muter.mute() == .muted)
-        #expect(h.muter.restore() == .restored)
+        #expect(h.muter.mute().rawValue == "already_muted")
+        #expect(h.muter.restore() == nil)
+        #expect(h.out.writes.isEmpty)
         h.clock.advance(5)
         #expect(h.out.mute["headset"] == true)
         #expect(!h.exists)
@@ -290,9 +295,12 @@ struct OutputMuterTests {
         h.clock.now = 6 // Expired timers have not run yet; the user mutes now.
         h.out.mute["headset"] = true
         _ = h.muter.mute()
-        #expect(try String(contentsOf: h.file, encoding: .utf8) == "headset\t1")
+        // v1.12.1 (L6): the user's mute is not owned, and the expired window's record is dropped (a
+        // later launch recovery must not unmute it either).
+        #expect(!h.exists)
         _ = h.muter.restore()
         #expect(h.out.mute["headset"] == true)
+        #expect(h.out.writes.count == 2)                                    // the first run's mute and restore only
     }
     @Test func failedLaunchRecoveryCanRetryWhenDeviceReturns() throws {
         let h = MuteHarness()
@@ -360,15 +368,15 @@ struct OutputMuterTests {
     }
     @Test func restoreRestoresEveryUIDInOrder() {
         let h = MuteHarness(); _ = h.muter.mute()
-        h.out.mute["headset-hfp"] = true    // already muted by the user: its prior is kept
+        h.out.mute["headset-hfp"] = true    // already muted by the user: v1.12.1 (L6) never owns it
         h.out.mute["speakers"] = false
         h.out.defaultUID = "headset-hfp"; h.out.notifyOutput(.defaultChanged)
         h.out.defaultUID = "speakers"; h.out.notifyOutput(.defaultChanged)
-        #expect(h.muter.mutedUIDs == ["headset", "headset-hfp", "speakers"])
+        #expect(h.muter.mutedUIDs == ["headset", "speakers"])
         let before = h.out.writes.count
         #expect(h.muter.restore() == .restored)
         let restoreWrites = h.out.writes[before...].map { "\($0.0)=\($0.1)" }
-        #expect(restoreWrites == ["headset=false", "headset-hfp=true", "speakers=false"])
+        #expect(restoreWrites == ["headset=false", "speakers=false"])          // restore may only unmute
         #expect(h.out.mute["headset-hfp"] == true)
         #expect(h.muter.mutedUIDs.isEmpty)
     }
@@ -402,5 +410,103 @@ struct OutputMuterTests {
         h.out.mute["headset"] = false; h.out.notifyOutput(.rateChanged)
         #expect(h.muter.reapplied == 0)
         #expect(h.out.mute["headset"] == false)
+    }
+
+    // MARK: v1.12.1 (L6) — restore may only unmute (10-13 15:33, Archie 42.0, XM6, session 4b18ada4)
+
+    private static let sony = "58-18-62-21-1C-6A:output"
+    private func sonyHarness() -> MuteHarness {
+        let h = MuteHarness()
+        h.out.defaultUID = Self.sony
+        h.out.mute = [Self.sony: false, "speakers": false]
+        return h
+    }
+
+    /// The poisoned record on disk at 15:38 (`muted.state` = `58-18-62-21-1C-6A:output\t1`): a host
+    /// launch must not write muted=1 to the headset; the record is dropped.
+    @Test func launchRecoveryNeverWritesMutedFromAStalePriorOneRecord() throws {
+        let h = sonyHarness()
+        try "\(Self.sony)\t1".write(to: h.file, atomically: true, encoding: .utf8)
+        let event = h.muter.recoverIfNeeded()
+        #expect(!h.out.writes.contains { $0.1 == true })
+        #expect(h.out.mute[Self.sony] == false)
+        #expect(event == nil)
+        #expect(!h.exists)
+    }
+
+    /// 15:33:06: the headset is already on HFP and its HFP-side flag reads 1 when `mute()` runs. v1.12
+    /// owned prior=1, restore wrote muted=1 (29.121 `Set muteControl … to 1`) and the A2DP return to 0
+    /// logged `restore_failed` ×4. Now nothing is owned or written and the settle window stays silent.
+    @Test func alreadyMutedHFPFlagIsNeverOwnedNorRestoredToMuted() {
+        let h = sonyHarness()
+        h.out.profile = "hfp"; h.out.reportsProfile = true
+        h.out.mute[Self.sony] = true                                        // stale HFP-side flag
+        #expect(h.muter.mute().rawValue == "already_muted")
+        #expect(h.muter.restore() == nil)
+        #expect(!h.out.writes.contains { $0.1 == true })
+        h.out.profile = "a2dp"; h.out.mute[Self.sony] = false; h.out.notifyChange()   // the A2DP return (29.428 → 0)
+        h.clock.advance(5)
+        #expect(!h.events.contains(.restoreFailed))
+        #expect(!h.exists)
+    }
+
+    /// Every later dictation re-poisoned itself: `mute()` ran `recoverIfNeeded()` on the stale record
+    /// first. Now the only true write is the mute itself, and the end leaves the output audible.
+    @Test func dictationWithAStaleRecordMutesOnceAndRestoresAudible() throws {
+        let h = sonyHarness()
+        try "\(Self.sony)\t1".write(to: h.file, atomically: true, encoding: .utf8)
+        #expect(h.muter.mute() == .muted)
+        #expect(h.out.writes.filter { $0.1 == true }.count == 1)            // the mute, nothing else
+        #expect(h.muter.restore() == .restored)
+        #expect(h.out.mute[Self.sony] == false)
+        h.clock.advance(5)
+        #expect(!h.events.contains(.restoreFailed))
+        #expect(!h.exists)
+        #expect(h.out.writes.last.map { $0.1 } == false)
+    }
+
+    /// A new default output that already reads muted mid-dictation is left alone (never owned).
+    @Test func reassertNeverOwnsAnAlreadyMutedNewOutput() throws {
+        let h = sonyHarness()
+        #expect(h.muter.mute() == .muted)
+        h.out.mute["speakers"] = true
+        h.out.defaultUID = "speakers"; h.out.notifyOutput(.defaultChanged)
+        #expect(!h.out.writes.contains { $0.0 == "speakers" })
+        #expect(h.muter.mutedUIDs == [Self.sony])
+        #expect(try String(contentsOf: h.file, encoding: .utf8) == "\(Self.sony)\t0")
+        #expect(h.muter.restore() == .restored)
+        #expect(!h.out.writes.contains { $0.0 == "speakers" })
+        #expect(h.out.mute["speakers"] == true)
+    }
+
+    /// The record names the profile it was taken on; across a profile change it describes another flag.
+    @Test func recordCarriesItsProfileAndIsIgnoredAcrossAProfileChange() throws {
+        let h = sonyHarness()
+        h.out.profile = "hfp"; h.out.reportsProfile = true
+        #expect(h.muter.mute() == .muted)
+        #expect(try String(contentsOf: h.file, encoding: .utf8) == "\(Self.sony)\t0\thfp")
+        // Crash. The next launch finds the headset on A2DP with its (other) flag muted by the user.
+        h.out.profile = "a2dp"; h.out.mute[Self.sony] = true
+        let writes = h.out.writes.count
+        let relaunched = OutputMuter(device: h.out, stateFile: h.file, clock: h.clock, retryWait: { _ in })
+        #expect(relaunched.recoverIfNeeded() == nil)
+        #expect(h.out.writes.count == writes)
+        #expect(h.out.mute[Self.sony] == true)
+        #expect(!h.exists)
+    }
+
+    /// Regression: a flag that reads 0 at the start returns to 0 with no `restore_failed`, also across
+    /// the HFP → A2DP return.
+    @Test func unmutedStartRestoresToUnmutedWithoutRestoreFailed() throws {
+        let h = sonyHarness()
+        h.out.profile = "hfp"; h.out.reportsProfile = true
+        #expect(h.muter.mute() == .muted)
+        #expect(h.muter.restore() == .restored)
+        #expect(h.out.mute[Self.sony] == false)
+        h.out.flip(after: 0.3, clock: h.clock, to: "a2dp")
+        h.clock.advance(5)
+        #expect(h.out.mute[Self.sony] == false)
+        #expect(!h.events.contains(.restoreFailed))
+        #expect(!h.exists)
     }
 }
