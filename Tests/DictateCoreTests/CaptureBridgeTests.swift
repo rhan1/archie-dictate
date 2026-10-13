@@ -290,9 +290,16 @@ struct CaptureBridgeTests {
         #expect(events == [.switchback])
         #expect(feed.bridge.switchbacks == 1 && feed.bridge.state == .fallback)
         #expect(feed.bridge.bridgeSource == "builtin")
-        // 10.00 → 13.00 contiguous: the built-in buffer that crossed the switch is replayed.
+        // v1.13 (L1): the built-in witnessed speech, so the switchback replays it from where the headset
+        // went silent (11.03). Nothing the built-in heard is lost; the one zero buffer the headset fed
+        // before the witness completed stays in as inserted silence (v1.12 kept the count at 3 s by
+        // feeding 0.5 s of zeros IN PLACE of the built-in's speech).
         let total = timeline.reduce(0) { $0 + $1.1 }
-        #expect(total == 3 * 24_000)
+        let headsetFed = timeline.filter { $0.0 == .headset }.reduce(0) { $0 + $1.1 }
+        let builtinFed = timeline.filter { $0.0 == .builtin }.reduce(0) { $0 + $1.1 }
+        #expect(headsetFed == 22_320)                                        // 10.20 → 11.13: its signal and one zero buffer
+        #expect(builtinFed == 4_800 + 47_280)                                // 10.00 → 10.20, then 11.03 → 13.00: nothing skipped
+        #expect(total - 3 * 24_000 <= 2_400)                                 // at most one buffer of inserted silence
         #expect(timeline.last?.0 == .builtin)
     }
 
