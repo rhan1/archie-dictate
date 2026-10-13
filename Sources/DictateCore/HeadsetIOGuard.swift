@@ -172,6 +172,18 @@ public struct HeadsetIOGuard: Sendable {
         held += 1
     }
 
+    /// The caller could not perform the `.reattach` because the episode's budget is spent: the
+    /// obligation is terminal for the guard (no re-attach, no escalation — the episode said no)
+    /// and stays open and visible. Without this a declined re-attach was re-offered every tick.
+    public mutating func reattachUnavailable() {
+        guard inFlightSince != nil, reattaches > 0 else { return }
+        reattaches -= 1
+        inFlightSince = nil
+        obligation?.reattached = true
+        obligation?.escalated = true
+        held += 1
+    }
+
     /// The in-flight re-attach's start returned (`started == false`: it threw — the obligation
     /// escalates on the next observation).
     public mutating func reattachFinished(started: Bool, at now: TimeInterval) {

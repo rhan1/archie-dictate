@@ -53,11 +53,14 @@ struct CaptureLeaseRecorderTests {
         let log: Log
         /// When set, `stop()` blocks until it is signalled (a slow hardware release).
         var stopGate: DispatchSemaphore?
+        /// When set, `start` throws it (a device that cannot be opened).
+        var startError: Error?
         private let lock = NSLock()
         private var epoch: CaptureEpoch?
         private var ioRunning = false
         init(_ name: String, _ log: Log) { self.name = name; self.log = log }
         func start(deviceUID: String, epoch: CaptureEpoch) throws {
+            if let startError { log.append("\(name).start.failed"); throw startError }
             lock.withLock { self.epoch = epoch; ioRunning = true }
             log.append("\(name).start uid=\(deviceUID)")
             onEvent?(.started(deviceUID: deviceUID, sampleRate: 16_000, channels: 1), epoch)
@@ -182,6 +185,24 @@ struct CaptureLeaseRecorderTests {
         #expect(recorder.stats.captureIntervals == "0-500")         // continuous from the boundary
         #expect(recorder.stats.carrier == "builtin:0-\(recorder.stats.recordingMs)" && recorder.stats.carrierFrames == "carrier_frames=builtin:0-500")
         #expect(recorder.stats.lease == "lease=2 lease_kind=dictation lease_wait_ms=0")
+    }
+
+    /// Review F2: a host whose startAsync throws (the headset cannot be opened) and that never
+    /// calls stop() must not leave the lease active and the built-in unit running forever.
+    @Test func aFailedStartReleasesTheLeaseAndTheBuiltin() async throws {
+        struct OpenFailed: Error {}
+        let log = Log()
+        let broker = CaptureLeaseBroker()
+        let (failing, _, headset) = Self.recorder("A", log, broker: broker)
+        headset.startError = OpenFailed()
+        await #expect(throws: OpenFailed.self) { try await failing.startAsync(device: .default) }
+        #expect(await failing.awaitRelease() == .released)
+        #expect(broker.holder == nil)
+        #expect(await Self.waitUntil { log.all.contains("A.builtin.stop") })
+        let (other, _, _) = Self.recorder("B", log, broker: broker)
+        try await other.startAsync(device: .default)              // the microphone is free again
+        _ = other.stop()
+        #expect(await other.awaitRelease() == .released)
     }
 
     // MARK: L3 — the AUHAL arm, instrumented like the engine arm

@@ -114,6 +114,18 @@ struct HeadsetIOGuardTests {
         #expect(io.observe(at: 1.1, engineRunning: false) == .reattach)
     }
 
+    /// Review F3: the episode's budget is spent, so the re-attach cannot run — the obligation must
+    /// not be re-offered every 100 ms tick (it stays open and visible instead).
+    @Test func aReattachTheEpisodeCannotAdmitIsNotReofferedEveryTick() {
+        var io = HeadsetIOGuard(bluetooth: true)
+        #expect(io.observe(at: 1.0, engineRunning: false) == .reattach)
+        io.reattachUnavailable()
+        var offered = 0
+        for tick in 1...50 where io.observe(at: 1.0 + Double(tick) * 0.1, engineRunning: false) == .reattach { offered += 1 }
+        #expect(offered == 0)
+        #expect(io.obligation?.reason == .engineStopped && io.reattaches == 0 && io.held == 1)
+    }
+
     @Test func reattachBudgetIsBounded() {
         var io = HeadsetIOGuard(bluetooth: true)
         var given = 0
