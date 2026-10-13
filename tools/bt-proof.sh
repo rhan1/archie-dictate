@@ -256,29 +256,41 @@ esco_analyse() {
         return match(s, "(^|[ \t])" key "=[^ \t\r\n]+") > 0
     }
 
+    BEGIN {
+        RECOVERY_SIGNAL_MAX_MS = 3000
+        FALLBACK_MAX_AFTER_DROP_MS = 2000
+        CAPTURE_INTERVALS_MAX = 400
+    }
+
     {
         t = parse_time($1, $2)
         if (t < 0) next
 
         t_raw = format_raw_time($2)
+        ev_dev = (has_field($0, "device") ? extract_field($0, "device") : "")
 
         if (index($0, "Dropping eSCO creation") > 0) {
             n_drops++
             drop_t[n_drops] = t
             drop_raw[n_drops] = t_raw
             drop_sess[n_drops] = ""
+            drop_dev[n_drops] = ev_dev
         }
 
         if (index($0, "operaton type = Creation") > 0 || index($0, "operation type = Creation") > 0) {
             n_creations++
             creation_t[n_creations] = t
+            creation_raw[n_creations] = t_raw
             creation_sess[n_creations] = ""
+            creation_dev[n_creations] = ev_dev
         }
 
         if (index($0, "bridge_src=builtin_fallback") > 0) {
             n_fallbacks++
             fallback_t[n_fallbacks] = t
+            fallback_raw[n_fallbacks] = t_raw
             fallback_sess[n_fallbacks] = ""
+            fallback_dev[n_fallbacks] = ev_dev
             if (has_field($0, "builtin_fresh_at_fallback")) {
                 fallback_fresh[n_fallbacks] = extract_field($0, "builtin_fresh_at_fallback") + 0
             } else {
@@ -295,7 +307,9 @@ esco_analyse() {
         if (index($0, "headset_signal_start=1") > 0) {
             n_headset_signals++
             headset_signal_t[n_headset_signals] = t
+            headset_signal_raw[n_headset_signals] = t_raw
             headset_signal_sess[n_headset_signals] = ""
+            headset_signal_dev[n_headset_signals] = ev_dev
         }
 
         if (has_field($0, "session")) {
@@ -356,6 +370,22 @@ esco_analyse() {
                 if (has_field($0, "builtin_frames_after_fallback")) {
                     session_has_builtin_frames[sid] = 1
                     session_builtin_frames[sid] = extract_field($0, "builtin_frames_after_fallback") + 0
+                }
+                if (has_field($0, "capture_intervals_truncated")) {
+                    session_has_truncated[sid] = 1
+                    session_truncated[sid] = extract_field($0, "capture_intervals_truncated") + 0
+                }
+                if (has_field($0, "headset_carried_ms")) {
+                    session_has_headset_carried_ms[sid] = 1
+                    session_headset_carried_ms[sid] = extract_field($0, "headset_carried_ms") + 0
+                }
+                if (has_field($0, "carrier")) {
+                    session_has_carrier[sid] = 1
+                    session_carrier[sid] = extract_field($0, "carrier")
+                }
+                if (has_field($0, "device")) {
+                    session_has_device[sid] = 1
+                    session_device[sid] = extract_field($0, "device")
                 }
             }
         }
@@ -421,17 +451,31 @@ esco_analyse() {
 
         for (d = 1; d <= n_drops; d++) {
             drop_sess[d] = ""
+            d_matches = 0
             for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
                 sid = session_list[s_idx]
                 if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
                     if (session_start_t[sid] <= drop_t[d] && drop_t[d] <= session_end_t[sid]) {
-                        drop_sess[d] = sid
-                        sess_drop_cnt[sid]++
-                        break
+                        if (drop_dev[d] != "" && session_has_device[sid] && session_device[sid] != drop_dev[d]) {
+                            # device mismatch
+                        } else {
+                            d_matches++
+                            d_matched_sids[d_matches] = sid
+                        }
                     }
                 }
             }
-            if (drop_sess[d] == "") {
+            if (d_matches == 1) {
+                drop_sess[d] = d_matched_sids[1]
+                sess_drop_cnt[d_matched_sids[1]]++
+            } else if (d_matches > 1) {
+                drop_status[d] = "FAIL"
+                for (m = 1; m <= d_matches; m++) {
+                    msid = d_matched_sids[m]
+                    session_ambiguous_cnt[msid]++
+                    session_ambiguous_reason[msid, session_ambiguous_cnt[msid]] = "ambiguous_session@" drop_raw[d]
+                }
+            } else {
                 drops_outside_sessions++
                 drop_status[d] = "FAIL"
             }
@@ -439,39 +483,81 @@ esco_analyse() {
 
         for (c = 1; c <= n_creations; c++) {
             creation_sess[c] = ""
+            c_matches = 0
             for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
                 sid = session_list[s_idx]
                 if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
                     if (session_start_t[sid] <= creation_t[c] && creation_t[c] <= session_end_t[sid]) {
-                        creation_sess[c] = sid
-                        break
+                        if (creation_dev[c] != "" && session_has_device[sid] && session_device[sid] != creation_dev[c]) {
+                            # device mismatch
+                        } else {
+                            c_matches++
+                            c_matched_sids[c_matches] = sid
+                        }
                     }
+                }
+            }
+            if (c_matches == 1) {
+                creation_sess[c] = c_matched_sids[1]
+            } else if (c_matches > 1) {
+                for (m = 1; m <= c_matches; m++) {
+                    msid = c_matched_sids[m]
+                    session_ambiguous_cnt[msid]++
+                    session_ambiguous_reason[msid, session_ambiguous_cnt[msid]] = "ambiguous_session@" creation_raw[c]
                 }
             }
         }
 
         for (f = 1; f <= n_fallbacks; f++) {
             fallback_sess[f] = ""
+            f_matches = 0
             for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
                 sid = session_list[s_idx]
                 if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
                     if (session_start_t[sid] <= fallback_t[f] && fallback_t[f] <= session_end_t[sid]) {
-                        fallback_sess[f] = sid
-                        break
+                        if (fallback_dev[f] != "" && session_has_device[sid] && session_device[sid] != fallback_dev[f]) {
+                            # device mismatch
+                        } else {
+                            f_matches++
+                            f_matched_sids[f_matches] = sid
+                        }
                     }
+                }
+            }
+            if (f_matches == 1) {
+                fallback_sess[f] = f_matched_sids[1]
+            } else if (f_matches > 1) {
+                for (m = 1; m <= f_matches; m++) {
+                    msid = f_matched_sids[m]
+                    session_ambiguous_cnt[msid]++
+                    session_ambiguous_reason[msid, session_ambiguous_cnt[msid]] = "ambiguous_session@" fallback_raw[f]
                 }
             }
         }
 
         for (h = 1; h <= n_headset_signals; h++) {
             headset_signal_sess[h] = ""
+            h_matches = 0
             for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
                 sid = session_list[s_idx]
                 if (session_start_cnt[sid] >= 1 && session_end_cnt[sid] >= 1) {
                     if (session_start_t[sid] <= headset_signal_t[h] && headset_signal_t[h] <= session_end_t[sid]) {
-                        headset_signal_sess[h] = sid
-                        break
+                        if (headset_signal_dev[h] != "" && session_has_device[sid] && session_device[sid] != headset_signal_dev[h]) {
+                            # device mismatch
+                        } else {
+                            h_matches++
+                            h_matched_sids[h_matches] = sid
+                        }
                     }
+                }
+            }
+            if (h_matches == 1) {
+                headset_signal_sess[h] = h_matched_sids[1]
+            } else if (h_matches > 1) {
+                for (m = 1; m <= h_matches; m++) {
+                    msid = h_matched_sids[m]
+                    session_ambiguous_cnt[msid]++
+                    session_ambiguous_reason[msid, session_ambiguous_cnt[msid]] = "ambiguous_session@" headset_signal_raw[h]
                 }
             }
         }
@@ -511,6 +597,11 @@ esco_analyse() {
             if (session_missing_end[sid]) {
                 n_r++; reasons[n_r] = "missing_end_marker"
             }
+            if (session_ambiguous_cnt[sid] > 0) {
+                for (a_i = 1; a_i <= session_ambiguous_cnt[sid]; a_i++) {
+                    n_r++; reasons[n_r] = session_ambiguous_reason[sid, a_i]
+                }
+            }
 
             # (a) outcome
             if (!session_has_outcome[sid]) {
@@ -535,7 +626,21 @@ esco_analyse() {
             }
 
             # (b) coverage
-            if (!session_has_capture_intervals[sid]) {
+            is_truncated = 0
+            if (session_has_truncated[sid] && session_truncated[sid] == 1) {
+                is_truncated = 1
+            }
+            if (session_has_capture_intervals[sid] && session_capture_intervals[sid] != "none") {
+                n_chk = split(session_capture_intervals[sid], chk_ints, ",")
+                if (n_chk >= CAPTURE_INTERVALS_MAX) {
+                    is_truncated = 1
+                }
+            }
+
+            if (is_truncated) {
+                n_r++; reasons[n_r] = "truncated_intervals@" sid
+                session_cov_pct[sid] = "na"
+            } else if (!session_has_capture_intervals[sid]) {
                 n_r++; reasons[n_r] = "missing_capture_intervals"
                 if (session_has_bytes[sid] && session_has_duration_ms[sid] && session_duration_ms[sid] > 0) {
                     byte_cov = (session_bytes[sid] - 44) / 48000.0 / (session_duration_ms[sid] / 1000.0)
@@ -669,7 +774,7 @@ esco_analyse() {
                             tc = creation_t[c]
                             if (tc > td && tc <= td + 1500) {
                                 for (h = 1; h <= n_headset_signals; h++) {
-                                    if (headset_signal_sess[h] == sid && headset_signal_t[h] > tc) {
+                                    if (headset_signal_sess[h] == sid && headset_signal_t[h] > tc && headset_signal_t[h] <= tc + RECOVERY_SIGNAL_MAX_MS) {
                                         rec_ok = 1
                                         break
                                     }
@@ -688,7 +793,7 @@ esco_analyse() {
                         for (f = 1; f <= n_fallbacks; f++) {
                             if (fallback_sess[f] == sid) {
                                 tf = fallback_t[f]
-                                if (tf >= td - 2000 && fallback_fresh[f] == 1 && session_has_builtin_frames[sid] && session_builtin_frames[sid] > 0) {
+                                if (tf >= td - 2000 && tf <= td + FALLBACK_MAX_AFTER_DROP_MS && fallback_fresh[f] == 1 && session_has_builtin_frames[sid] && session_builtin_frames[sid] > 0) {
                                     fb_ok = 1
                                     break
                                 }
@@ -754,6 +859,100 @@ esco_analyse() {
                n_drops, tot_recovered, tot_successful_fallbacks, drops_outside_sessions)
 
         evaluable = tot_pass + tot_held + tot_failed
+
+        # Compute separate verdicts
+        # 1. continuity: PASS | FAIL
+        v_continuity = "PASS"
+        if (evaluable == 0 || drops_outside_sessions > 0) {
+            v_continuity = "FAIL"
+        } else {
+            for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+                sid = session_list[s_idx]
+                if (session_duplicate[sid] || session_missing_start[sid] || session_missing_end[sid] || session_ambiguous_cnt[sid] > 0) {
+                    v_continuity = "FAIL"
+                    break
+                }
+                for (r_i = 1; r_i <= session_n_reasons[sid]; r_i++) {
+                    r = session_reasons[sid, r_i]
+                    if (r ~ /^(missing_capture_intervals|missing_recording_ms|duplicate_or_unordered_intervals|late_start=|coverage=|gap=|truncated_intervals@|drop_unrecovered@|ambiguous_session@)/) {
+                        v_continuity = "FAIL"
+                        break
+                    }
+                }
+                if (v_continuity == "FAIL") break
+            }
+        }
+
+        # 2. headset: PASS | FAIL | NA
+        has_headset_carried = 0
+        has_unrecovered_drop = 0
+        has_headset_explicit_fail = 0
+        if (n_drops > 0 && tot_recovered < n_drops && tot_successful_fallbacks < (n_drops - tot_recovered)) {
+            has_unrecovered_drop = 1
+        }
+        for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+            sid = session_list[s_idx]
+            if (session_has_headset_carried_ms[sid]) {
+                if (session_headset_carried_ms[sid] > 0) {
+                    has_headset_carried = 1
+                } else {
+                    has_headset_explicit_fail = 1
+                }
+            }
+            if (sess_recovered_cnt[sid] > 0) {
+                has_headset_carried = 1
+            }
+            for (r_i = 1; r_i <= session_n_reasons[sid]; r_i++) {
+                r = session_reasons[sid, r_i]
+                if (r ~ /^drop_unrecovered@/) {
+                    has_unrecovered_drop = 1
+                }
+            }
+        }
+        if (has_unrecovered_drop || has_headset_explicit_fail) {
+            v_headset = "FAIL"
+        } else if (has_headset_carried) {
+            v_headset = "PASS"
+        } else {
+            v_headset = "NA"
+        }
+
+        # 3. content: PASS | FAIL | NA
+        if (evaluable == 0) {
+            v_content = "NA"
+        } else {
+            v_content = "PASS"
+            for (s_idx = 1; s_idx <= n_sessions; s_idx++) {
+                sid = session_list[s_idx]
+                if (session_verdict[sid] == "CANCELLED") continue
+                if (!session_has_outcome[sid]) {
+                    v_content = "FAIL"
+                    break
+                }
+                outc = session_outcome[sid]
+                if (outc != "ok" && !match(outc, /^held(:.*)?$/)) {
+                    v_content = "FAIL"
+                    break
+                }
+                if (!session_has_chars[sid] || session_chars[sid] <= 0) {
+                    v_content = "FAIL"
+                    break
+                }
+                if (!session_has_speech_sections[sid] || session_speech_sections[sid] < 3) {
+                    v_content = "FAIL"
+                    break
+                }
+            }
+        }
+
+        # 4. playback: NA
+        v_playback = "NA"
+
+        printf("DROPS_SEEN=%d RECOVERED=%d FALLBACKS=%d\n", n_drops, tot_recovered, tot_successful_fallbacks)
+        printf("VERDICT continuity=%s\n", v_continuity)
+        printf("VERDICT headset=%s\n", v_headset)
+        printf("VERDICT content=%s\n", v_content)
+        printf("VERDICT playback=%s\n", v_playback)
         if (evaluable == 0) {
             print "BT-PROOF: FAIL missing_sessions"
             exit 1
