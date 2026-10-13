@@ -618,6 +618,10 @@ public final class AudioRecorder: CaptureEngine {
                     // A re-attach is in flight: the obligation stays open; the health clock re-asks.
                     AppController.note("bt_recovery=obligation path=configuration engine_running=\(running ? 1 : 0) in_flight=1")
                     return
+                case .escalate:
+                    AppController.note("bt_recovery=escalate path=configuration")
+                    requestHeadsetRestart(epoch: epoch, path: .configuration)
+                    return
                 case .exhausted:
                     AppController.note("bt_recovery=obligation_open path=configuration reason=reattach_budget")
                     return
@@ -1175,10 +1179,13 @@ public final class AudioRecorder: CaptureEngine {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         guard engineEpoch === epoch, feed.bridge.isRecording else { lock.unlock(); return }
-        var obligationDue = false
-        if episode.bluetooth, captureRunning, !restarting, let headsetRunning,
-           ioGuard.observe(at: now, engineRunning: headsetRunning) == .reattach {
-            obligationDue = true
+        var obligationDue = false, escalate = false
+        if episode.bluetooth, captureRunning, !restarting, let headsetRunning {
+            switch ioGuard.observe(at: now, engineRunning: headsetRunning) {
+            case .reattach: obligationDue = true
+            case .escalate: escalate = true
+            default: break
+            }
         }
         var driftNote: String?
         if builtinActive, let check, check != .ok, !builtinDriftNoted {
@@ -1202,6 +1209,11 @@ public final class AudioRecorder: CaptureEngine {
         out.notes.forEach { AppController.note($0) }
         if let (unit, queue) = deadUnit { stopBuiltinUnit(unit, queue: queue, epoch: epoch) }
         if obligationDue { onExecutor { [weak self] in self?.obligationReattach(epoch: epoch) } }
+        if escalate {
+            // v1.12 (L2): the obligation's re-attach brought no IO — one restart through the episode.
+            AppController.note("bt_recovery=escalate path=obligation")
+            requestHeadsetRestart(epoch: epoch, path: .restart)
+        }
         if let failure = out.failure {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }

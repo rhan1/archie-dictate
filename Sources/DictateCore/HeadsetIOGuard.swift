@@ -16,13 +16,14 @@ import Foundation
 ///   100 ms health clock while capture should be running ("config running at 0 ms; auto-stop at
 ///   200 ms; no frames thereafter") — opens a recovery OBLIGATION. It stays open, visible on the
 ///   session line, until IO is observed again (fresh headset frames after the re-attach).
-/// - An open obligation gets a re-attach as soon as none is in flight. A re-attach is IN FLIGHT
+/// - An open obligation gets ONE re-attach as soon as none is in flight. A re-attach is IN FLIGHT
 ///   from its start until fresh headset frames arrive (IO completed), its start fails, or
 ///   `inFlightBound` passes without frames. Nothing else touches the engine while one is in
 ///   flight (that keeps v1.10's protection against churn while the SCO link forms), but the
 ///   bound is a ceiling, not a blind wait: observed frames end it early.
-/// - At most `maxReattaches` re-attaches per dictation; past that the obligation stays open
-///   (`io_obligation=open`) and the episode/health clock decide — bounded, never a spin.
+/// - If that re-attach brought no IO, the obligation ESCALATES once to the episode's restart
+///   (its own budget and debounce) and stays open — visible as `io_obligation=open:…` — until IO
+///   is observed. At most `maxReattaches` re-attaches per dictation: bounded, never a spin.
 /// - A notification that finds the engine still running is left alone while recovery is
 ///   unsettled; once the headset delivered SUSTAINED usable signal (the bridge's takeover test,
 ///   `CaptureBridge.takeoverSignal` of consecutive non-silent frames — never one nonzero buffer)
@@ -53,6 +54,8 @@ public struct HeadsetIOGuard: Sendable {
         /// A re-attach is in flight until `until` at the latest; the obligation stays open and is
         /// re-evaluated on the next observation.
         case pending(until: TimeInterval)
+        /// The obligation's re-attach brought no IO: ask the episode for one restart (once).
+        case escalate
         /// The re-attach budget is spent; the obligation stays open (the episode decides).
         case exhausted
         /// Not Bluetooth, or no recovery open: the episode's policy decides (v1.9).
@@ -65,6 +68,9 @@ public struct HeadsetIOGuard: Sendable {
         public enum Reason: String, Sendable { case engineStopped = "engine_stopped", ioCeased = "io_ceased" }
         public var since: TimeInterval
         public var reason: Reason
+        /// Its one re-attach was given; then its one escalation.
+        public var reattached = false
+        public var escalated = false
     }
 
     public let bluetooth: Bool
@@ -162,10 +168,12 @@ public struct HeadsetIOGuard: Sendable {
         guard inFlightSince != nil, reattaches > 0 else { return }
         reattaches -= 1
         inFlightSince = nil
+        obligation?.reattached = false
         held += 1
     }
 
-    /// The in-flight re-attach's start returned (`started == false`: it threw).
+    /// The in-flight re-attach's start returned (`started == false`: it threw — the obligation
+    /// escalates on the next observation).
     public mutating func reattachFinished(started: Bool, at now: TimeInterval) {
         if !started { inFlightSince = nil }
     }
@@ -185,13 +193,19 @@ public struct HeadsetIOGuard: Sendable {
     }
 
     private mutating func due(at now: TimeInterval) -> Reaction {
-        guard obligation != nil else { return .none }
+        guard let open = obligation else { return .none }
         if let since = inFlightSince, now < since + Self.inFlightBound {
             held += 1
             return .pending(until: since + Self.inFlightBound)
         }
+        if open.reattached {
+            guard !open.escalated else { return .none }      // the episode owns it now
+            obligation?.escalated = true
+            return .escalate
+        }
         guard reattaches < Self.maxReattaches else { return .exhausted }
         reattaches += 1
+        obligation?.reattached = true
         inFlightSince = now
         return .reattach
     }
