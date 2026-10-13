@@ -83,3 +83,16 @@ hotkeys and insertion. Engine construction performs no asset download. The exist
 standalone launch continues to prepare assets as before.
 
 `injectedAudioURL:` (or env `DICTATE_INJECT_WAV=<path>`) replaces the microphone with a 24 kHz mono 16-bit WAV, paced in real time, then silence until finish(); STT, cleanup and paste stay real — for unattended end-to-end checks.
+
+## Capture contract for hosts (v1.11, frozen)
+
+A host that runs its own capture session (Archie's ⌘⌘ conversation) uses `AudioRecorder` directly. These members are frozen by `Tests/DictateAppKitTests/HostContractTests.swift` (a non-`@testable` import): changing a name or type breaks that file before it breaks a host.
+
+- `public init()`: no audio until `startAsync`.
+- `onPCMChunk: (([Int16]) -> Void)?`: 24 kHz mono pcm16, 100 ms chunks (`AudioRecorder.chunkSamples` = 2 400), in order, outside the recorder's lock.
+- `onCaptureFailure: ((CaptureFailure) -> Void)?`, `resetCapture()`, `startAsync(device: MicChoice) async throws`, `stop() -> [Float]`.
+- `stats: AudioRecorder.CaptureStats`: `bridgeSource`, `bridgeMs`, `ioOps`, `ioHeld`, `speechSections`, `recordingMs` (plus, v1.11, `carrier`, `headsetCarriedMs`, `captureIntervalsTruncated`, `kind`).
+- `kind: CaptureKind` (`.dictation` default, `.conversation`): a label set before `startAsync`. Capture is identical; `stats.sessionEndFields` begins `kind=…`, so a host writing `session=<id> event=end outcome=… ` + `stats.sessionEndFields` logs the same line Dictate does.
+
+The muter, the refusal of a second capture and the arbitration between hosts' features live in the host.
+
