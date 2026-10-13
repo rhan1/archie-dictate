@@ -260,6 +260,7 @@ esco_analyse() {
         RECOVERY_SIGNAL_MAX_MS = 3000
         FALLBACK_MAX_AFTER_DROP_MS = 2000
         CAPTURE_INTERVALS_MAX = 400
+        current_open_session = "-"
     }
 
     {
@@ -317,6 +318,7 @@ esco_analyse() {
             sid = extract_field($0, "session")
             ev = extract_field($0, "event")
             if (ev == "start") {
+                current_open_session = sid
                 if (!session_seen[sid]) {
                     session_seen[sid] = 1
                     n_sessions++
@@ -328,6 +330,9 @@ esco_analyse() {
                     session_start_cnt[sid]++
                 }
             } else if (ev == "end") {
+                if (current_open_session == sid) {
+                    current_open_session = "-"
+                }
                 if (!session_seen[sid]) {
                     session_seen[sid] = 1
                     n_sessions++
@@ -388,6 +393,24 @@ esco_analyse() {
                     session_device[sid] = extract_field($0, "device")
                 }
             }
+        }
+
+        if (has_field($0, "bridge_switch") && has_field($0, "headset_peak") && has_field($0, "builtin_peak")) {
+            n_switches++
+            switch_t[n_switches] = t
+            switch_raw[n_switches] = t_raw
+            switch_sess[n_switches] = current_open_session
+            sw_to = extract_field($0, "bridge_switch")
+            sw_reason = (has_field($0, "reason") ? extract_field($0, "reason") : "-")
+            sw_hp = extract_field($0, "headset_peak")
+            sw_bp = extract_field($0, "builtin_peak")
+            switch_to[n_switches] = sw_to
+            switch_reason[n_switches] = sw_reason
+            switch_hp[n_switches] = sw_hp
+            switch_bp[n_switches] = sw_bp
+            switch_line[n_switches] = sprintf("SWITCH session=%s to=%s reason=%s headset_peak=%s builtin_peak=%s",
+                                              current_open_session, sw_to, sw_reason, sw_hp, sw_bp)
+            switch_fail[n_switches] = (sw_to == "builtin" && (sw_reason == "witness" || sw_reason == "zeros") && (sw_bp + 0.0 < 0.01))
         }
 
         if (match($0, "(^|[ \t])duration=[0-9]+(\\.[0-9]+)?s") && has_field($0, "bytes") && has_field($0, "latency_ms") && has_field($0, "chars") && has_field($0, "app") && has_field($0, "outcome")) {
@@ -811,6 +834,14 @@ esco_analyse() {
                 }
             }
 
+            for (sw = 1; sw <= n_switches; sw++) {
+                if (switch_sess[sw] == sid || (switch_sess[sw] == "-" && session_start_t[sid] <= switch_t[sw] && switch_t[sw] <= session_end_t[sid])) {
+                    if (switch_fail[sw]) {
+                        n_r++; reasons[n_r] = "pause_switch@" switch_raw[sw]
+                    }
+                }
+            }
+
             if (n_r == 0) {
                 if (session_is_held[sid]) {
                     session_verdict[sid] = "HELD"
@@ -852,6 +883,10 @@ esco_analyse() {
         for (d = 1; d <= n_drops; d++) {
             sess_name = (drop_sess[d] != "" && drop_sess[d] != "none" ? drop_sess[d] : "none")
             printf("drop %s session=%s -> %s\n", drop_raw[d], sess_name, drop_status[d])
+        }
+
+        for (sw = 1; sw <= n_switches; sw++) {
+            print switch_line[sw]
         }
 
         printf("sessions=%d pass=%d held=%d cancelled=%d failed=%d drops=%d recovered=%d successful_fallbacks=%d drops_outside_sessions=%d\n",
@@ -948,15 +983,33 @@ esco_analyse() {
         # 4. playback: NA
         v_playback = "NA"
 
+        # 5. pause: PASS | FAIL | NA
+        has_pause_fail = 0
+        for (sw = 1; sw <= n_switches; sw++) {
+            if (switch_fail[sw]) {
+                has_pause_fail = 1
+                break
+            }
+        }
+        if (n_switches == 0) {
+            v_pause = "NA"
+        } else if (has_pause_fail) {
+            v_pause = "FAIL"
+        } else {
+            v_pause = "PASS"
+        }
+
         printf("DROPS_SEEN=%d RECOVERED=%d FALLBACKS=%d\n", n_drops, tot_recovered, tot_successful_fallbacks)
+        printf("PEAKS_SEEN=%d\n", n_switches)
         printf("VERDICT continuity=%s\n", v_continuity)
         printf("VERDICT headset=%s\n", v_headset)
+        printf("VERDICT pause=%s\n", v_pause)
         printf("VERDICT content=%s\n", v_content)
         printf("VERDICT playback=%s\n", v_playback)
         if (evaluable == 0) {
             print "BT-PROOF: FAIL missing_sessions"
             exit 1
-        } else if (tot_failed == 0) {
+        } else if (tot_failed == 0 && v_pause != "FAIL") {
             print "BT-PROOF: PASS"
             exit 0
         } else {
@@ -968,14 +1021,26 @@ esco_analyse() {
                     break
                 }
             }
-            sid = session_list[first_fail_idx]
-            fail_reasons = ""
-            for (r_i = 1; r_i <= session_n_reasons[sid]; r_i++) {
-                if (r_i == 1) fail_reasons = session_reasons[sid, r_i]
-                else fail_reasons = fail_reasons " " session_reasons[sid, r_i]
+            if (first_fail_idx > 0) {
+                sid = session_list[first_fail_idx]
+                fail_reasons = ""
+                for (r_i = 1; r_i <= session_n_reasons[sid]; r_i++) {
+                    if (r_i == 1) fail_reasons = session_reasons[sid, r_i]
+                    else fail_reasons = fail_reasons " " session_reasons[sid, r_i]
+                }
+                if (n_drops > 0) {
+                    fail_reasons = fail_reasons " successful_fallbacks=" tot_successful_fallbacks
+                }
+            } else {
+                fail_reasons = ""
             }
-            if (n_drops > 0) {
-                fail_reasons = fail_reasons " successful_fallbacks=" tot_successful_fallbacks
+            if (v_pause == "FAIL" && index(fail_reasons, "pause_switch@") == 0) {
+                for (sw = 1; sw <= n_switches; sw++) {
+                    if (switch_fail[sw]) {
+                        fail_reasons = (fail_reasons != "" ? fail_reasons " " : "") "pause_switch@" switch_raw[sw]
+                        break
+                    }
+                }
             }
             print "BT-PROOF: FAIL " fail_reasons
             exit 1
@@ -1046,7 +1111,7 @@ esco_log_window() {
 
     /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
         --predicate 'subsystem == "com.razakhan.archie" AND category == "voice"' 2>/dev/null \
-        | grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start' \
+        | grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start|bridge_switch=' \
         > "$notes_tmp"
     local status_notes=${PIPESTATUS[0]}
 
@@ -1063,7 +1128,7 @@ esco_log_window() {
                 stamp="${BASH_REMATCH[1]}Z"
                 frac="${BASH_REMATCH[3]:-}"
                 text="${BASH_REMATCH[4]}"
-                if [[ "$text" =~ session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start ]]; then
+                if [[ "$text" =~ session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start|bridge_switch= ]]; then
                     l_sec=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$stamp" '+%s' 2>/dev/null || true)
                     if [ -n "$l_sec" ] && [ "$l_sec" -ge "$start_sec" ] && [ "$l_sec" -le "$end_sec" ]; then
                         local_base=$(date -r "$l_sec" '+%Y-%m-%d %H:%M:%S')
@@ -1078,7 +1143,7 @@ esco_log_window() {
                     fi
                 fi
             fi
-        done < <(grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start' "$dictate_stderr" 2>/dev/null || true)
+        done < <(grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start|bridge_switch=' "$dictate_stderr" 2>/dev/null || true)
     fi
 
     local dictate_log="$HOME/Library/Logs/Dictate/dictate.log"
