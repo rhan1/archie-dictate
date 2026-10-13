@@ -1058,8 +1058,9 @@ public final class AudioRecorder: CaptureEngine {
             return headsetUnit!
         }
         unit.onFrames = { [weak self] chunk, time, stamped in
-            guard stamped === epoch else { return }
-            self?.acceptConverted(chunk, at: time, source: .headset, epoch: epoch, tap: token)
+            guard stamped === epoch, let self else { return }
+            self.headsetUnitFirstBuffer(epoch: epoch, token: token)
+            self.acceptConverted(chunk, at: time, source: .headset, epoch: epoch, tap: token)
         }
         unit.onEvent = { [weak self] event, stamped in
             guard stamped === epoch else { return }
@@ -1083,6 +1084,21 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
+    /// The AUHAL arm's first buffer: the same `first_buffer_ms` / `onFirstBuffer` the engine tap
+    /// gives (the lifecycle's first-buffer watchdog listens for it).
+    private func headsetUnitFirstBuffer(epoch: CaptureEpoch, token: CaptureEpoch) {
+        let first: Bool = lock.withLock {
+            guard captureRunning, tapEpoch === token, stats.firstBufferMs == nil else { return false }
+            stats.firstBufferMs = elapsedMs()
+            return true
+        }
+        guard first else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.lock.withLock({ self.engineEpoch === epoch && self.captureRunning && self.tapEpoch === token }) else { return }
+            self.onFirstBuffer?()
+        }
+    }
+
     /// v1.12 (L3): the AUHAL client's state transitions — counted and noted; recovery stays with
     /// the guard's observation (a stopped or silent client opens an obligation on the health clock).
     private func headsetUnitEvent(_ event: HeadsetCaptureEvent, epoch: CaptureEpoch, token: CaptureEpoch) {
@@ -1094,6 +1110,7 @@ public final class AudioRecorder: CaptureEngine {
                 instrumentation.format(sampleRate: rate, channels: channels, at: now)
             case .formatChanged(_, let rate, let channels):
                 instrumentation.format(sampleRate: rate, channels: channels, at: now)
+                stats.formatChanges += 1
                 _ = ioGuard.configurationChanged(at: now, engineRunning: true)    // a format generation, no auto-stop
             default: break
             }

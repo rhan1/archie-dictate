@@ -189,6 +189,8 @@ struct CaptureLeaseRecorderTests {
         let log = Log()
         let broker = CaptureLeaseBroker()
         let (recorder, builtin, headset) = Self.recorder("A", log, broker: broker)
+        let firstBuffer = Log()
+        recorder.onFirstBuffer = { firstBuffer.append("first") }
         try await recorder.startAsync(device: .default)
         #expect(log.all.contains("A.headset.start uid=\(Self.headsetUID)"))
         recorder.resetCapture()
@@ -198,7 +200,9 @@ struct CaptureLeaseRecorderTests {
             if step >= 3 { headset.deliver(0.1, at: t) }           // signal from 300 ms: takeover after 150 ms
             t += 0.1
         }
+        #expect(await Self.waitUntil { firstBuffer.all == ["first"] })     // the lifecycle's watchdog hears it
         _ = recorder.stop()
+        #expect(recorder.stats.firstBufferMs != nil)
         let line = recorder.stats.instrumentation
         #expect(line.hasPrefix("headset_backend=auhal route_uid=\(Self.headsetUID) fmt_epochs=1:16000Hz/1ch@"))
         #expect(line.contains(" io_callbacks=builtin:10,headset:7 frames=builtin:24000,headset:16800 zeros=builtin:0,headset:0"))
