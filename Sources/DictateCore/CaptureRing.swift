@@ -61,6 +61,26 @@ public struct CaptureRing {
         return kept
     }
 
+    /// v1.13 (L3): the newest contiguous run (start time and frames), without draining.
+    public func newestRun() -> (start: TimeInterval, frames: [Float])? {
+        guard let run = runs.last else { return nil }
+        let offset = count - run.count
+        return (run.time, (0..<run.count).map { storage[(head + offset + $0) % capacity] })
+    }
+
+    /// v1.13 (L3): stored frames whose sample time lies in [from, to), oldest first, without draining.
+    public func frames(from: TimeInterval, to: TimeInterval) -> [Float] {
+        var out: [Float] = []
+        var offset = 0
+        for run in runs {
+            let first = max(0, Int(ceil((from - run.time) * Self.sampleRate - 0.000001)))
+            let end = min(run.count, Int(ceil((to - run.time) * Self.sampleRate - 0.000001)))
+            if first < end { for i in first..<end { out.append(storage[(head + offset + i) % capacity]) } }
+            offset += run.count
+        }
+        return out
+    }
+
     public mutating func removeAll() {
         head = 0
         count = 0
@@ -126,6 +146,15 @@ public struct CaptureFeed {
     /// resumes exactly where the headset stopped (the buffer that crossed the switch
     /// arrived before the decision). 1.5 s covers the stale-headset wait (1.0 s) plus one buffer.
     private var standby = CaptureRing(capacity: 36_000)
+    /// v1.13 (L3): each source's recent frames at their own timestamps (0.6 s), for the one-shot
+    /// splice alignment and for headset frames a negative lag needs at the takeover.
+    private var headsetHistory = CaptureRing(capacity: 14_400)
+    private var builtinHistory = CaptureRing(capacity: 14_400)
+    /// v1.13 (L3): seconds the headset's content trails its timestamps relative to the built-in's;
+    /// every headset time entering the bridge is shifted by it once `aligned`.
+    public private(set) var headsetLag: TimeInterval = 0
+    public private(set) var aligned = false
+    private var alignNote: String?
 
     public init(ringCapacity: Int = CaptureRing.defaultCapacity) {
         ring = CaptureRing(capacity: ringCapacity)
@@ -136,6 +165,11 @@ public struct CaptureFeed {
         bridge.start(defaultInput: defaultInput, hasBuiltin: hasBuiltin, epoch: epoch)
         ring.removeAll()
         standby.removeAll()
+        headsetHistory.removeAll()
+        builtinHistory.removeAll()
+        headsetLag = 0
+        aligned = false
+        alignNote = nil
         health = CaptureHealth()
         evidence = CaptureEvidence()
         timeline = SourceTimeline()
@@ -169,8 +203,44 @@ public struct CaptureFeed {
         let peak = Self.peak(frames[...])
         let signalStart = health.buffer(source, at: now, frames: frames.count, peak: peak)
         let builtinFresh = health.isFresh(.builtin, at: now)
-        let decision = bridge.buffer(source: source, at: time, frames: frames.count,
+        if source == .builtin { builtinHistory.append(frames, at: time) } else { headsetHistory.append(frames, at: time) }
+        if source == .headset, peak >= CaptureBridge.silencePeak { alignIfDue() }
+        // The built-in's content clock: headset times shifted by the measured lag (0 until aligned).
+        let content = source == .headset ? time - headsetLag : time
+        let continuity = bridge.fedThroughTime
+        let decision = bridge.buffer(source: source, at: content, frames: frames.count,
                                      arrivedAt: arrivedAt, epoch: epoch, peak: peak, builtinFresh: builtinFresh)
+        // v1.13 (L3): a headset that LEADS the built-in (negative lag) takes over past the built-in's
+        // content: the frames in between already arrived — fed from its history, nothing skipped.
+        if source == .headset, decision.releaseBuiltin || decision.event == .recovered, let continuity,
+           decision.dropFrames == 0, content > continuity + 0.5 / CaptureRing.sampleRate {
+            let missing = headsetHistory.frames(from: continuity + headsetLag, to: time)
+            let start = content - Double(missing.count) / CaptureRing.sampleRate
+            bridge.resumedHeadset(through: content + Double(frames.count) / CaptureRing.sampleRate)
+            var adjusted = decision
+            adjusted.framesToFeed = decision.framesToFeed + missing.count
+            return finish(adjusted, frames: missing + frames, source: source, time: start, now: now,
+                          arrivedAt: arrivedAt, hadKept: hadKept, signalStart: signalStart)
+        }
+        return finish(decision, frames: frames, source: source, time: content, now: now, arrivedAt: arrivedAt,
+                      hadKept: hadKept, signalStart: signalStart)
+    }
+
+    /// v1.13 (L3): before the first takeover, while the built-in carries and the headset hears signal:
+    /// estimate the headset's lag once (`SpliceAligner`); a clear estimate shifts every later headset time.
+    private mutating func alignIfDue() {
+        guard !aligned, bridge.isRecording, bridge.state == .builtinOnly || bridge.state == .fallback,
+              let h = headsetHistory.newestRun(), let b = builtinHistory.newestRun(),
+              let estimate = SpliceAligner.estimate(headset: h.frames, headsetStart: h.start,
+                                                    builtin: b.frames, builtinStart: b.start) else { return }
+        aligned = true
+        headsetLag = estimate.lag
+        alignNote = "splice_align_ms=\(Int((estimate.lag * 1000).rounded())) corr=\(String(format: "%.2f", estimate.correlation))"
+    }
+
+    private mutating func finish(_ decision: CaptureBridge.Decision, frames: [Float], source: CaptureBridge.Source,
+                                 time: TimeInterval, now: TimeInterval, arrivedAt: TimeInterval?, hadKept: Bool,
+                                 signalStart: Bool) -> Output {
         var output = Output(releaseBuiltin: decision.releaseBuiltin,
                             restartHeadset: decision.restartHeadset, event: decision.event)
         output.headsetSignalStart = source == .headset && signalStart
@@ -192,7 +262,8 @@ public struct CaptureFeed {
         }
         if decision.event == .switchback { output.frames += resumeBuiltin(arrivedAt: now, from: bridge.resumeFrom) }
         output.firstKept = !hadKept && bridge.firstKeptMs != nil
-        output.notes = bridge.takeSwitchNotes()
+        output.notes = (alignNote.map { [$0] } ?? []) + bridge.takeSwitchNotes()
+        alignNote = nil
         return output
     }
 

@@ -46,6 +46,10 @@ import DictateCore
 ///   idle wait, a fresh start) draws a stopping notification `WarmModel.restartStopsAfter` later and no
 ///   frames. The production `HeadsetIOGuard`, `BluetoothRecoveryEpisode` and `CaptureFeed` decide every
 ///   step, as the recorder does. `warmRoute` = what the recorder sampled (`route.hfpAlready()`).
+/// - `splice_lag` (L3): both sources hear the WAV, but the headset's content trails its timestamps by
+///   `headsetLag` (its voice link and codec delay, which a HAL timestamp does not carry; negative: it
+///   leads); the built-in hears it distant. `spliceDropAt` (optional) drops the headset to exact zeros
+///   there (a switchback splice).
 /// - `live_pause` (L1 c): the 10-13 A/B as modeled — the WAV with the inserted pause, through the
 ///   Sony's mic gate (`gatePeak` per 20 ms → exact zeros) on the headset, distant on the built-in.
 public final class WAVInjectedRecorder: EngineRecorder {
@@ -56,10 +60,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case scoTornDown250ms = "sco_torn_down_250ms"
         case headsetTakeover = "headset_takeover"
         case pauseZeros = "pause_zeros", headsetDrops = "headset_drops", livePause = "live_pause"
-        case warmHFP = "warm_hfp"
+        case warmHFP = "warm_hfp", spliceLag = "splice_lag"
         var hasHeadset: Bool { self != .plain }
         /// v1.13: the headset and the built-in each play their own track.
-        public var usesTracks: Bool { self == .pauseZeros || self == .headsetDrops || self == .livePause || self == .warmHFP }
+        public var usesTracks: Bool {
+            self == .pauseZeros || self == .headsetDrops || self == .livePause || self == .warmHFP || self == .spliceLag
+        }
     }
     /// v1.13: the headset client modeled — only the size of the headset's deliveries differs (10-13 A/B
     /// session lines: engine `io_callbacks=…headset:149 frames=…headset:357552` = 2400 frames per
@@ -82,6 +88,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
     public var pauseLength: TimeInterval = 2.0
     /// `headset_drops`: media time after the boundary from which the headset delivers only zeros.
     public var dropAt: TimeInterval = 1.0
+    /// `splice_lag`: seconds the headset's content trails its timestamps (negative: leads).
+    public var headsetLag: TimeInterval = 0.06
+    /// `splice_lag`: media time from which the headset delivers only zeros (nil: never).
+    public var spliceDropAt: TimeInterval?
     /// `warm_hfp`: the recorder found the headset already on HFP (false: the cold flag on the same IO).
     public var warmRoute = true
     /// `warm_hfp` IO model, from the E4 (f9fc0895) / W2 (c3e8e1f9) lines of 10-13 15:24.
@@ -255,7 +265,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     /// v1.13: the two tracks a two-stream scenario plays (headset, built-in), from the WAV's samples.
     public static func tracks(_ scenario: Scenario, wav: [Float], pauseAt: TimeInterval, pauseLength: TimeInterval,
-                              dropAt: TimeInterval) -> (headset: [Float], builtin: [Float]) {
+                              dropAt: TimeInterval, headsetLag: TimeInterval = 0,
+                              spliceDropAt: TimeInterval? = nil) -> (headset: [Float], builtin: [Float]) {
         let rate = AudioRecorder.sampleRate
         func inserted(_ x: [Float]) -> [Float] {
             let at = min(x.count, max(0, Int((pauseAt * rate).rounded())))
@@ -284,6 +295,16 @@ public final class WAVInjectedRecorder: EngineRecorder {
             return (gated(speech), distant(speech))
         case .warmHFP:
             return (wav, distant(wav))
+        case .spliceLag:
+            let lag = Int((headsetLag * rate).rounded())
+            var headset = (0..<wav.count).map { i -> Float in
+                let j = i - lag
+                return j >= 0 && j < wav.count ? wav[j] : 0
+            }
+            if let drop = spliceDropAt {
+                for i in min(headset.count, max(0, Int((drop * rate).rounded())))..<headset.count { headset[i] = 0 }
+            }
+            return (headset, distant(wav))
         default:
             return ([], [])
         }
@@ -312,7 +333,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
         sampleCursor = 0
         if scenario.usesTracks {
             (headsetTrack, builtinTrack) = Self.tracks(scenario, wav: parsed.map { Float($0) / 32768.0 }, pauseAt: pauseAt,
-                                                       pauseLength: pauseLength, dropAt: dropAt)
+                                                       pauseLength: pauseLength, dropAt: dropAt, headsetLag: headsetLag,
+                                                       spliceDropAt: spliceDropAt)
         }
         trackCursor = 0
         timedNotes = []
