@@ -24,6 +24,7 @@ public final class TextInserter {
     private let timeout: TimeInterval
     private let fakeReader: (() -> [String]?)?
     private let log: (String) -> Void
+    private let now: () -> TimeInterval
 
     public init(
         pasteboard: NSPasteboard = .general,
@@ -32,13 +33,15 @@ public final class TextInserter {
         pollInterval: TimeInterval = defaultPollInterval,
         timeout: TimeInterval = defaultTimeout,
         axReader: (() -> [String]?)? = nil,
-        logger: ((String) -> Void)? = nil
+        logger: ((String) -> Void)? = nil,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.pasteboard = pasteboard
         self.postKeystroke = postKeystroke ?? TextInserter.postCommandV
         self.schedule = schedule ?? { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) }
-        self.pollInterval = pollInterval
-        self.timeout = timeout
+        self.pollInterval = max(0.01, pollInterval)
+        self.timeout = max(0, timeout)
+        self.now = now
         self.fakeReader = axReader
         self.log = logger ?? { AppController.note($0) }
     }
@@ -89,7 +92,7 @@ public final class TextInserter {
         if let fakeReader {
             return fakeReader()
         }
-        guard let initialElement, let current = currentFocusedElement(), CFEqual(initialElement, current).boolValue else {
+        guard let initialElement, let current = currentFocusedElement(), CFEqual(initialElement, current) else {
             return nil
         }
         return readAXTexts(from: current)
@@ -125,7 +128,7 @@ public final class TextInserter {
             initialElement = nil
             initialTexts = fakeReader!() ?? []
         } else {
-            initialElement = currentFocusedElement()
+            initialElement = pasteboard.name == NSPasteboard.general.name ? currentFocusedElement() : nil
             if let initialElement {
                 initialTexts = readAXTexts(from: initialElement)
             } else {
@@ -138,7 +141,7 @@ public final class TextInserter {
 
         postKeystroke()
 
-        var elapsed: TimeInterval = 0.0
+        let deadline = now() + timeout
 
         func checkConfirmed(currentTexts: [String]?) -> Bool {
             guard let currentTexts, !needle.isEmpty else { return false }
@@ -151,15 +154,14 @@ public final class TextInserter {
         }
 
         func pollStep() {
-            elapsed += self.pollInterval
             let currentTexts = self.sampleTexts(initialElement: initialElement)
-            if checkConfirmed(currentTexts: currentTexts) {
+            if self.now() <= deadline, checkConfirmed(currentTexts: currentTexts) {
                 saved.restore(to: self.pasteboard, ifUnchangedSince: ourChangeCount)
                 self.log("paste_confirm=ax")
                 completion?()
                 self.inFlight = false
                 self.insertNext()
-            } else if elapsed >= self.timeout - 1e-6 {
+            } else if self.now() >= deadline - 1e-6 {
                 // Timeout: do NOT restore; retain dictation so manual command V can recover
                 self.log("paste_confirm=timeout")
                 completion?()

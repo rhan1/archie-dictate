@@ -63,7 +63,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts },
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert("DICTATION_LATE")
@@ -107,7 +108,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts },
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert("DICTATION_SUCCESS") {
@@ -147,7 +149,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts }, // stays empty
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert("RETAIN_ME_ON_TIMEOUT") {
@@ -197,7 +200,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts },
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert("DICTATION_CLOBBER_TEST")
@@ -231,7 +235,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts },
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert("PASTE_ONE") {
@@ -291,7 +296,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts },
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert(secretText)
@@ -333,7 +339,8 @@ struct V15PasteConfirmationTests {
             pollInterval: 0.1,
             timeout: 10.0,
             axReader: { axBox.texts },
-            logger: logBox.log
+            logger: logBox.log,
+            now: { clock.now }
         )
 
         inserter.insert(dictation)
@@ -352,4 +359,23 @@ struct V15PasteConfirmationTests {
         #expect(pb.string(forType: .string) == "ORIGINAL_CLIPBOARD")
         #expect(logBox.lines.contains("paste_confirm=ax"))
     }
+    @Test func stalledQueueUsesWallDeadline() async {
+        let pb = seededPasteboard()
+        defer { pb.releaseGlobally() }
+        var work: (() -> Void)?
+        var now: TimeInterval = 0
+        var finished = false
+        var log: [String] = []
+        let inserter = TextInserter(pasteboard: pb, postKeystroke: {},
+            schedule: { _, callback in work = callback }, axReader: { [] },
+            logger: { log.append($0) }, now: { now })
+        inserter.insert("RECOVERY") { finished = true }
+        for _ in 0..<500 where work == nil { await Task.yield() }
+        now = 11
+        work?()
+        #expect(finished)
+        #expect(pb.string(forType: .string) == "RECOVERY")
+        #expect(log == ["paste_confirm=timeout"])
+    }
+
 }
