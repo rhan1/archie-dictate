@@ -197,7 +197,7 @@ public final class AppController {
             self.inserter.insert(text)
         }
 
-        let trusted = isAppRuntime() ? AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) : false
+        let trusted = Self.isAppRuntime() ? AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) : false
         let tapOK = hotkeys.start()
         AppController.note("started pid=\(getpid()) accessibility=\(trusted) eventTap=\(tapOK) promptChars=\(prompt.count) fake=\(fakeTranscript != nil) bt_profile=\(BluetoothProfile.sample())")
         // Property reads only; never opens a device.
