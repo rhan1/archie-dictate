@@ -197,7 +197,7 @@ public final class AppController {
             self.inserter.insert(text)
         }
 
-        let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        let trusted = isAppRuntime() ? AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) : false
         let tapOK = hotkeys.start()
         AppController.note("started pid=\(getpid()) accessibility=\(trusted) eventTap=\(tapOK) promptChars=\(prompt.count) fake=\(fakeTranscript != nil) bt_profile=\(BluetoothProfile.sample())")
         // Property reads only; never opens a device.
@@ -273,6 +273,16 @@ public final class AppController {
     }
     /// Tests: a finish before the mic start completes is discarded by design (BT3); wait this out.
     var micStartPending: Bool { micStarting }
+    /// Production permission prompting/AX reads may happen only when Bundle.main.bundleURL
+    /// is an .app and executableURL is within Contents/MacOS of that same bundle.
+    /// Pure, so it can be tested directly and fails closed outside an app bundle.
+    static func isAppRuntime(
+        bundleURL: URL = Bundle.main.bundleURL,
+        executableURL: URL? = Bundle.main.executableURL
+    ) -> Bool {
+        TextInserter.isAppRuntime(bundleURL: bundleURL, executableURL: executableURL)
+    }
+
     /// The explicit URL wins; else a non-empty `DICTATE_INJECT_WAV` path.
     static func injectedAudioURL(_ explicit: URL?, environment: [String: String]) -> URL? {
         if let explicit { return explicit }
