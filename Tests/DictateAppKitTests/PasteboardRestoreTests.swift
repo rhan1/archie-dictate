@@ -63,10 +63,19 @@ struct PasteboardRestoreTests {
         pb.setString("SENTINEL-CLIP", forType: .string)
 
         var seenAtKeystroke: String?
-        let inserter = TextInserter(pasteboard: pb, postKeystroke: { seenAtKeystroke = pb.string(forType: .string) })
+        var axTexts: [String]? = []
+        let inserter = TextInserter(
+            pasteboard: pb,
+            postKeystroke: {
+                seenAtKeystroke = pb.string(forType: .string)
+                axTexts = ["hello from dictate"]
+            },
+            pollInterval: 0.01,
+            axReader: { axTexts }
+        )
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             DispatchQueue.main.async {
-                inserter.insert("hello from dictate") { done.resume() }
+                inserter.insert("hello from dictate", completion: { done.resume() })
             }
         }
         #expect(seenAtKeystroke == "hello from dictate")
