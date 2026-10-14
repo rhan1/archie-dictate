@@ -17,9 +17,18 @@ struct InsertionTests {
         let pb = seededPasteboard()
         defer { pb.releaseGlobally() }
         var seen: String?
-        let inserter = TextInserter(pasteboard: pb, postKeystroke: { seen = pb.string(forType: .string) })
+        var axTexts: [String]? = []
+        let inserter = TextInserter(
+            pasteboard: pb,
+            postKeystroke: {
+                seen = pb.string(forType: .string)
+                axTexts = ["DICTATION"]
+            },
+            pollInterval: 0.01,
+            axReader: { axTexts }
+        )
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            inserter.insert("DICTATION") { done.resume() }
+            inserter.insert("DICTATION", completion: { done.resume() })
         }
         #expect(seen == "DICTATION")
         #expect(pb.string(forType: .string) == "ORIGINAL")
@@ -30,7 +39,7 @@ struct InsertionTests {
         defer { pb.releaseGlobally() }
         let inserter = TextInserter(pasteboard: pb, postKeystroke: {})
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            inserter.insert("DICTATION") { done.resume() }
+            inserter.insert("DICTATION", completion: { done.resume() })
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 pb.clearContents()
                 pb.setString("NEW_USER_COPY", forType: .string)
@@ -45,20 +54,36 @@ struct InsertionTests {
         var keystrokes: [String] = []
         var completions: [String] = []
         var atCompletion: [String] = []
-        let inserter = TextInserter(pasteboard: pb, postKeystroke: {
-            keystrokes.append(pb.string(forType: .string) ?? "nil")
-        })
+        var axTexts: [String]? = []
+        let inserter = TextInserter(
+            pasteboard: pb,
+            postKeystroke: {
+                let current = pb.string(forType: .string) ?? "nil"
+                keystrokes.append(current)
+                if current == "DICTATION_ONE" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        axTexts = ["DICTATION_ONE"]
+                    }
+                } else if current == "DICTATION_TWO" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        axTexts = ["DICTATION_TWO"]
+                    }
+                }
+            },
+            pollInterval: 0.01,
+            axReader: { axTexts }
+        )
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            inserter.insert("DICTATION_ONE") {
+            inserter.insert("DICTATION_ONE", completion: {
                 completions.append("one")
                 atCompletion.append(pb.string(forType: .string) ?? "nil")
-            }
+            })
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                inserter.insert("DICTATION_TWO") {
+                inserter.insert("DICTATION_TWO", completion: {
                     completions.append("two")
                     atCompletion.append(pb.string(forType: .string) ?? "nil")
                     done.resume()
-                }
+                })
             }
         }
         #expect(keystrokes == ["DICTATION_ONE", "DICTATION_TWO"])
@@ -90,17 +115,30 @@ struct InsertionTests {
         defer { pb.releaseGlobally() }
         let clock = ManualMainScheduler()
         var slowReader: String?
-        let inserter = TextInserter(pasteboard: pb, postKeystroke: {
-            clock.schedule(0.6) { slowReader = pb.string(forType: .string) }
-        }, schedule: clock.schedule)
+        var axTexts: [String]? = []
+        let inserter = TextInserter(
+            pasteboard: pb,
+            postKeystroke: {
+                clock.schedule(0.6) {
+                    slowReader = pb.string(forType: .string)
+                }
+                clock.schedule(1.5) {
+                    axTexts = ["DICTATION"]
+                }
+            },
+            schedule: clock.schedule,
+            pollInterval: 0.1,
+            timeout: 10.0,
+            axReader: { axTexts },
+            now: { clock.now }
+        )
         inserter.insert("DICTATION")
-        for _ in 0..<500 where clock.items.count < 2 { await Task.yield(); try? await Task.sleep(nanoseconds: 1_000_000) }
-        #expect(clock.items.count == 2)                       // the reader and the restore, nothing ran yet
+        for _ in 0..<500 where clock.items.isEmpty { await Task.yield(); try? await Task.sleep(nanoseconds: 1_000_000) }
         clock.advance(to: 0.6)
         #expect(slowReader == "DICTATION")
-        clock.advance(to: TextInserter.restoreDelay - 0.001)
+        clock.advance(to: 1.0)
         #expect(pb.string(forType: .string) == "DICTATION")
-        clock.advance(to: TextInserter.restoreDelay)
+        clock.advance(to: 1.5)
         #expect(pb.string(forType: .string) == "ORIGINAL")
     }
 

@@ -274,7 +274,16 @@ struct DictationEngineTests {
             let clipboard = NSPasteboard(name: .init("dictate-l1-\(UUID().uuidString)"))
             defer { clipboard.releaseGlobally() }
             clipboard.setString("ORIGINAL", forType: .string)
-            let inserter = TextInserter(pasteboard: clipboard, postKeystroke: { pastes += 1 })
+            var axTexts: [String]? = []
+            let inserter = TextInserter(
+                pasteboard: clipboard,
+                postKeystroke: {
+                    pastes += 1
+                    axTexts = [clean]
+                },
+                pollInterval: 0.01,
+                axReader: { axTexts }
+            )
             let dependencies = EngineDependencies(recorder: recorder, makeApple: { apple }, sttTransport: stt,
                 groqCleanupTransport: groq, localCleanupTransport: local, inserter: inserter,
                 panelFactory: { creations += 1; return panel }, requestMicrophoneAccess: { $0(true) },
