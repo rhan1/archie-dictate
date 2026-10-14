@@ -57,7 +57,25 @@ public final class TextInserter {
         }
     }
 
+    /// Production permission prompting/AX reads may happen only when Bundle.main.bundleURL
+    /// is an .app and executableURL is within Contents/MacOS of that same bundle.
+    /// Pure, so it can be tested directly and fails closed outside an app bundle.
+    public static func isAppRuntime(
+        bundleURL: URL = Bundle.main.bundleURL,
+        executableURL: URL? = Bundle.main.executableURL
+    ) -> Bool {
+        let bundle = bundleURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard bundle.pathExtension == "app" || bundle.path.hasSuffix(".app"),
+              let executable = executableURL?.standardizedFileURL.resolvingSymlinksInPath() else {
+            return false
+        }
+        let macosDir = bundle.appendingPathComponent("Contents/MacOS").standardizedFileURL.resolvingSymlinksInPath()
+        let macosPath = macosDir.path.hasSuffix("/") ? macosDir.path : macosDir.path + "/"
+        return executable.path.hasPrefix(macosPath)
+    }
+
     private func currentFocusedElement() -> AXUIElement? {
+        guard Self.isAppRuntime() else { return nil }
         let systemWide = AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef)
