@@ -19,11 +19,11 @@
 int main(void) { @autoreleasepool {
     int failures = 0;
     NSError *error = nil;
-    for (NSNumber *number in @[@24000, @0, @(-1), @(NAN)]) {
+    for (NSNumber *number in @[@24000, @0, @0.5, @(-1), @(NAN)]) {
         double rate = number.doubleValue;
         error = nil;
         AVAudioFormat *format = dictate_pcm_format(AVAudioPCMFormatInt16, rate, 1, YES, &error);
-        BOOL valid = isfinite(rate) && rate > 0;
+        BOOL valid = isfinite(rate) && rate >= 1;
         printf("R0 DICTATE_NATIVE rate=%g format=%d error=%d\n", rate, format != nil, error != nil);
         failures += ((format != nil) != valid || (!valid && error == nil));
     }

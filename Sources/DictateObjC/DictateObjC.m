@@ -25,13 +25,13 @@ static void dictate_audio_error(NSError **error, NSString *reason) {
         userInfo:@{NSLocalizedDescriptionKey: reason}];
 }
 static BOOL dictate_valid_format(AVAudioFormat *format) {
-    return format && isfinite(format.sampleRate) && format.sampleRate > 0 && format.sampleRate <= 384000
+    return format && isfinite(format.sampleRate) && format.sampleRate >= 1 && format.sampleRate <= 384000
         && format.channelCount > 0 && format.channelCount <= 32;
 }
 AVAudioFormat *dictate_pcm_format(AVAudioCommonFormat commonFormat, double rate,
     AVAudioChannelCount channels, BOOL interleaved, NSError **error) {
     @try {
-        if (!isfinite(rate) || rate <= 0 || rate > 384000 || channels == 0 || channels > 32) {
+        if (!isfinite(rate) || rate < 1 || rate > 384000 || channels == 0 || channels > 32) {
             dictate_audio_error(error, @"invalid PCM format"); return nil;
         }
         AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:commonFormat sampleRate:rate
