@@ -95,9 +95,11 @@ struct RigInertTests {
         var run = Run()
         let recorder = RigRecorder()
         let text = "Please send the whole report on Tuesday."
+        var axTexts: [String]? = []
         let dependencies = EngineDependencies(recorder: recorder, makeApple: { RigApple() }, sttTransport: RigHTTP(text),
             groqCleanupTransport: RigHTTP(text), localCleanupTransport: RigHTTP(text),
-            inserter: TextInserter(pasteboard: clipboard, postKeystroke: { run.pastes += 1 }),
+            inserter: TextInserter(pasteboard: clipboard, postKeystroke: { run.pastes += 1; axTexts = [text] },
+                                   axReader: { axTexts }),
             panelFactory: { RigPanel() }, requestMicrophoneAccess: { $0(true) },
             frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
         let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate, dependencies: dependencies)

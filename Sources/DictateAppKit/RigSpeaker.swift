@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreAudio
 import DictateCore
+import DictateObjC
 
 /// v1.14: the rig's mouth (`DictateBench rig-play`). Plays a 24 kHz mono 16-bit clip through the BUILT-IN
 /// output device, bound by its UID on a private AVAudioEngine's output unit, peak-normalised to a fixed
@@ -43,8 +44,8 @@ public enum RigSpeaker {
         guard let (device, uid) = builtInOutput() else {
             return Result(deviceUID: "-", gainDB: gainDB, peakDBFS: levelDBFS, durationMs: 0, enginesOpened: enginesOpened, outcome: "no_builtin_output")
         }
-        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else {
+        guard let format = try? NativePCM.format(.pcmFormatFloat32, rate: 24_000, channels: 1, interleaved: false),
+              let buffer = try? NativePCM.buffer(format, capacity: samples.count) else {
             return Result(deviceUID: uid, gainDB: gainDB, peakDBFS: levelDBFS, durationMs: 0, enginesOpened: enginesOpened, outcome: "no_buffer")
         }
         buffer.frameLength = AVAudioFrameCount(samples.count)
@@ -54,27 +55,23 @@ public enum RigSpeaker {
         let engine = AVAudioEngine()
         enginesOpened += 1
         let player = AVAudioPlayerNode()
-        engine.attach(player)
         let started = ContinuousClock.now
-        do {
-            // Bind THIS engine's output unit to the built-in device; the system default is untouched.
-            try engine.outputNode.auAudioUnit.setDeviceID(device)
-            engine.connect(player, to: engine.mainMixerNode, format: format)
-            engine.prepare()
-            try engine.start()
-        } catch {
+        var error: NSError?
+        guard dictate_rig_start(engine, player, format, device, &error) else {
+            _ = dictate_rig_stop(engine, player, &error)
             return Result(deviceUID: uid, gainDB: gainDB, peakDBFS: levelDBFS, durationMs: 0, enginesOpened: enginesOpened, outcome: "engine_error")
         }
         let done = DispatchSemaphore(value: 0)
-        player.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { _ in done.signal() }
-        player.play()
+        guard dictate_rig_schedule_play(player, buffer, { _ in done.signal() }, &error) else {
+            _ = dictate_rig_stop(engine, player, &error)
+            return Result(deviceUID: uid, gainDB: gainDB, peakDBFS: levelDBFS, durationMs: 0, enginesOpened: enginesOpened, outcome: "schedule_error")
+        }
         let finished = done.wait(timeout: .now() + .milliseconds(durationMs + 5_000)) == .success
-        player.stop()
-        engine.stop()
+        let stopped = dictate_rig_stop(engine, player, &error)
         let elapsed = started.duration(to: .now)
         let playedMs = Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
         return Result(deviceUID: uid, gainDB: gainDB, peakDBFS: levelDBFS, durationMs: playedMs, enginesOpened: enginesOpened,
-                      outcome: finished ? "ok" : "timeout")
+                      outcome: !stopped ? "stop_error" : (finished ? "ok" : "timeout"))
     }
 
     /// The built-in output (transport built-in, has output streams) and its UID; property reads only.

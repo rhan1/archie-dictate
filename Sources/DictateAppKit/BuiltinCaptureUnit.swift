@@ -35,8 +35,8 @@ final class BuiltinCaptureUnit: BuiltinCapture {
     private var lastArrival: TimeInterval?
     private var retained: [BuiltinRenderContext] = []
     private(set) var deviceUID: String?
-    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate,
-                                             channels: 1, interleaved: false)!
+    private let targetFormat = try? NativePCM.format(.pcmFormatFloat32, rate: AudioRecorder.sampleRate,
+                                             channels: 1, interleaved: false)
     /// Notes for the recorder's timeline (start step errors, teardown errors, render errors).
     var note: (String) -> Void = { AppController.note($0) }
 
@@ -60,6 +60,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
     }
 
     func start(epoch token: CaptureEpoch) throws {
+        guard let targetFormat else { throw StartError(step: "target_format", status: -1) }
         stop()
         let id = try AudioDevices.builtInInput()
         let uid = AudioDevices.uid(of: id)
@@ -99,14 +100,15 @@ final class BuiltinCaptureUnit: BuiltinCapture {
                                                   inputProcRefCon: Unmanaged.passUnretained(context).toOpaque())
             try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
                                            &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "input_callback")
-            guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hardware.mSampleRate,
+            guard let mono = try? NativePCM.format(.pcmFormatFloat32, rate: hardware.mSampleRate,
                                            channels: 1, interleaved: false) else {
                 throw StartError(step: "mono_format", status: -1)
             }
+            let preparedConverter = try NativePCM.converter(from: mono, to: targetFormat)
             lock.withLock {
                 self.context = context
                 hardwareFormat = mono
-                converter = AVAudioConverter(from: mono, to: targetFormat)
+                converter = preparedConverter
             }
             try check(AudioUnitInitialize(unit), "initialize")
             try check(AudioOutputUnitStart(unit), "start")
@@ -171,14 +173,14 @@ final class BuiltinCaptureUnit: BuiltinCapture {
 
     /// Worker: slots → mono hardware-rate buffer → 24 kHz → onFrames.
     private func drain() {
-        guard let (context, converter, format, token) = lock.withLock({ () -> (BuiltinRenderContext, AVAudioConverter, AVAudioFormat, CaptureEpoch)? in
+        guard let targetFormat, let (context, converter, format, token) = lock.withLock({ () -> (BuiltinRenderContext, AVAudioConverter, AVAudioFormat, CaptureEpoch)? in
             guard let context, let converter, let hardwareFormat, let epoch else { return nil }
             return (context, converter, hardwareFormat, epoch)
         }) else { return }
         let errors = context.renderErrors.exchange(0, ordering: .relaxed)
         if errors > 0 { note("builtin_render_errors=\(errors) status=\(context.lastStatus.load(ordering: .relaxed))") }
         while let (frames, hostTime) = context.nextSlot({ pointer, count in
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)),
+            guard let buffer = try? NativePCM.buffer(format, capacity: count),
                   let channel = buffer.floatChannelData?[0] else { return nil as AVAudioPCMBuffer? }
             channel.update(from: pointer, count: count)
             buffer.frameLength = AVAudioFrameCount(count)
@@ -186,17 +188,15 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         }) {
             guard let input = frames else { continue }
             let ratio = targetFormat.sampleRate / format.sampleRate
-            let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 32
-            guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { continue }
+            let capacity = Int(Double(input.frameLength) * ratio) + 32
+            guard let out = try? NativePCM.buffer(targetFormat, capacity: Int(capacity)) else { continue }
             var fed = false
-            var error: NSError?
-            converter.convert(to: out, error: &error) { _, status in
+            do { _ = try NativePCM.convert(converter, to: out) { _, status in
                 if fed { status.pointee = .noDataNow; return nil }
                 fed = true
                 status.pointee = .haveData
                 return input
-            }
-            if let error { note("builtin_convert_error=\(error.domain):\(error.code)"); continue }
+            } } catch { let error = error as NSError; note("builtin_convert_error=\(error.domain):\(error.code)"); continue }
             guard let channel = out.floatChannelData?[0], out.frameLength > 0 else { continue }
             let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
             let arrival = ProcessInfo.processInfo.systemUptime
