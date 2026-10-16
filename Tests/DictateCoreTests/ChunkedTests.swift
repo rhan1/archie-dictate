@@ -379,11 +379,16 @@ struct GroqChunkedTests {
     }
 
     @Test func noHedgeWhenFast() async {
-        let transport = HedgeTransport(.fast)
+        // Measures 10 ms response before 50 ms hedge using the same injected clock on both.
+        let manual = ManualClock()
+        let transport = HedgeTransport(.fast, clock: manual)
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
-                                            prompt: "", hedgeAfterMs: 50)
+                                            prompt: "", hedgeAfterMs: 50, clock: manual)
         engine.submit(chunk(0, tag: 1000))
-        let result = await engine.finish()
+        let finishTask = Task { await engine.finish() }
+        #expect(await manual.waitForSleepers(2))
+        manual.advance(by: .milliseconds(10))
+        let result = await finishTask.value
         #expect(result.text == "primary")
         #expect(result.hedges == 0)
         #expect(result.hedgeWins == 0)
