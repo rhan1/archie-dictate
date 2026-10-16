@@ -403,7 +403,9 @@ struct DictationEngineTests {
         let clipboard = NSPasteboard(name: .init("dictate-d3-\(UUID().uuidString)"))
         defer { clipboard.releaseGlobally() }
         var pastes = 0
-        let inserter = TextInserter(pasteboard: clipboard, postKeystroke: { pastes += 1 })
+        var confirmedTexts: [String]? = []
+        let inserter = TextInserter(pasteboard: clipboard, postKeystroke: { pastes += 1; confirmedTexts = [clean] },
+                                    axReader: { confirmedTexts })
         let dependencies = EngineDependencies(recorder: recorder, makeApple: { apple }, sttTransport: stt,
             groqCleanupTransport: groq, localCleanupTransport: local, inserter: inserter,
             panelFactory: { panel }, requestMicrophoneAccess: { $0(true) },
@@ -549,3 +551,50 @@ private actor TestSequenceTransport: HTTPTransport {
     }
 }
 
+
+extension DictationEngineTests {
+    @Test func pasteOutcomeWaitsForConfirmationAndTimeoutOffersRecovery() async throws {
+        for confirms in [true, false] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-v53-outcome-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(home: root)
+            let keys = KeyStore(reader: { _ in "fixture" })
+            keys.prefetch(services: ["groq-api"])
+            try await waitFor { keys.key(for: "groq-api") != nil }
+            let pb = NSPasteboard(name: .init("dictate-v53-outcome-\(UUID().uuidString)"))
+            defer { pb.releaseGlobally() }
+            pb.setString("ORIGINAL", forType: .string)
+            let clock = V15PasteConfirmationTests.ManualMainScheduler()
+            let ax = V15PasteConfirmationTests.AXMockBox()
+            let words = "Please send the whole report on Tuesday."
+            let recorder = TestRecorder()
+            var posted = false
+            let inserter = TextInserter(pasteboard: pb, postKeystroke: { posted = true },
+                schedule: clock.schedule, axReader: { ax.texts }, now: { clock.now })
+            let deps = EngineDependencies(recorder: recorder, makeApple: { TestApple(words) },
+                sttTransport: TestHTTP(words), groqCleanupTransport: TestHTTP(words), localCleanupTransport: TestHTTP(words),
+                inserter: inserter, panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+                frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+            let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate, dependencies: deps)
+            let engine = DictationEngine(controller: controller)
+            var states: [DictateAppKit.DictationState] = []
+            engine.onState = { states.append($0) }
+            engine.start()
+            try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending }
+            engine.finish()
+            try await waitFor { posted }
+            let before = (try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? ""
+            print("R0 PASTE_UI pending=\(!states.contains(.pasted)) logged_ok=\(before.contains("outcome=ok"))")
+            #expect(!states.contains(.pasted))
+            #expect(!before.contains("outcome=ok"))
+            if confirms { ax.texts = [words] }
+            clock.advance(to: confirms ? 0.2 : 10.1)
+            if confirms { #expect(states.last == .pasted) }
+            else { #expect(states.last == .held(preview: words)); #expect(!states.contains(.pasted)) }
+            let after = try String(contentsOf: paths.logURL, encoding: .utf8)
+            #expect(after.contains(confirms ? "outcome=ok" : "outcome=held:paste_timeout"))
+            #expect(pb.string(forType: .string) == (confirms ? "ORIGINAL" : words))
+            engine.cancel()
+        }
+    }
+}

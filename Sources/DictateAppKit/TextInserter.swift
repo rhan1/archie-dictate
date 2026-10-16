@@ -6,8 +6,9 @@ import ApplicationServices
 
 /// D3: borrow the clipboard, synthesize ⌘V, then put the clipboard back.
 /// D1 (v1.15): restore old clipboard only after inserted text is confirmed in the SAME initially
-/// focused accessibility element via AXValue / AXSelectedText (last 40 characters of dictation).
+/// focused accessibility element via an AXValue / AXSelectedText insertion delta.
 public final class TextInserter {
+    public enum Result: Equatable, Sendable { case confirmed, timedOut, held }
     public static let restoreDelay: TimeInterval = 1.0
     public static let defaultTimeout: TimeInterval = 10.0
     public static let defaultPollInterval: TimeInterval = 0.1
@@ -16,7 +17,7 @@ public final class TextInserter {
     private let pasteboard: NSPasteboard
     private let postKeystroke: () -> Void
     // Accessed only on the main queue, including reentrant completion calls.
-    private var pending: [(text: String, shouldInsert: (() -> Bool)?, completion: (() -> Void)?)] = []
+    private var pending: [(text: String, shouldInsert: (() -> Bool)?, result: ((Result) -> Void)?, completion: (() -> Void)?)] = []
     private var inFlight = false
     /// Runs `work` on the main queue after a delay (v1.12: injectable so tests run on a manual clock).
     private let schedule: (TimeInterval, @escaping () -> Void) -> Void
@@ -50,9 +51,9 @@ public final class TextInserter {
     /// runs on the main queue after the restore window (a newer copy is kept).
     /// `shouldInsert` runs when this request reaches the head of the queue,
     /// before borrowing the clipboard, so callers can recheck the destination.
-    public func insert(_ text: String, shouldInsert: (() -> Bool)? = nil, completion: (() -> Void)? = nil) {
+    public func insert(_ text: String, shouldInsert: (() -> Bool)? = nil, onResult: ((Result) -> Void)? = nil, completion: (() -> Void)? = nil) {
         DispatchQueue.main.async {
-            self.pending.append((text, shouldInsert, completion))
+            self.pending.append((text, shouldInsert, onResult, completion))
             self.insertNext()
         }
     }
@@ -95,14 +96,6 @@ public final class TextInserter {
                 texts.append(attr.string)
             }
         }
-        var selectedRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selectedRef) == .success, let selectedRef {
-            if let str = selectedRef as? String {
-                texts.append(str)
-            } else if let attr = selectedRef as? NSAttributedString {
-                texts.append(attr.string)
-            }
-        }
         return texts
     }
 
@@ -119,8 +112,9 @@ public final class TextInserter {
     private func insertNext() {
         guard !inFlight, !pending.isEmpty else { return }
         inFlight = true
-        let (text, shouldInsert, completion) = pending.removeFirst()
+        let (text, shouldInsert, onResult, completion) = pending.removeFirst()
         if let shouldInsert, !shouldInsert() {
+            onResult?(.held)
             completion?()
             inFlight = false
             insertNext()
@@ -134,6 +128,7 @@ public final class TextInserter {
 
         if text.isEmpty {
             saved.restore(to: pasteboard, ifUnchangedSince: ourChangeCount)
+            onResult?(.confirmed)
             completion?()
             inFlight = false
             insertNext()
@@ -154,21 +149,23 @@ public final class TextInserter {
             }
         }
 
-        let needle = String(text.suffix(40))
-        let initialHadNeedle = !needle.isEmpty && initialTexts.contains(where: { $0.contains(needle) })
-
         postKeystroke()
-
         let deadline = now() + timeout
 
         func checkConfirmed(currentTexts: [String]?) -> Bool {
-            guard let currentTexts, !needle.isEmpty else { return false }
-            let hasNeedle = currentTexts.contains(where: { $0.contains(needle) })
-            guard hasNeedle else { return false }
-            if initialHadNeedle {
-                return currentTexts != initialTexts
+            guard let currentTexts else { return false }
+            // Compare each AX attribute against its own baseline. An old suffix
+            // plus an unrelated edit is not evidence that this paste landed.
+            for (index, current) in currentTexts.prefix(1).enumerated() {
+                let initial = index < initialTexts.count ? initialTexts[index] : ""
+                // Count complete new occurrences rather than a minimal string
+                // diff (which trims shared letters from a real replacement).
+                func occurrences(_ value: String) -> Int {
+                    value.components(separatedBy: text).count - 1
+                }
+                if occurrences(current) > occurrences(initial) { return true }
             }
-            return true
+            return false
         }
 
         func pollStep() {
@@ -176,12 +173,14 @@ public final class TextInserter {
             if self.now() <= deadline, checkConfirmed(currentTexts: currentTexts) {
                 saved.restore(to: self.pasteboard, ifUnchangedSince: ourChangeCount)
                 self.log("paste_confirm=ax")
+                onResult?(.confirmed)
                 completion?()
                 self.inFlight = false
                 self.insertNext()
             } else if self.now() >= deadline - 1e-6 {
                 // Timeout: do NOT restore; retain dictation so manual command V can recover
                 self.log("paste_confirm=timeout")
+                onResult?(.timedOut)
                 completion?()
                 self.inFlight = false
                 self.insertNext()

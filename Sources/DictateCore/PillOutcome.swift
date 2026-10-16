@@ -21,7 +21,9 @@ public struct PillOutcome: Equatable, Sendable {
     public var label: String? {
         guard isVisible else { return nil }
         switch kind {
-        case .held(let reason): return reason == "no_stt" ? "no speech" : "held"
+        case .held(let reason):
+            if reason == "paste_timeout" { return "paste unconfirmed · ⌘V to paste" }
+            return reason == "no_stt" ? "no speech" : "held"
         case .error(let reason):
             let reason = reason.lowercased()
             if reason.contains("mic_dead") { return "no mic signal" }

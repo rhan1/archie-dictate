@@ -918,27 +918,41 @@ public final class AppController {
                             }
                             return
                         }
+                        var pasteApp = ""
                         self.inserter.insert(text, shouldInsert: {
                             let now = self.currentTarget()
-                            let app = now?.bundleID ?? ""
+                            pasteApp = now?.bundleID ?? ""
                             switch InsertionTarget.decide(start: start, now: now) {
                             case .paste:
-                                if let cleanup = report.cleanup, cleanup != "skipped:short", cleanup.hasPrefix("skipped:") || cleanup.hasPrefix("rejected:") {
-                                    self.showOutcome(.rawPasted(cleanup))
-                                } else {
-                                    self.showOutcome(.ok)
-                                }
+                                self.clearOutcome()
+                                self.pill.show(.transcribing, status: "pasting")
+                                self.engineOnState?(.transcribing)
                                 self.traceFocus("pasting")
-                                self.appendLog(entry(text.count, app, .ok), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
                                 return true
                             case .hold:
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(text, forType: .string)
-                                self.rememberHeldDictation(text)
-                                self.showOutcome(.held("focus_changed"), text: text)
-                                self.appendLog(entry(text.count, app, .held("focus_changed")), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
                                 return false
                             }
+                        }, onResult: { result in
+                            // Finish the original session log even if a newer recording has
+                            // started. Only the current generation may change its surface.
+                            let outcome: DictationOutcome
+                            switch result {
+                            case .confirmed:
+                                outcome = .ok
+                                if myGeneration === self.generation {
+                                    if let cleanup = report.cleanup, cleanup != "skipped:short", cleanup.hasPrefix("skipped:") || cleanup.hasPrefix("rejected:") {
+                                        self.showOutcome(.rawPasted(cleanup))
+                                    } else { self.showOutcome(.ok) }
+                                }
+                            case .timedOut, .held:
+                                let reason = result == .timedOut ? "paste_timeout" : "focus_changed"
+                                outcome = result == .timedOut ? .held("paste_timeout") : .held("focus_changed")
+                                self.rememberHeldDictation(text)
+                                if myGeneration === self.generation { self.showOutcome(.held(reason), text: text) }
+                            }
+                            self.appendLog(entry(text.count, pasteApp, outcome), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
                         })
                     })
                     if !policy.usesPaste {
