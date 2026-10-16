@@ -236,7 +236,8 @@ struct ClockDeterminismTests {
 
     // Stalled by 300 ms on an 850 ms total bound: breaks the wall-clock bound deterministically.
     @Test func raceStartsSingleAfter600RealClockUnderStallRed() async throws {
-        let transport = StallRaceTransport(midMs: 1_000)
+        // Pending network fixture so mid stays in-flight until ~1 s single fallback finishes and cancels it; no changed performance target.
+        let transport = StallRaceTransport(midMs: 30_000)
         let incremental = IncrementalCleaner(cleaner: TranscriptCleaner(
             transport: transport, vocabulary: "", apiKey: { "hermetic-key" }))
         incremental.append(index: 0, text: chunkText)

@@ -118,15 +118,19 @@ struct WAVInjectedRecorderTests {
         try wavData.write(to: wavURL)
 
         let recorder = WAVInjectedRecorder(url: wavURL, pace: 0.1)
+        let lock = NSLock()
+        var deliveredCount = 0
+        recorder.onPCMChunk = { chunk in
+            lock.withLock { deliveredCount += chunk.count }
+        }
         try recorder.start()
         #expect(recorder.isRunning == true)
         #expect(recorder.isAllocated == true)
 
         let start = DispatchTime.now()
         while DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds < 1_000_000_000 {
-            if !recorder.isRunning { break }
-            try await Task.sleep(nanoseconds: 60_000_000)
-            break
+            if lock.withLock({ deliveredCount >= 8_400 }) { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
         }
 
         let stoppedSamples = recorder.stop()
