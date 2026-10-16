@@ -86,8 +86,9 @@ final class BuiltinCaptureUnit: BuiltinCapture {
             var hardware = AudioStreamBasicDescription()
             var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
             try check(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hardware, &size), "hw_format")
-            guard hardware.mSampleRate > 0, hardware.mChannelsPerFrame > 0 else {
-                throw StartError(step: "hw_format_invalid", status: Int32(hardware.mSampleRate))
+            guard hardware.mSampleRate.isFinite, hardware.mSampleRate >= 1, hardware.mSampleRate <= 384_000,
+                  hardware.mChannelsPerFrame > 0, hardware.mChannelsPerFrame <= 32 else {
+                throw StartError(step: "hw_format_invalid", status: -1)
             }
             // AUHAL's input element does no rate conversion: the client keeps the hardware rate (TN2091).
             var client = AudioStreamBasicDescription(mSampleRate: hardware.mSampleRate, mFormatID: kAudioFormatLinearPCM,
