@@ -15,8 +15,8 @@ public final class AppleTranscriber: @unchecked Sendable {
     private var collector: Task<String, Error>?
     private var converter: AVAudioConverter?
     private var targetFormat: AVAudioFormat?
-    private let sourceFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: AudioRecorder.sampleRate,
-                                             channels: 1, interleaved: true)!
+    private let sourceFormat = try? NativePCM.format(.pcmFormatInt16, rate: AudioRecorder.sampleRate, channels: 1, interleaved: true)
+    private var conversionFailure: Error?
     private let lock = NSLock()
     private var started = false
     private var pending: [[Int16]] = []
@@ -38,9 +38,11 @@ public final class AppleTranscriber: @unchecked Sendable {
     }
 
     public func start() async throws {
+        guard let sourceFormat else { throw AppleError.noFormat }
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
             throw AppleError.noFormat
         }
+        let preparedConverter = try NativePCM.converter(from: sourceFormat, to: format)
         let transcriber = self.transcriber
         collector = Task {
             var text = ""
@@ -52,7 +54,7 @@ public final class AppleTranscriber: @unchecked Sendable {
         try await analyzer.start(inputSequence: input)
         let queued: [[Int16]] = lock.withLock {
             targetFormat = format
-            converter = AVAudioConverter(from: sourceFormat, to: format)
+            converter = preparedConverter
             started = true
             defer { pending.removeAll() }
             return pending
@@ -70,32 +72,39 @@ public final class AppleTranscriber: @unchecked Sendable {
     }
 
     private func feed(_ samples: [Int16]) {
-        guard !samples.isEmpty,
+        guard !samples.isEmpty, let sourceFormat,
               let (converter, format) = lock.withLock({ () -> (AVAudioConverter, AVAudioFormat)? in
                   guard let converter, let targetFormat else { return nil }
                   return (converter, targetFormat)
-              }),
-              let source = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(samples.count))
-        else { return }
-        source.frameLength = AVAudioFrameCount(samples.count)
-        samples.withUnsafeBufferPointer { src in
-            source.int16ChannelData![0].update(from: src.baseAddress!, count: samples.count)
+              }) else { return }
+        do {
+            let source = try NativePCM.buffer(sourceFormat, capacity: samples.count)
+            source.frameLength = AVAudioFrameCount(samples.count)
+            samples.withUnsafeBufferPointer { src in
+                source.int16ChannelData![0].update(from: src.baseAddress!, count: samples.count)
+            }
+            let capacity = Int(Double(samples.count) * format.sampleRate / sourceFormat.sampleRate) + 64
+            let out = try NativePCM.buffer(format, capacity: capacity)
+            var fed = false
+            _ = try NativePCM.convert(converter, to: out) { _, status in
+                if fed { status.pointee = .noDataNow; return nil }
+                fed = true; status.pointee = .haveData; return source
+            }
+            if out.frameLength > 0 { inputContinuation.yield(AnalyzerInput(buffer: out)) }
+        } catch {
+            lock.withLock { conversionFailure = error }
+            inputContinuation.finish()
         }
-        let capacity = AVAudioFrameCount(Double(samples.count) * format.sampleRate / sourceFormat.sampleRate) + 64
-        guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return }
-        var fed = false
-        converter.convert(to: out, error: nil) { _, status in
-            if fed { status.pointee = .noDataNow; return nil }
-            fed = true
-            status.pointee = .haveData
-            return source
-        }
-        if out.frameLength > 0 { inputContinuation.yield(AnalyzerInput(buffer: out)) }
     }
 
     /// Finalises and returns the full transcript.
     public func finish() async throws -> String {
         inputContinuation.finish()
+        if let failure = lock.withLock({ conversionFailure }) {
+            await analyzer.cancelAndFinishNow()
+            collector?.cancel()
+            throw failure
+        }
         try await analyzer.finalizeAndFinishThroughEndOfInput()
         guard let collector else { throw AppleError.unavailable }
         return try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
