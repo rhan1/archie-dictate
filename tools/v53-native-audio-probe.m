@@ -1,6 +1,21 @@
 // Standalone offline regression. No engines, IO units, speech services or TCC.
 #import "DictateObjC.h"
 #import <math.h>
+@interface ForcedRig : NSObject
+@property(nonatomic) BOOL engineStopped;
+@end
+@implementation ForcedRig
+- (void)attachNode:(AVAudioNode *)node { [NSException raise:@"DictateForcedAttach" format:@"offline control"]; }
+- (void)scheduleBuffer:(AVAudioPCMBuffer *)buffer atTime:(AVAudioTime *)time options:(AVAudioPlayerNodeBufferOptions)options completionCallbackType:(AVAudioPlayerNodeCompletionCallbackType)type completionHandler:(AVAudioPlayerNodeCompletionHandler)completion {
+    [NSException raise:@"DictateForcedSchedule" format:@"offline control"];
+}
+- (void)stop { self.engineStopped = YES; }
+@end
+@interface ForcedRigPlayer : ForcedRig
+@end
+@implementation ForcedRigPlayer
+- (void)stop { [NSException raise:@"DictateForcedStop" format:@"offline control"]; }
+@end
 int main(void) { @autoreleasepool {
     int failures = 0;
     NSError *error = nil;
@@ -51,6 +66,15 @@ int main(void) { @autoreleasepool {
         ^AVAudioBuffer *(AVAudioPacketCount n, AVAudioConverterInputStatus *s) { *s = AVAudioConverterInputStatus_EndOfStream; return nil; }, &error);
     printf("R0 DICTATE_NATIVE forced_convert status=%ld exception=%s alive=1\n", (long)status, [error.userInfo[@"exceptionName"] UTF8String]);
     failures += status != AVAudioConverterOutputStatus_Error || ![error.userInfo[@"exceptionName"] isEqual:@"DictateForcedConvert"];
+    ForcedRig *fakeEngine = [ForcedRig new];
+    ForcedRigPlayer *fakePlayer = [ForcedRigPlayer new];
+    error = nil;
+    failures += dictate_rig_start((id)fakeEngine, (id)fakePlayer, input, 0, &error) || ![error.userInfo[@"exceptionName"] isEqual:@"DictateForcedAttach"];
+    error = nil;
+    failures += dictate_rig_schedule_play((id)fakePlayer, source, ^(AVAudioPlayerNodeCompletionCallbackType type) {}, &error) || ![error.userInfo[@"exceptionName"] isEqual:@"DictateForcedSchedule"];
+    error = nil;
+    failures += dictate_rig_stop((id)fakeEngine, (id)fakePlayer, &error) || ![error.userInfo[@"exceptionName"] isEqual:@"DictateForcedStop"] || !fakeEngine.engineStopped;
+    printf("R0 DICTATE_NATIVE rig_exceptions=3 engine_cleanup=%d hardware=0\n", fakeEngine.engineStopped);
     printf("R0 DICTATE_NATIVE failures=%d\n", failures);
     return failures != 0;
 } }
