@@ -92,8 +92,10 @@ BOOL dictate_rig_schedule_play(AVAudioPlayerNode *player, AVAudioPCMBuffer *buff
     } @catch (NSException *exception) { dictate_exception(error, exception); return NO; }
 }
 BOOL dictate_rig_stop(AVAudioEngine *engine, AVAudioPlayerNode *player, NSError **error) {
-    @try { [player stop]; [engine stop]; return YES; }
-    @catch (NSException *exception) { dictate_exception(error, exception); return NO; }
+    BOOL ok = YES;
+    @try { [player stop]; } @catch (NSException *exception) { dictate_exception(error, exception); ok = NO; }
+    @try { [engine stop]; } @catch (NSException *exception) { if (ok) dictate_exception(error, exception); ok = NO; }
+    return ok;
 }
 @interface DictateThrowingConverter : AVAudioConverter
 @end
