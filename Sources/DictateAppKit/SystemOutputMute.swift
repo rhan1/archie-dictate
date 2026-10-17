@@ -50,6 +50,9 @@ public final class SystemOutputMute: OutputMuteDevice {
         return ok
     }
 
+    /// M1: a device that is not connected has no AudioObject for its UID.
+    public func isPresent(uid: String) -> Bool { device(for: uid) != nil }
+
     /// v1.12.1 (L6): read-only — the profile whose mute flag the output exposes now (`hfp`/`a2dp`).
     public func outputProfile(uid: String) -> String? {
         guard let device = device(for: uid) else { return nil }
