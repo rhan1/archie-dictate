@@ -97,6 +97,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public let droppedArtifacts: Int
         /// v1.11 L1: chunks with no speech window by the dictation's rule (their whole text).
         public let droppedSilentChunks: Int
+        /// M2: Whisper repetition loops collapsed or dropped (counts only).
+        public var droppedLoops: Int = 0
 
         public init(text: String, chunks: Int, rejoins: Int, failedCount: Int, lastChunkMs: Int, sttMs: Int,
                     calls: [Call], hedges: Int, hedgeWins: Int, rateLimits: RateLimits?,
@@ -142,6 +144,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var rejoined: Set<Int> = []
     private var silenceJudged: Set<Int> = []
     private var droppedSilent = 0
+    /// M2: repetition-loop runs collapsed + loop chunks dropped (`stt_dropped_loop=<n>`).
+    private var loopEvents = 0
     private var openingIndex: Int?
     private var openingDrops: [EdgeSentenceGuard.Drop] = []
     private var tailJudged = false
@@ -363,7 +367,12 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 calls.append(Call(index: chunk.index, attempt: attempt, model: model, isFinal: isFinal, isRejoin: false, milliseconds: Self.ms(from: start),
                                   status: outcome.status, hedgeFired: outcome.hedgeFired,
                                   winningRequest: outcome.winningRequest))
-                if let text = outcome.text { texts[chunk.index] = text }
+                if let text = outcome.text {
+                    // M2: a Whisper repetition loop is collapsed or dropped before it is streamed or joined.
+                    let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
+                    texts[chunk.index] = guarded.text
+                    loopEvents += guarded.loops
+                }
                 else if attempt == 2 { failures.insert(chunk.index) }
             }
             if let text = outcome.text {
@@ -425,9 +434,11 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedTailSentences: tailDrops.filter { $0 == .lowSpeech }.count,
                           droppedOpeningSentences: openingDrops.filter { $0 == .lowSpeech }.count,
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
-                          droppedSilentChunks: droppedSilent)
+                          droppedSilentChunks: droppedSilent).withLoops(loopEvents)
         }
     }
+
+    private static func seconds(_ samples: Int) -> Double { Double(samples) / Double(PauseChunker.sampleRate) }
 
     /// The first non-empty text after `index`, or nil while an index between them is still in flight.
     private func adjacentNextTextLocked(after index: Int) -> String? {
@@ -549,7 +560,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 if let http = response.http { limits = RateLimits(response: http) }
                 lastResponse = DispatchTime.now().uptimeNanoseconds
                 guard let text = response.text, !text.isEmpty else { return nil }
-                texts[index - 1] = text
+                let guardedJoin = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(previous.samples.count + current.samples.count))
+                loopEvents += guardedJoin.loops
+                texts[index - 1] = guardedJoin.text
                 texts[index] = ""
                 if let previousRatio = speechRatios[index - 1], let currentRatio = speechRatios[index] {
                     speechRatios[index - 1] = min(previousRatio, currentRatio)
@@ -583,4 +596,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private static func ms(from start: UInt64) -> Int {
         Int((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
     }
+}
+
+extension GroqChunkedTranscriber.Result {
+    /// M2: the same result with the loop count set (keeps the long memberwise init unchanged).
+    func withLoops(_ loops: Int) -> Self { var copy = self; copy.droppedLoops = loops; return copy }
 }
