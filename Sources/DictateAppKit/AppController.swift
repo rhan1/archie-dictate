@@ -779,6 +779,11 @@ public final class AppController {
                 let sttStart = Date()
                 let stt = await policy.transcribe(apple: appleSession, chunked: chunkedSession, at: finishClock)
                 result = stt.result
+                // M2: no path pastes or cleans a Whisper repetition loop (chunks were guarded already).
+                if case .success(let raw) = result {
+                    let guarded = RepetitionGuard.collapseRuns(raw)
+                    if guarded.loops > 0 { result = .success(guarded.text); timeline.rawLoopCollapses = guarded.loops }
+                }
                 pipeline.path = stt.path
                 if let joined = stt.joined {
                     pipeline.chunks = joined.chunks
@@ -999,6 +1004,9 @@ public final class AppController {
     /// Groq first (fastest + best measured). If Groq fails or is slower than
     /// its 1.5 s deadline, the local model runs; raw text is used if both fail.
     /// The log says which one produced the text.
+    /// M2: the single network retry's request timeout (the whole retry costs at most this long).
+    static let cleanupNetworkRetrySeconds: TimeInterval = 1.5
+
     static func cleanUp(_ raw: String, groq: TranscriptCleaner, local: TranscriptCleaner, forceLocal: Bool = false) async
         -> (text: String, label: String, model: String, stats: TranscriptCleaner.Stats?, calls: Int) {
         var calls = 0
@@ -1024,6 +1032,13 @@ public final class AppController {
                 if let (text, stats) = try? await retryGroq.cleanWithStats(raw) {
                     return (text, "cleanup_model_fallback=\(TranscriptCleaner.retryModelLogName)", TranscriptCleaner.retryModel, stats, calls)
                 }
+            } catch TranscriptionError.network {
+                // M2 (2026-10-17 00:43 `network_-1004`): one Groq retry, bounded to
+                // `cleanupNetworkRetrySeconds`, before the local model / raw fallback. No backoff wait.
+                var retry = groq
+                retry.timeoutInterval = min(groq.timeoutInterval, Self.cleanupNetworkRetrySeconds)
+                calls += 1
+                if let (text, stats) = try? await retry.cleanWithStats(raw) { return (text, "ok", groq.model, stats, calls) }
             } catch {}
         }
         if Task.isCancelled { return (raw, "skipped:cancelled", groq.model, nil, max(1, calls)) }
@@ -1065,6 +1080,8 @@ public final class AppController {
         var chunked: GroqChunkedTranscriber.Result?
         var cleanupMode = "single"
         var cleanupCalls = 0
+        /// M2: repetition runs collapsed on the joined raw text (any STT path), added to the chunk count.
+        var rawLoopCollapses = 0
         var cleanupFallbackReason: String?
         var cleanupModelFallback: String?
         var incrementalSkipped: String?
@@ -1094,6 +1111,7 @@ public final class AppController {
             if capture.bridgeSwitchback > 0 { fields.append("bridge_switchback=\(capture.bridgeSwitchback)") }
             if let restart = capture.headsetRestart { fields.append("headset_restart=1 headset_restart_result=\(restart)") }
             if micFallback { fields.append("mic_fallback=builtin") }
+            fields.append("stt_dropped_loop=\((chunked?.droppedLoops ?? 0) + rawLoopCollapses)")
             if let chunked {
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
