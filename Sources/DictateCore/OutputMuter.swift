@@ -12,6 +12,9 @@ public protocol OutputMuteDevice: AnyObject {
     /// v1.12.1 (L6): the Bluetooth profile the output's flag currently belongs to (`hfp`, `a2dp`; nil:
     /// unknown or not Bluetooth). A headset keeps one mute flag per profile.
     func outputProfile(uid: String) -> String?
+    /// M1 (2026-10-18): whether a device with this UID is connected at all. An absent device's crash
+    /// record is carried (restored when it returns) instead of blocking the mute of the current output.
+    func isPresent(uid: String) -> Bool
 }
 
 /// What changed on the output side while a dictation holds the mute (v1.9 L2).
@@ -23,6 +26,8 @@ public extension OutputMuteDevice {
     func observeChanges(uid: String, _ action: @escaping () -> Void) -> CaptureCancellation? { nil }
     func observeOutputChanges(uid: String, _ action: @escaping (OutputChange) -> Void) -> CaptureCancellation? { nil }
     func outputProfile(uid: String) -> String? { nil }
+    /// Without a device lookup, an unreadable flag is the only sign of absence (pre-M1 behaviour).
+    func isPresent(uid: String) -> Bool { isMuted(uid: uid) != nil }
 }
 
 /// Owns crash records until restoration is verified and its settle window ends.
@@ -92,8 +97,9 @@ public final class OutputMuter {
 
     public func mute() -> Event {
         guard active.isEmpty else { return .muted }
-        if FileManager.default.fileExists(atPath: stateFile.path),
-           recoverIfNeeded() == .restoreFailed { return .restoreFailed }
+        // M1: only a PRESENT device whose restore failed blocks the mute; records for devices that are
+        // not connected are carried (kept on disk) and the current output is muted alongside them.
+        if FileManager.default.fileExists(atPath: stateFile.path), recover().blocking { return .restoreFailed }
         guard let uid = device.defaultOutputUID() else { return .none }
         guard let current = device.isMuted(uid: uid) else { return .unsupported }
         let old = settling[uid]
@@ -205,18 +211,22 @@ public final class OutputMuter {
     }
 
     @discardableResult
-    public func recoverIfNeeded() -> Event? {
+    public func recoverIfNeeded() -> Event? { recover().event }
+
+    /// `blocking`: a present device's restore could not be verified. Absent devices' records are
+    /// carried (no write, no settle window) and reported once per recovery as `mute_record_absent=<n>`.
+    private func recover() -> (event: Event?, blocking: Bool) {
         guard active.isEmpty, settling.values.allSatisfy({ $0.deadline == nil }),
-              FileManager.default.fileExists(atPath: stateFile.path) else { return nil }
-        guard let text = try? String(contentsOf: stateFile, encoding: .utf8) else { return .restoreFailed }
+              FileManager.default.fileExists(atPath: stateFile.path) else { return (nil, false) }
+        guard let text = try? String(contentsOf: stateFile, encoding: .utf8) else { return (.restoreFailed, true) }
         var records: [String: State] = [:]
         var parsed = Set<String>()
         for line in text.split(separator: "\n") {
             let parts = line.split(separator: "\t", omittingEmptySubsequences: false)
             guard parts.count == 2 || parts.count == 3, !parts[0].isEmpty, parts[1] == "0" || parts[1] == "1",
-                  parts.count == 2 || !parts[2].isEmpty else { return .restoreFailed }
+                  parts.count == 2 || !parts[2].isEmpty else { return (.restoreFailed, true) }
             let uid = String(parts[0])
-            guard parsed.insert(uid).inserted else { return .restoreFailed }
+            guard parsed.insert(uid).inserted else { return (.restoreFailed, true) }
             // L6: a crash record may only unmute — prior 1 is dropped, never written back.
             guard parts[1] == "0" else { continue }
             let profile = parts.count == 3 ? String(parts[2]) : nil
@@ -224,20 +234,26 @@ public final class OutputMuter {
             if let profile, let now = device.outputProfile(uid: uid), now != profile { continue }
             records[uid] = State(uid: uid, prior: false, profile: profile)
         }
-        guard !parsed.isEmpty else { return .restoreFailed }
+        guard !parsed.isEmpty else { return (.restoreFailed, true) }
         guard !records.isEmpty else {
             settling = [:]
             persistRemaining()
-            return nil
+            return (nil, false)
         }
         settling.values.forEach { $0.cancel() }
         settling = records // Keep all records, including any device that disappeared.
-        var verified = true
+        var presentFailed = false
+        var absent = 0
         for state in records.values {
+            // M1: an absent device keeps its record (deadline nil = carried) until it returns.
+            guard device.isPresent(uid: state.uid) else { absent += 1; continue }
             if verifyRestore(state) { beginSettling(state) }
-            else { verified = false }
+            else { presentFailed = true }
         }
-        return verified ? .unmuteRecovered : .restoreFailed
+        if absent > 0 { onNote?("mute_record_absent=\(absent)") }
+        // Launch recovery still reports an absent device as not restored (it is retried when the
+        // device returns); only a present device's failure blocks a new mute.
+        return (presentFailed || absent > 0 ? .restoreFailed : .unmuteRecovered, presentFailed)
     }
 
     private func verifyRestore(_ state: State, until deadline: TimeInterval? = nil) -> Bool {

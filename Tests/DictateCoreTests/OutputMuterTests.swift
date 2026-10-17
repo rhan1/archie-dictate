@@ -50,6 +50,8 @@ final class FakeOutput: OutputMuteDevice {
         deinit { cancel() }
     }
     func defaultOutputUID() -> String? { defaultUID }
+    /// M1: present = the fake knows the device (an `unsupported` device is present but unreadable).
+    func isPresent(uid: String) -> Bool { mute[uid] != nil }
     func isMuted(uid: String) -> Bool? {
         reads.append(uid)
         guard !unsupported.contains(uid), let value = mute[uid] else { return nil }
