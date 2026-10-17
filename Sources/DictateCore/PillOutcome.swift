@@ -22,7 +22,7 @@ public struct PillOutcome: Equatable, Sendable {
         guard isVisible else { return nil }
         switch kind {
         case .held(let reason):
-            if reason == "paste_timeout" { return "paste unconfirmed · ⌘V to paste" }
+            if reason == "paste_timeout" { return "paste unconfirmed · tap to retry" }
             return reason == "no_stt" ? "no speech" : "held"
         case .error(let reason):
             let reason = reason.lowercased()
