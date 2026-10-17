@@ -597,4 +597,89 @@ extension DictationEngineTests {
             engine.cancel()
         }
     }
+
+    @Test func heldPasteRecoveryWaitsForItsOwnConfirmation() async throws {
+        let outcome = PillOutcome(.held("paste_timeout"), hasText: true)
+        #expect(outcome.label == "paste unconfirmed · tap to retry")
+        #expect(outcome.showsPasteAffordance)
+        for confirms in [true, false] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-v53-recovery-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(home: root)
+            let keys = KeyStore(reader: { _ in "fixture" })
+            let pb = NSPasteboard(name: .init("dictate-v53-recovery-\(UUID().uuidString)"))
+            defer { pb.releaseGlobally() }
+            pb.clearContents()
+            pb.setString("ORIGINAL", forType: .string)
+            let clock = V15PasteConfirmationTests.ManualMainScheduler()
+            let ax = V15PasteConfirmationTests.AXMockBox()
+            let words = "WORDS"
+            var posted = 0
+            let inserter = TextInserter(
+                pasteboard: pb,
+                postKeystroke: {
+                    posted += 1
+                    if !confirms && posted == 1 {
+                        clock.schedule(0.2) {
+                            pb.clearContents()
+                            pb.setString("NEWER_COPY", forType: .string)
+                        }
+                    }
+                },
+                schedule: clock.schedule,
+                axReader: { ax.texts },
+                now: { clock.now }
+            )
+            let deps = EngineDependencies(
+                recorder: TestRecorder(),
+                makeApple: { TestApple(words) },
+                sttTransport: TestHTTP(words),
+                groqCleanupTransport: TestHTTP(words),
+                localCleanupTransport: TestHTTP(words),
+                inserter: inserter,
+                panelFactory: { TestPanel() },
+                requestMicrophoneAccess: { $0(true) },
+                frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") },
+                manageMedia: false
+            )
+            let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate, dependencies: deps)
+            let engine = DictationEngine(controller: controller)
+            controller.configureEngine()
+            var states: [DictateAppKit.DictationState] = []
+            engine.onState = { states.append($0) }
+            controller.showOutcome(.held("paste_timeout"), text: words)
+            #expect(states.last == .held(preview: words))
+            states.removeAll()
+            engine.pasteHeld()
+            try await waitFor { posted == 1 }
+            let pending = !states.contains(.pasted) && states.last == .transcribing
+            #expect(!states.contains(.pasted))
+            #expect(states.last == .transcribing)
+            if confirms {
+                ax.texts = [words]
+                clock.advance(to: 0.2)
+                let clipboard = pb.string(forType: .string) ?? "nil"
+                print("R0 RECOVERY pending=\(pending) confirmed=\(states.last == .pasted) clipboard=\(clipboard) reason=ok")
+                #expect(states.last == .pasted)
+                #expect(clipboard == "ORIGINAL")
+            } else {
+                clock.advance(to: 10.1)
+                let clipboard = pb.string(forType: .string) ?? "nil"
+                print("R0 RECOVERY pending=\(pending) confirmed=\(states.contains(.pasted)) clipboard=\(clipboard) reason=paste_timeout")
+                #expect(!states.contains(.pasted))
+                #expect(states.last == .held(preview: words))
+                #expect(clipboard == "NEWER_COPY")
+                engine.pasteHeld()
+                for _ in 0..<100 where posted < 2 {
+                    try await Task.sleep(nanoseconds: 1_000_000)
+                }
+                #expect(posted == 2)
+                ax.texts = [words]
+                clock.advance(to: 10.3)
+                #expect(states.last == .pasted)
+            }
+            engine.cancel()
+        }
+    }
 }
+

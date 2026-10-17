@@ -433,7 +433,22 @@ public final class AppController {
         let text = outcomeText
         if output.label == nil { clearOutcome() }
         else { renderOutcome() }
-        if output.pasteHeldText, let text { inserter.insert(text); engineOnState?(.pasted) }
+        if output.pasteHeldText, let text {
+            pill.show(.transcribing, status: "pasting")
+            engineOnState?(.transcribing)
+            let myGeneration = generation
+            inserter.insert(text, onResult: { [weak self] result in
+                guard let self, myGeneration === self.generation else { return }
+                switch result {
+                case .confirmed:
+                    self.showOutcome(.ok)
+                case .timedOut, .held:
+                    let reason = result == .timedOut ? "paste_timeout" : "focus_changed"
+                    self.rememberHeldDictation(text)
+                    self.showOutcome(.held(reason), text: text)
+                }
+            })
+        }
     }
 
     private func renderOutcome() {
