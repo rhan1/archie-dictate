@@ -55,7 +55,8 @@ public enum RepetitionGuard {
     /// characters per second of audio, or ≥ 50 % one word over ≥ `minimumTokensForShare` words — is
     /// dropped, except a pure repetition of one word (≥ 90 %), which keeps that word once. Decision
     /// (conservative, never delete real words): the rate rule alone drops a chunk only when it also
-    /// shows repetition (a run of ≥ `minimumRun` or ≥ 30 % one word); a fast but varied chunk is kept.
+    /// shows repetition (a run of ≥ `minimumRun`, or ≥ 30 % one word over ≥ `minimumTokensForShare` words);
+    /// a fast but varied (or very short) chunk is kept.
     public static func guardChunk(_ text: String, audioSeconds: Double) -> Output {
         let tokens = text.split(whereSeparator: \.isWhitespace).map(normalized).filter { !$0.isEmpty }
         guard !tokens.isEmpty else { return Output(text: text, loops: 0) }
@@ -65,7 +66,7 @@ public enum RepetitionGuard {
         let collapsed = collapseRuns(text)
         let fast = audioSeconds > 0 && Double(text.count) / audioSeconds > maximumCharsPerSecond
         let dominated = tokens.count >= minimumTokensForShare && share >= 0.5
-        let repetitive = collapsed.loops > 0 || share >= 0.3
+        let repetitive = collapsed.loops > 0 || (tokens.count >= minimumTokensForShare && share >= 0.3)
         guard dominated || (fast && repetitive) else { return collapsed }
         if share >= 0.9 { return Output(text: collapsed.text, loops: max(1, collapsed.loops)) }
         return Output(text: "", loops: 1)
