@@ -32,8 +32,26 @@ final class HeadsetCaptureUnit: HeadsetCapture {
     }()
     private static let workerKey = DispatchSpecificKey<Void>()
     private let context = HeadsetRenderContext()
-    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate,
-                                             channels: 1, interleaved: false)!
+    let headsetNative = HeadsetNativeBoundary()
+    private var targetFormat: AVAudioFormat?
+
+    private func native<T>(_ stage: String, _ body: () throws -> T) throws -> T {
+        do { return try headsetNative.call(stage, body) }
+        catch {
+            headsetNative.failed(stage, error)
+            note("headset_native_error stage=\(stage)")
+            throw error
+        }
+    }
+
+    private func prepareTarget() throws -> AVAudioFormat {
+        if let targetFormat { return targetFormat }
+        let made = try native("target_format") {
+            AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate, channels: 1, interleaved: false)!
+        }
+        targetFormat = made
+        return made
+    }
 
     private var _isRunning = false
     private var _lastCallbackTime: TimeInterval?
@@ -141,12 +159,13 @@ final class HeadsetCaptureUnit: HeadsetCapture {
                 throw StartError(step: "configure", status: OSStatus((error as NSError).code))
             }
 
-            guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hwFormat.sampleRate,
-                                           channels: 1, interleaved: false) else {
+            let targetFormat = try prepareTarget()
+            guard let mono = try native("input_format", { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hwFormat.sampleRate,
+                                           channels: 1, interleaved: false) }) else {
                 throw StartError(step: "mono_format", status: -1)
             }
 
-            let conv = makeConverter(mono, targetFormat)
+            let conv = try native("converter") { makeConverter(mono, targetFormat) }
             var convFailedAtStart = false
             lock.withLock {
                 hardwareFormat = mono
@@ -257,6 +276,12 @@ final class HeadsetCaptureUnit: HeadsetCapture {
     }
 
     private func drain() {
+        drainPCM()
+    }
+
+    func offlineDrainPCM() { worker.sync { drainPCM() } }
+
+    private func drainPCM() {
         guard let (format, token, currentSession) = lock.withLock({ () -> (AVAudioFormat, CaptureEpoch, Int)? in
             guard let format = self.hardwareFormat, let epoch = self.epoch, _isRunning else {
                 return nil
@@ -299,7 +324,7 @@ final class HeadsetCaptureUnit: HeadsetCapture {
 
         // Drain slots
         while let (frames, hostTime, slotSession) = context.nextSlot({ pointer, count in
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)),
+            guard let buffer = try? native("input_buffer", { AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) }),
                   let channel = buffer.floatChannelData?[0] else { return nil as AVAudioPCMBuffer? }
             channel.update(from: pointer, count: count)
             buffer.frameLength = AVAudioFrameCount(count)
@@ -314,17 +339,23 @@ final class HeadsetCaptureUnit: HeadsetCapture {
 
             guard !isInvalid, let input = frames, let converter = currentConverter else { continue }
 
+            guard let targetFormat = self.targetFormat else { continue }
             let ratio = targetFormat.sampleRate / format.sampleRate
             let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio)) + 128
-            guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { continue }
+            guard let out = try? native("output_buffer", { AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) }) else { continue }
 
             var fed = false
             var error: NSError?
-            converter.convert(to: out, error: &error) { _, status in
+            do { try native("convert") { converter.convert(to: out, error: &error) { _, status in
                 if fed { status.pointee = .noDataNow; return nil }
                 fed = true
                 status.pointee = .haveData
                 return input
+            }
+
+            } } catch {
+                lock.withLock { self.converter = nil }
+                continue
             }
 
             if let error {
@@ -406,8 +437,11 @@ final class HeadsetCaptureUnit: HeadsetCapture {
 
         guard needsUpdate else { return }
 
-        guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: newFormat.sampleRate,
-                                       channels: 1, interleaved: false) else {
+        targetFormat = nil
+        do {
+        let targetFormat = try prepareTarget()
+        guard let mono = try native("input_format", { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: newFormat.sampleRate,
+                                       channels: 1, interleaved: false) }) else {
             let shouldEmit = lock.withLock { () -> Bool in
                 guard !converterFailedReported else { return false }
                 converterFailedReported = true
@@ -426,7 +460,7 @@ final class HeadsetCaptureUnit: HeadsetCapture {
             note("headset_reconfigure_error=\(error)")
         }
 
-        let conv = makeConverter(mono, targetFormat)
+        let conv = try native("converter") { makeConverter(mono, targetFormat) }
         let (gen, shouldEmitConverterFailed) = lock.withLock { () -> (Int, Bool) in
             _formatGeneration += 1
             hardwareFormat = mono
@@ -449,6 +483,9 @@ final class HeadsetCaptureUnit: HeadsetCapture {
             onEvent?(.converterFailed, token)
         }
         onEvent?(.formatChanged(generation: gen, sampleRate: newFormat.sampleRate, channels: newFormat.channels), token)
+        } catch {
+            lock.withLock { converter = nil; isFormatInvalid = true }
+        }
     }
 }
 

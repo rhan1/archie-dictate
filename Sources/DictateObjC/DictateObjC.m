@@ -106,3 +106,6 @@ BOOL dictate_rig_stop(AVAudioEngine *engine, AVAudioPlayerNode *player, NSError 
 }
 @end
 AVAudioConverter *dictate_throwing_converter(AVAudioFormat *from, AVAudioFormat *to) { return [[DictateThrowingConverter alloc] initFromFormat:from toFormat:to]; }
+void dictate_force_headset_exception(void) {
+    [NSException raise:@"DictateForcedHeadset" format:@"offline native boundary control"];
+}

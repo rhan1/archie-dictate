@@ -127,9 +127,8 @@ public final class AudioRecorder: CaptureEngine {
     private let lock = NSLock()
     private var samples: [Float] = []
     private var converter: AVAudioConverter?
-    private let targetFormat = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate, channels: 1, interleaved: false
-    )!
+    let headsetNative = HeadsetNativeBoundary()
+    private var targetFormat: AVAudioFormat?
     private var meter = WisprLevel() // persists for this app-lifetime recorder
     private var levelTimer: DispatchSourceTimer?
 
@@ -1395,9 +1394,32 @@ public final class AudioRecorder: CaptureEngine {
         // The converter must match the buffers actually arriving: a format
         // change under a live tap otherwise yields garbled (resampled-wrong) audio.
         let epoch = lock.withLock { engineEpoch }
-        let converter: AVAudioConverter? = lock.withLock {
-            guard captureRunning, tapEpoch === token else { return nil }
-            if stats.firstBufferMs == nil {
+        guard lock.withLock({ captureRunning && tapEpoch === token }),
+              let chunk = convertHeadsetPCM(buffer, epoch: epoch, token: token) else { return }
+        // AVAudioTime and the AUHAL timestamps share the host-clock domain.
+        let hostStart = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) :
+            ProcessInfo.processInfo.systemUptime - Double(chunk.count) / Self.sampleRate
+        acceptConverted(chunk, at: hostStart, source: .headset, epoch: epoch, tap: token)
+    }
+
+    /// Offline callers exercise the same consumer and lock, without starting an engine.
+    func offlineHeadsetPCM(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+        convertHeadsetPCM(buffer, epoch: engineEpoch, token: tapEpoch)
+    }
+
+    private func convertHeadsetPCM(_ buffer: AVAudioPCMBuffer, epoch: CaptureEpoch, token: CaptureEpoch) -> [Float]? {
+        var stage = "target_format"
+        do {
+        let targetFormat = try lock.withLock { () throws -> AVAudioFormat in
+            if let current = self.converter, current.inputFormat != buffer.format { self.targetFormat = nil }
+            if let targetFormat = self.targetFormat { return targetFormat }
+            let made = try headsetNative.call(stage) { AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.sampleRate, channels: 1, interleaved: false)! }
+            self.targetFormat = made
+            return made
+        }
+        stage = "converter"
+        let converter: AVAudioConverter? = try lock.withLock {
+            if captureRunning, stats.firstBufferMs == nil {
                 stats.firstBufferMs = elapsedMs()
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.lock.withLock({ self.engineEpoch === epoch && self.captureRunning && self.tapEpoch === token }) else { return }
@@ -1409,16 +1431,18 @@ public final class AudioRecorder: CaptureEngine {
                                    at: ProcessInfo.processInfo.systemUptime)
             if let current = self.converter, current.inputFormat == buffer.format { return current }
             if self.converter != nil { stats.formatChanges += 1 }
-            self.converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            self.converter = try headsetNative.call("converter") { AVAudioConverter(from: buffer.format, to: targetFormat) }
             return self.converter
         }
-        guard let converter else { return }
+        guard let converter else { return nil }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
-        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+        stage = "output_buffer"
+        guard let out = try headsetNative.call(stage, { AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) }) else { return nil }
         var fed = false
         var error: NSError?
-        converter.convert(to: out, error: &error) { _, status in
+        stage = "convert"
+        try headsetNative.call(stage) { converter.convert(to: out, error: &error) { _, status in
             if fed {
                 status.pointee = .noDataNow
                 return nil
@@ -1427,13 +1451,16 @@ public final class AudioRecorder: CaptureEngine {
             status.pointee = .haveData
             return buffer
         }
+        }
         if let error { AppController.note("headset_convert_error=\(error.domain):\(error.code)") }
-        guard error == nil, let channel = out.floatChannelData?[0] else { return }
-        let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
-        // AVAudioTime and the AUHAL timestamps share the host-clock domain.
-        let hostStart = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) :
-            ProcessInfo.processInfo.systemUptime - Double(chunk.count) / Self.sampleRate
-        acceptConverted(chunk, at: hostStart, source: .headset, epoch: epoch, tap: token)
+        guard error == nil, let channel = out.floatChannelData?[0] else { return nil }
+        return Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
+        } catch {
+            lock.withLock { self.converter = nil }
+            headsetNative.failed(stage, error)
+            AppController.note("headset_native_error stage=\(stage)")
+            return nil
+        }
     }
 
     /// Arbitration, accumulation and meter updates share this lock; PCM is enqueued in order

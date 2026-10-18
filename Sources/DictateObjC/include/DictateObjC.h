@@ -19,3 +19,5 @@ BOOL dictate_rig_schedule_play(AVAudioPlayerNode *player, AVAudioPCMBuffer *buff
 BOOL dictate_rig_stop(AVAudioEngine *engine, AVAudioPlayerNode *player, NSError * _Nullable * _Nullable error);
 AVAudioConverter *dictate_throwing_converter(AVAudioFormat *from, AVAudioFormat *to);
 NS_ASSUME_NONNULL_END
+// Offline fault seam: caller deliberately chooses whether it is inside a native guard.
+void dictate_force_headset_exception(void);
