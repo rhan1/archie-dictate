@@ -353,7 +353,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
             return
         }
 
-        let timerSource = DispatchSource.makeTimerSource(queue: queue)
+        // WAV pacing is a media clock: background timer coalescing must not stretch injected playback.
+        let timerSource = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         let intervalSeconds = 0.1 * pace
         let intervalNs = max(1_000, Int((intervalSeconds * 1_000_000_000).rounded()))
         timerSource.schedule(deadline: .now() + .nanoseconds(intervalNs), repeating: .nanoseconds(intervalNs))
