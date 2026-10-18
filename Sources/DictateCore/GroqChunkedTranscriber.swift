@@ -99,6 +99,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public let droppedSilentChunks: Int
         /// M2: Whisper repetition loops collapsed or dropped (counts only).
         public var droppedLoops: Int = 0
+        public var scribeChunks: Int = 0
+        public var scribeNoKey: Bool = false
 
         public init(text: String, chunks: Int, rejoins: Int, failedCount: Int, lastChunkMs: Int, sttMs: Int,
                     calls: [Call], hedges: Int, hedgeWins: Int, rateLimits: RateLimits?,
@@ -124,6 +126,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 
     private let lock = NSLock()
     private let client: TranscriptionClient
+    private let scribeClient: ScribeClient?
     private let vocabulary: String
     private let hedgeAfterMs: Int
     private let clock: any DictateClock
@@ -146,6 +149,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var droppedSilent = 0
     /// M2: repetition-loop runs collapsed + loop chunks dropped (`stt_dropped_loop=<n>`).
     private var loopEvents = 0
+    private var scribeChunks = 0
+    private var scribeNoKey = false
     private var openingIndex: Int?
     private var openingDrops: [EdgeSentenceGuard.Drop] = []
     private var tailJudged = false
@@ -165,11 +170,28 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var closed = false
     private var cancelled = false
 
+    public convenience init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String,
+                            scribeAPIKey: (@Sendable () throws -> String)?, prompt: String,
+                            fillerLeadIn: Bool = true, leadIn: String? = nil, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
+                            hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = nil,
+                            finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = false,
+                            edgeGuard: Bool = true,
+                            onChunkText: (@Sendable (Int, String) -> Void)? = nil,
+                            onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
+                            clock: any DictateClock = SystemClock()) {
+        self.init(transport: transport, apiKey: apiKey, prompt: prompt, fillerLeadIn: fillerLeadIn, leadIn: leadIn,
+                  firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds,
+                  hedgeAfterMs: hedgeAfterMs, finalSplitSeconds: finalSplitSeconds, finalModel: finalModel,
+                  rejoinGuard: rejoinGuard, lowSpeechGuard: lowSpeechGuard, edgeGuard: edgeGuard,
+                  scribeAPIKey: scribeAPIKey, onChunkText: onChunkText, onGroqRateLimit: onGroqRateLimit, clock: clock)
+    }
+
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
                 fillerLeadIn: Bool = true, leadIn: String? = nil, firstMinimumSeconds: Double = 3.0, firstMaximumSeconds: Double = 4.0,
                 hedgeAfterMs: Int = 700, finalSplitSeconds: Double? = nil,
                 finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = false,
                 edgeGuard: Bool = true,
+                scribeAPIKey: (@Sendable () throws -> String)? = nil,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
                 clock: any DictateClock = SystemClock()) {
@@ -177,6 +199,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
         self.client = client
+        self.scribeClient = scribeAPIKey.map { ScribeClient(transport: transport, apiKey: $0) }
         self.hedgeAfterMs = max(0, hedgeAfterMs)
         self.clock = clock
         self.finalSplitSeconds = finalSplitSeconds
@@ -284,6 +307,20 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         } catch { return Response(text: nil, http: nil) }
     }
 
+    private func sendScribe(_ request: URLRequest) async -> Response {
+        do {
+            let (data, response) = try await client.transport.send(request)
+            guard (200...299).contains(response.statusCode) else { return Response(text: nil, http: response) }
+            struct Transcript: Decodable { let text: String }
+            guard let raw = (try? JSONDecoder().decode(Transcript.self, from: data))?.text else {
+                return Response(text: nil, http: response)
+            }
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return Response(text: nil, http: response) }
+            return Response(text: text, http: response)
+        } catch { return Response(text: nil, http: nil) }
+    }
+
     /// Unstructured workers let the winner return even if a transport ignores
     /// cancellation. Only this consumer publishes responses; late losers are ignored.
     private func requestAttempt(_ request: URLRequest, hedged: Bool) async -> AttemptResult {
@@ -338,10 +375,27 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         return AttemptResult(text: nil, status: status, hedgeFired: fired, winningRequest: nil)
     }
 
+    private func emitChunk(_ chunk: PauseChunker.Chunk, fallbackText: String) {
+        // v1.10 L3: the incremental cleaner cleans a chunk once the next one arrives, so a
+        // low-speech chunk's dropped sentence is replaced BEFORE the next chunk is emitted.
+        // v1.11 L1: a chunk with no speech, or the opening's invented sentence, is removed
+        // before the text is ever streamed.
+        let (shouldEmit, replacements, current) = lock.withLock { () -> (Bool, [(Int, String)], String) in
+            guard !cancelled else { return (false, [], "") }
+            silenceLocked(chunk.index)
+            openingLocked(chunk.index)
+            let replaced = [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
+            return (true, replaced, texts[chunk.index] ?? fallbackText)
+        }
+        guard shouldEmit, !Task.isCancelled else { return }
+        for (index, filtered) in replacements where index < chunk.index { onChunkText?(index, filtered) }
+        onChunkText?(chunk.index, current)
+    }
+
     private func upload(_ chunk: PauseChunker.Chunk, model: String, isFinal: Bool) async {
         let wav = WAVEncoder.encode(samples: Self.resampleTo16k(chunk.samples), sampleRate: 16_000)
         for attempt in 1...2 {
-            if Task.isCancelled { return }
+            if Task.isCancelled || lock.withLock({ cancelled }) { return }
             let start = DispatchTime.now().uptimeNanoseconds
             let outcome: AttemptResult
             do {
@@ -362,32 +416,73 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             } catch {
                 outcome = AttemptResult(text: nil, status: nil, hedgeFired: false, winningRequest: nil)
             }
-            if Task.isCancelled { return }
-            lock.withLock {
+            if Task.isCancelled || lock.withLock({ cancelled }) { return }
+            let accepted: Bool = lock.withLock {
+                guard !cancelled else { return false }
                 calls.append(Call(index: chunk.index, attempt: attempt, model: model, isFinal: isFinal, isRejoin: false, milliseconds: Self.ms(from: start),
                                   status: outcome.status, hedgeFired: outcome.hedgeFired,
                                   winningRequest: outcome.winningRequest))
-                if let text = outcome.text {
-                    // M2: a Whisper repetition loop is collapsed or dropped before it is streamed or joined.
+                guard let text = outcome.text else { return false }
+                // M2: a Whisper repetition loop is collapsed or dropped before it is streamed or joined.
+                let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
+                texts[chunk.index] = guarded.text
+                loopEvents += guarded.loops
+                return true
+            }
+            if accepted, let text = outcome.text {
+                emitChunk(chunk, fallbackText: text)
+                return
+            }
+        }
+
+        if Task.isCancelled || lock.withLock({ cancelled }) { return }
+        guard let scribe = scribeClient else {
+            lock.withLock { if !cancelled { _ = failures.insert(chunk.index) } }
+            return
+        }
+        let scribeKey: String
+        do {
+            scribeKey = try scribe.apiKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            scribeKey = ""
+        }
+        guard !scribeKey.isEmpty else {
+            lock.withLock {
+                guard !cancelled else { return }
+                scribeNoKey = true
+                _ = failures.insert(chunk.index)
+            }
+            return
+        }
+
+        for scribeAttempt in 1...2 {
+            if Task.isCancelled || lock.withLock({ cancelled }) { return }
+            let start = DispatchTime.now().uptimeNanoseconds
+            let request = scribe.makeRequest(wav: wav, apiKey: scribeKey, boundary: "dictate-\(UUID().uuidString)")
+            let response = await sendScribe(request)
+            if Task.isCancelled || lock.withLock({ cancelled }) { return }
+            let accepted: Bool = lock.withLock {
+                guard !cancelled else { return false }
+                if response.http != nil {
+                    lastResponse = DispatchTime.now().uptimeNanoseconds
+                }
+                calls.append(Call(index: chunk.index, attempt: scribeAttempt, model: scribe.modelID, isFinal: isFinal, isRejoin: false,
+                                  milliseconds: Self.ms(from: start), status: response.http?.statusCode,
+                                  hedgeFired: false, winningRequest: response.text == nil ? nil : 1))
+                if let text = response.text {
+                    scribeChunks += 1
                     let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
                     texts[chunk.index] = guarded.text
                     loopEvents += guarded.loops
+                    return true
                 }
-                else if attempt == 2 { failures.insert(chunk.index) }
+                if scribeAttempt == 2 {
+                    _ = failures.insert(chunk.index)
+                }
+                return false
             }
-            if let text = outcome.text {
-                // v1.10 L3: the incremental cleaner cleans a chunk once the next one arrives, so a
-                // low-speech chunk's dropped sentence is replaced BEFORE the next chunk is emitted.
-                // v1.11 L1: a chunk with no speech, or the opening's invented sentence, is removed
-                // before the text is ever streamed.
-                let (replacements, current) = lock.withLock {
-                    silenceLocked(chunk.index)
-                    openingLocked(chunk.index)
-                    let replaced = [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
-                    return (replaced, texts[chunk.index] ?? text)
-                }
-                for (index, filtered) in replacements where index < chunk.index { onChunkText?(index, filtered) }
-                onChunkText?(chunk.index, current)
+            if accepted, let text = response.text {
+                emitChunk(chunk, fallbackText: text)
                 return
             }
         }
@@ -434,7 +529,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedTailSentences: tailDrops.filter { $0 == .lowSpeech }.count,
                           droppedOpeningSentences: openingDrops.filter { $0 == .lowSpeech }.count,
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
-                          droppedSilentChunks: droppedSilent).withLoops(loopEvents)
+                          droppedSilentChunks: droppedSilent).withLoops(loopEvents).withScribe(chunks: scribeChunks, noKey: scribeNoKey)
         }
     }
 
@@ -601,4 +696,10 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 extension GroqChunkedTranscriber.Result {
     /// M2: the same result with the loop count set (keeps the long memberwise init unchanged).
     func withLoops(_ loops: Int) -> Self { var copy = self; copy.droppedLoops = loops; return copy }
+    func withScribe(chunks: Int, noKey: Bool) -> Self {
+        var copy = self
+        copy.scribeChunks = chunks
+        copy.scribeNoKey = noKey
+        return copy
+    }
 }
