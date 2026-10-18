@@ -23,7 +23,7 @@ private final class InjectedApple: EngineAppleSession, @unchecked Sendable {
 private actor InjectedHTTP: HTTPTransport {
     private(set) var calls = 0
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        calls += 1
+        if request.url!.path.contains("transcriptions") { calls += 1 }
         let payload: [String: Any] = request.url!.path.contains("transcriptions")
             ? ["text": "Testing the fixture."]
             : ["choices": [["finish_reason": "stop", "message": ["content": "Testing the fixture."]]]]
@@ -85,24 +85,33 @@ struct InjectedEngineTests {
         let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate,
                                        dependencies: deps, injectedAudioURL: injected ? wav : nil)
         let engine = DictationEngine(controller: controller)
+        controller.configureEngine()
         defer { engine.cancel() }
         var ends: [String] = []
-        controller.onSessionNote = { if $0.contains("event=end") { ends.append($0) } }
+        var started = false
+        controller.onSessionNote = {
+            if $0.contains("event=start") { started = true }
+            if $0.contains("event=end") { ends.append($0) }
+        }
         let rig = root.appendingPathComponent("rig")
         try FileManager.default.createDirectory(at: rig, withIntermediateDirectories: true)
         #expect(engine.enableRig(launchEnvironment: ["DICTATE_RIG": "1", "DICTATE_RIG_DIR": rig.path]) {
             engine.handle($0 == .tap ? .tap : .doubleTap)
         })
         let trigger = rig.appendingPathComponent("trigger")
-        try Data("chord selftest\n".utf8).write(to: trigger)
-        try await waitFor { recorder.isRunning }
+        #expect(FileManager.default.createFile(atPath: trigger.path, contents: Data("chord selftest\n".utf8),
+                                               attributes: [.posixPermissions: 0o600]))
+        try await waitFor { recorder.isRunning && started && !controller.micStartPending }
         if injected {
             for _ in 0..<90 {
                 wave.step()
                 try await Task.sleep(nanoseconds: 1_000_000)
             }
             // A dead-health RED must surface its actual outcome before checking output text.
-            if ends.isEmpty { try Data("tap selftest\n".utf8).write(to: trigger) }
+            if ends.isEmpty {
+                #expect(FileManager.default.createFile(atPath: trigger.path, contents: Data("chord selftest\n".utf8),
+                                                       attributes: [.posixPermissions: 0o600]))
+            }
         }
         try await waitFor { !ends.isEmpty }
         let outcome = ends.first!.split(separator: " ").first { $0.hasPrefix("outcome=") }.map(String.init) ?? "outcome=missing"
