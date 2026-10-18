@@ -470,7 +470,7 @@ struct ScribeChunkedTests {
         // 2) Cancellation while Scribe is in flight prevents late publication.
         let transport2 = ScribeFakeTransport(
             groqByTag: [3000: [.status(403), .status(403)]],
-            scribeByTag: [3000: [.json("late text after cancel", delayMs: 80)]]
+            scribeByTag: [3000: [.json("late text after cancel", delayMs: 400)]]
         )
         let streamed2 = StreamRecorder()
         let engine2 = GroqChunkedTranscriber(
@@ -484,9 +484,13 @@ struct ScribeChunkedTests {
             onChunkText: { index, text in streamed2.record(index, text) }
         )
         engine2.submit(speechChunk(0, tag: 3000))
-        for _ in 0..<100 where await transport2.scribeRequests.isEmpty {
+        // Wait (bounded) until the Scribe request is in flight, then cancel before its reply lands.
+        var waitedMs = 0
+        while await transport2.scribeRequests.isEmpty, waitedMs < 5_000 {
             try? await Task.sleep(for: .milliseconds(2))
+            waitedMs += 2
         }
+        #expect(!(await transport2.scribeRequests.isEmpty))
         engine2.cancel()
         try? await Task.sleep(for: .milliseconds(100))
         let result2 = await engine2.finish()
