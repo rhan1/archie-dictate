@@ -754,7 +754,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
             kept += health.frames
             notes += health.notes
             if scenario == .warmHFP { notes += warmObserve(at: mediaTime) }
-            if let found = health.failure { failed = true; failure = found; notes.append(found.note) }
+            // Plain injection delivers a frame on every tick by construction, so exact zeros (leading, between
+            // words, EOF tail) are the fixture's silence, not a dead mic. Only the dead-stream scenarios judge it.
+            if let found = health.failure, scenario != .plain { failed = true; failure = found; notes.append(found.note) }
         }
         buffer.append(contentsOf: kept)
         // Exact inverse of the /32768 above: the WAV's samples arrive unchanged.
