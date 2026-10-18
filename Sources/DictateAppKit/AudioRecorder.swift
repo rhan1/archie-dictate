@@ -129,9 +129,6 @@ public final class AudioRecorder: CaptureEngine {
     private var converter: AVAudioConverter?
     /// The engine arm's native-call boundary for headset conversion (test seams nil in production).
     let headsetNative = HeadsetNativeBoundary()
-    private let targetFormat = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate, channels: 1, interleaved: false
-    )!
     private var meter = WisprLevel() // persists for this app-lifetime recorder
     private var levelTimer: DispatchSourceTimer?
 
@@ -1003,7 +1000,12 @@ public final class AudioRecorder: CaptureEngine {
             if stats.startFormat.isEmpty {
                 stats.startFormat = "\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch"
             }
-            lock.withLock { converter = AVAudioConverter(from: hardware, to: targetFormat) }
+            let prepared: AVAudioConverter?
+            do { prepared = try makeHeadsetConverter(from: hardware) } catch {
+                headsetNativeFailed(error)
+                prepared = nil                     // `consume` builds one from the first buffer's format
+            }
+            lock.withLock { converter = prepared }
             let token = CaptureEpoch()
             lock.withLock { tapEpoch = token }
             tapInstalled = true // remove even if installTap partially changes state then raises
@@ -1396,7 +1398,11 @@ public final class AudioRecorder: CaptureEngine {
     private func consume(_ buffer: AVAudioPCMBuffer, time: AVAudioTime, epoch token: CaptureEpoch) {
         // The converter must match the buffers actually arriving: a format
         // change under a live tap otherwise yields garbled (resampled-wrong) audio.
+        // v1.17 (R4): every native call below runs inside the boundary's Objective-C catching frame —
+        // the converter build inside this lock's closure — so an exception drops this buffer with one
+        // stage note and leaves no converter behind; the next buffer rebuilds it (same recorder).
         let epoch = lock.withLock { engineEpoch }
+        var buildFailure: Error?
         let converter: AVAudioConverter? = lock.withLock {
             guard captureRunning, tapEpoch === token else { return nil }
             if stats.firstBufferMs == nil {
@@ -1411,34 +1417,70 @@ public final class AudioRecorder: CaptureEngine {
                                    at: ProcessInfo.processInfo.systemUptime)
             if let current = self.converter, current.inputFormat == buffer.format { return current }
             if self.converter != nil { stats.formatChanges += 1 }
-            let target = headsetNative.call("target_format") { targetFormat }
-            self.converter = headsetNative.call("converter") { AVAudioConverter(from: buffer.format, to: target) }
+            do { self.converter = try makeHeadsetConverter(from: buffer.format) } catch {
+                self.converter = nil               // never keep converting with the old format's converter
+                buildFailure = error
+            }
             return self.converter
         }
+        if let buildFailure { headsetNativeFailed(buildFailure) }
         guard let converter else { return }
-        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
-        guard let out = headsetNative.call("output_buffer", { AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) })
-        else { return }
         var fed = false
         var error: NSError?
-        _ = headsetNative.call("convert") {
-            converter.convert(to: out, error: &error) { _, status in
-                if fed {
-                    status.pointee = .noDataNow
-                    return nil
-                }
-                fed = true
-                status.pointee = .haveData
-                return buffer
+        do {
+            let out = try headsetNative.call("output_buffer") { () throws -> AVAudioPCMBuffer in
+                let target = converter.outputFormat
+                let capacity = Int(Double(buffer.frameLength) * (target.sampleRate / buffer.format.sampleRate)) + 32
+                return try NativePCM.buffer(target, capacity: capacity)
             }
+            try headsetNative.call("convert") {
+                _ = converter.convert(to: out, error: &error) { _, status in
+                    if fed {
+                        status.pointee = .noDataNow
+                        return nil
+                    }
+                    fed = true
+                    status.pointee = .haveData
+                    return buffer
+                }
+            }
+            return finishConsume(out, error: error, time: time, epoch: epoch, token: token)
+        } catch {
+            // A converter that raised mid-conversion is not reused: the next buffer builds a fresh one.
+            if HeadsetNativeFailure.wrap(error).stage == "convert" {
+                lock.withLock { if self.converter === converter { self.converter = nil } }
+            }
+            headsetNativeFailed(error)
         }
+    }
+
+    /// The engine arm's converter to 24 kHz mono Float. The target format goes through NativePCM; the
+    /// converter is the v1.16 constructor (it accepts every hardware format v1.16 did), and both run
+    /// inside the boundary's Objective-C catching frame. Nil when the constructor declines (v1.16).
+    private func makeHeadsetConverter(from input: AVAudioFormat) throws -> AVAudioConverter? {
+        let target = try headsetNative.call("target_format") {
+            try NativePCM.format(.pcmFormatFloat32, rate: Self.sampleRate, channels: 1, interleaved: false)
+        }
+        return try headsetNative.call("converter") { AVAudioConverter(from: input, to: target) }
+    }
+
+    /// One note per failing stage until a buffer converts again: the stage name and the exception
+    /// name or error code only — never audio.
+    private func headsetNativeFailed(_ error: Error) {
+        let failure = HeadsetNativeFailure.wrap(error)
+        guard headsetNative.failed(failure) else { return }
+        AppController.note("headset_native_error backend=engine stage=\(failure.stage) \(failure.field)")
+    }
+
+    private func finishConsume(_ out: AVAudioPCMBuffer, error: NSError?, time: AVAudioTime,
+                               epoch: CaptureEpoch, token: CaptureEpoch) {
         if let error { AppController.note("headset_convert_error=\(error.domain):\(error.code)") }
         guard error == nil, let channel = out.floatChannelData?[0] else { return }
         let chunk = Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
         // AVAudioTime and the AUHAL timestamps share the host-clock domain.
         let hostStart = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) :
             ProcessInfo.processInfo.systemUptime - Double(chunk.count) / Self.sampleRate
+        if headsetNative.recovered() { AppController.note("headset_native_recovered=1 backend=engine") }
         headsetNative.converted?(chunk)
         acceptConverted(chunk, at: hostStart, source: .headset, epoch: epoch, tap: token)
     }

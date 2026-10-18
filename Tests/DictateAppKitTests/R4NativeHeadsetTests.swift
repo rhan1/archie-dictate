@@ -21,6 +21,13 @@ struct R4NativeHeadsetTests {
         let env = ProcessInfo.processInfo.environment
         guard let backend = env["DICTATE_R4_BACKEND"], let requested = env["DICTATE_R4_STAGE"],
               let phase = env["DICTATE_R4_PHASE"] else { return }
+        if backend == "rig" {
+            // R4b: the rig speaker's engine/player constructors, forced to raise (nothing is constructed).
+            let made = RigSpeaker.makePlayback { dictate_force_headset_exception(); fatalError("unreachable") }
+            #expect(made == nil)
+            FileHandle.standardOutput.write(Data("R4_CHILD stage=constructor backend=rig forced=1 result=\(made == nil ? "engine_error" : "constructed") alive=1\n".utf8))
+            return
+        }
         let forced = requested != "none"
         var fired = false
         var caught: [String] = []
@@ -189,6 +196,22 @@ struct R4NativeHeadsetTests {
             }
         }
         if allGreen { print("CONTROL same_recorder_conversion_recovery PASS rows=24 backends=engine,auhal phases=startup,change") }
+    }
+
+    /// R4b: `RigSpeaker.swift`'s AVAudioEngine/AVAudioPlayerNode constructors raise → `engine_error`, alive.
+    @Test func rigConstructorFault() throws {
+        guard ProcessInfo.processInfo.environment["DICTATE_R4_BACKEND"] == nil else { return }
+        let result = try Self.runChild(backend: "rig", stage: "constructor", phase: "startup")
+        if let signal = result.signal {
+            print("RIG RED stage=constructor backend=rig forced=1 child_signal=\(Self.signalName(signal))")
+        } else if let line = result.line, result.status == 0, line.contains("result=engine_error alive=1") {
+            print(line.replacingOccurrences(of: "R4_CHILD", with: "RIG GREEN"))
+            print("CONTROL rig_constructor_guard PASS result=engine_error")
+        } else {
+            Issue.record("rig child failed:\n\(result.output.suffix(2000))")
+        }
+        #expect(result.signal == nil)
+        #expect(result.line?.contains("result=engine_error alive=1") == true)
     }
 
     // MARK: guard controls (the existing guards themselves, in-process)

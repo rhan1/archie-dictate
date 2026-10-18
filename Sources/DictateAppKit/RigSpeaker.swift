@@ -52,9 +52,10 @@ public enum RigSpeaker {
         let channel = buffer.floatChannelData![0]
         for (i, s) in samples.enumerated() { channel[i] = Float(Double(s) / 32_768 * gain) }
 
-        let engine = AVAudioEngine()
+        guard let (engine, player) = makePlayback() else {
+            return Result(deviceUID: uid, gainDB: gainDB, peakDBFS: levelDBFS, durationMs: 0, enginesOpened: enginesOpened, outcome: "engine_error")
+        }
         enginesOpened += 1
-        let player = AVAudioPlayerNode()
         let started = ContinuousClock.now
         var error: NSError?
         guard dictate_rig_start(engine, player, format, device, &error) else {
@@ -72,6 +73,14 @@ public enum RigSpeaker {
         let playedMs = Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
         return Result(deviceUID: uid, gainDB: gainDB, peakDBFS: levelDBFS, durationMs: playedMs, enginesOpened: enginesOpened,
                       outcome: !stopped ? "stop_error" : (finished ? "ok" : "timeout"))
+    }
+
+    /// v1.17 (R4b): the private engine and its player node are constructed inside Dictate's Objective-C
+    /// catching frame (`captureObjC`): a constructor exception is `result=engine_error`, never an abort.
+    /// `make` is injectable so the offline test forces the exception without constructing an engine.
+    static func makePlayback(_ make: () -> (AVAudioEngine, AVAudioPlayerNode) = { (AVAudioEngine(), AVAudioPlayerNode()) })
+        -> (AVAudioEngine, AVAudioPlayerNode)? {
+        try? captureObjC(make)
     }
 
     /// The built-in output (transport built-in, has output streams) and its UID; property reads only.

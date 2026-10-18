@@ -34,8 +34,6 @@ final class HeadsetCaptureUnit: HeadsetCapture {
     private let context = HeadsetRenderContext()
     /// The AUHAL arm's native-call boundary (test seams nil in production).
     let headsetNative = HeadsetNativeBoundary()
-    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate,
-                                             channels: 1, interleaved: false)!
 
     private var _isRunning = false
     private var _lastCallbackTime: TimeInterval?
@@ -50,6 +48,12 @@ final class HeadsetCaptureUnit: HeadsetCapture {
     private var listenerToken: AnyObject?
     private var hardwareFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
+    /// v1.17 (R4): the hardware rate whose conversion chain a caught native exception left unbuilt;
+    /// the worker rebuilds it before the next buffer (same unit, no restart).
+    private var pendingRebuild: Double?
+    /// v1.17 (R4): a format change whose chain build a caught native exception aborted; the worker
+    /// retries it at the top of its next drain, before that drain reads the hardware format.
+    private var pendingFormatChange: HALStreamFormat?
 
     private var callbacksStoppedReported = false
     private var deviceLostReported = false
@@ -102,6 +106,8 @@ final class HeadsetCaptureUnit: HeadsetCapture {
             isFormatInvalid = false
             formatInvalidReported = false
             converterFailedReported = false
+            pendingRebuild = nil
+            pendingFormatChange = nil
             _counters = SourceCounters()
             _formatGeneration = 1
             hasDriverSession = true
@@ -143,19 +149,23 @@ final class HeadsetCaptureUnit: HeadsetCapture {
                 throw StartError(step: "configure", status: OSStatus((error as NSError).code))
             }
 
-            let target = headsetNative.call("target_format") { targetFormat }
-            guard let mono = headsetNative.call("input_format", {
-                AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hwFormat.sampleRate, channels: 1, interleaved: false)
-            }) else {
-                throw StartError(step: "mono_format", status: -1)
+            // A native exception here is not a failed start: the unit runs and the worker rebuilds the
+            // chain before the first buffer. A format/converter that is merely unavailable keeps v1.16's path.
+            var built: Conversion?
+            var faulted = false
+            do { built = try conversion(rate: hwFormat.sampleRate) } catch {
+                nativeFailed(error)
+                faulted = true
             }
+            if !faulted, built == nil { throw StartError(step: "mono_format", status: -1) }
 
-            let conv = headsetNative.call("converter") { makeConverter(mono, target) }
+            let conv = built?.converter
             var convFailedAtStart = false
             lock.withLock {
-                hardwareFormat = mono
+                hardwareFormat = built?.mono
                 converter = conv
-                if conv == nil {
+                pendingRebuild = faulted ? hwFormat.sampleRate : nil
+                if !faulted, conv == nil {
                     converterFailedReported = true
                     convFailedAtStart = true
                 }
@@ -242,7 +252,54 @@ final class HeadsetCaptureUnit: HeadsetCapture {
         lock.withLock {
             converter = nil
             hardwareFormat = nil
+            pendingRebuild = nil
+            pendingFormatChange = nil
         }
+    }
+
+    /// One hardware rate's conversion chain (mono input format + converter to the 24 kHz mono target).
+    private struct Conversion {
+        let mono: AVAudioFormat
+        let converter: AVAudioConverter?
+    }
+
+    /// Every native call runs inside the boundary's Objective-C catching frame (v1.17 R4). The fixed
+    /// target goes through NativePCM; the hardware-rate format and the converter keep v1.16's
+    /// constructors (same acceptance). Nil: the input format is unavailable (v1.16's `mono_format`).
+    private func conversion(rate: Double) throws -> Conversion? {
+        let target = try headsetNative.call("target_format") {
+            try NativePCM.format(.pcmFormatFloat32, rate: AudioRecorder.sampleRate, channels: 1, interleaved: false)
+        }
+        guard let mono = try headsetNative.call("input_format", {
+            AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)
+        }) else { return nil }
+        return Conversion(mono: mono, converter: try headsetNative.call("converter") { makeConverter(mono, target) })
+    }
+
+    /// One note per failing stage until a buffer converts again (stage + exception name, never audio).
+    private func nativeFailed(_ error: Error) {
+        let failure = HeadsetNativeFailure.wrap(error)
+        guard headsetNative.failed(failure) else { return }
+        note("headset_native_error backend=auhal stage=\(failure.stage) \(failure.field)")
+    }
+
+    /// Worker: rebuild the chain a caught native exception left unbuilt. A repeat exception stays
+    /// pending (retried next tick, noted once); an unavailable format/converter reports v1.16's
+    /// `converterFailed` once and stops retrying.
+    private func rebuildAfterNativeFault() {
+        guard let rate = lock.withLock({ _isRunning ? pendingRebuild : nil }) else { return }
+        let built: Conversion?
+        do { built = try conversion(rate: rate) } catch { nativeFailed(error); return }
+        let emit: CaptureEpoch? = lock.withLock {
+            guard _isRunning, pendingRebuild == rate else { return nil }
+            pendingRebuild = nil
+            if let built { hardwareFormat = built.mono }
+            converter = built?.converter
+            guard converter == nil, !converterFailedReported else { return nil }
+            converterFailedReported = true
+            return epoch
+        }
+        if let emit { onEvent?(.converterFailed, emit) }
     }
 
     /// Real-time thread: no locks, no allocation, no object retains — the context copies into a
@@ -264,6 +321,12 @@ final class HeadsetCaptureUnit: HeadsetCapture {
     func offlineDrain() { worker.sync { drain() } }
 
     private func drain() {
+        rebuildAfterNativeFault()
+        let retry = lock.withLock { () -> HALStreamFormat? in
+            defer { pendingFormatChange = nil }
+            return _isRunning ? pendingFormatChange : nil
+        }
+        if let retry { handleFormatChange(driver.currentFormat() ?? retry) }
         guard let (format, token, currentSession) = lock.withLock({ () -> (AVAudioFormat, CaptureEpoch, Int)? in
             guard let format = self.hardwareFormat, let epoch = self.epoch, _isRunning else {
                 return nil
@@ -302,18 +365,29 @@ final class HeadsetCaptureUnit: HeadsetCapture {
         }
 
         let isInvalid = lock.withLock { isFormatInvalid }
-        let currentConverter = lock.withLock { converter }
+        var currentConverter = lock.withLock { converter }
 
-        // Drain slots
-        while let (frames, hostTime, slotSession) = context.nextSlot({ pointer, count in
-            guard let buffer = headsetNative.call("input_buffer", {
-                      AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count))
-                  }),
-                  let channel = buffer.floatChannelData?[0] else { return nil as AVAudioPCMBuffer? }
-            channel.update(from: pointer, count: count)
-            buffer.frameLength = AVAudioFrameCount(count)
-            return buffer
+        // Drain slots. The input copy runs inside the ring's slot closure: a native exception is caught
+        // there, the slot is still released (read index advanced) and counted, and the buffer is dropped.
+        var slotFailure: Error?
+        while let (frames, hostTime, slotSession) = context.nextSlot({ pointer, count -> AVAudioPCMBuffer? in
+            do {
+                guard let buffer = try headsetNative.call("input_buffer", {
+                          AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count))
+                      }),
+                      let channel = buffer.floatChannelData?[0] else { return nil }
+                channel.update(from: pointer, count: count)
+                buffer.frameLength = AVAudioFrameCount(count)
+                return buffer
+            } catch {
+                slotFailure = error
+                return nil
+            }
         }) {
+            if let failure = slotFailure {
+                slotFailure = nil
+                nativeFailed(failure)
+            }
             // Late frames from an earlier start are dropped
             guard slotSession == currentSession else { continue }
 
@@ -323,21 +397,39 @@ final class HeadsetCaptureUnit: HeadsetCapture {
 
             guard !isInvalid, let input = frames, let converter = currentConverter else { continue }
 
-            let ratio = targetFormat.sampleRate / format.sampleRate
-            let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio)) + 128
-            guard let out = headsetNative.call("output_buffer", {
-                AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity)
-            }) else { continue }
+            let out: AVAudioPCMBuffer
+            do {
+                out = try headsetNative.call("output_buffer") { () throws -> AVAudioPCMBuffer in
+                    let target = converter.outputFormat
+                    let ratio = target.sampleRate / format.sampleRate
+                    return try NativePCM.buffer(target, capacity: Int(ceil(Double(input.frameLength) * ratio)) + 128)
+                }
+            } catch {
+                nativeFailed(error)
+                continue
+            }
 
             var fed = false
             var error: NSError?
-            _ = headsetNative.call("convert") {
-                converter.convert(to: out, error: &error) { _, status in
-                    if fed { status.pointee = .noDataNow; return nil }
-                    fed = true
-                    status.pointee = .haveData
-                    return input
+            do {
+                try headsetNative.call("convert") {
+                    _ = converter.convert(to: out, error: &error) { _, status in
+                        if fed { status.pointee = .noDataNow; return nil }
+                        fed = true
+                        status.pointee = .haveData
+                        return input
+                    }
                 }
+            } catch {
+                // A converter that raised mid-conversion is never reused: rebuild it now for the
+                // following slots (still pending for the next drain if the rebuild faults too).
+                lock.withLock {
+                    if self.converter === converter { self.converter = nil; pendingRebuild = hardwareFormat?.sampleRate }
+                }
+                nativeFailed(error)
+                rebuildAfterNativeFault()
+                currentConverter = lock.withLock { self.converter }
+                continue
             }
 
             if let error {
@@ -363,6 +455,7 @@ final class HeadsetCaptureUnit: HeadsetCapture {
                 start = clock() - Double(input.frameLength) / format.sampleRate
             }
 
+            if headsetNative.recovered() { note("headset_native_recovered=1 backend=auhal") }
             let deliver: (([Float], TimeInterval, CaptureEpoch) -> Void)? = lock.withLock {
                 guard _isRunning, epoch === token else { return nil }
                 _counters.frames(chunk)
@@ -419,10 +512,17 @@ final class HeadsetCaptureUnit: HeadsetCapture {
 
         guard needsUpdate else { return }
 
-        let target = headsetNative.call("target_format") { targetFormat }
-        guard let mono = headsetNative.call("input_format", {
-            AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: newFormat.sampleRate, channels: 1, interleaved: false)
-        }) else {
+        // v1.17 (R4): the whole chain is built (guarded) before the unit is reconfigured. A native exception
+        // drops the old-rate converter (it would garble the new rate) and keeps the old hardware format;
+        // the chain is marked mismatched (`isFormatInvalid`: no slot is converted, the retry always rebuilds)
+        // and the worker retries the change at the top of its next drain.
+        let built: Conversion?
+        do { built = try conversion(rate: newFormat.sampleRate) } catch {
+            lock.withLock { converter = nil; isFormatInvalid = true; pendingFormatChange = newFormat }
+            nativeFailed(error)
+            return
+        }
+        guard let mono = built?.mono else {
             let shouldEmit = lock.withLock { () -> Bool in
                 guard !converterFailedReported else { return false }
                 converterFailedReported = true
@@ -441,11 +541,13 @@ final class HeadsetCaptureUnit: HeadsetCapture {
             note("headset_reconfigure_error=\(error)")
         }
 
-        let conv = headsetNative.call("converter") { makeConverter(mono, target) }
+        let conv = built?.converter
         let (gen, shouldEmitConverterFailed) = lock.withLock { () -> (Int, Bool) in
             _formatGeneration += 1
             hardwareFormat = mono
             converter = conv
+            pendingRebuild = nil
+            pendingFormatChange = nil
             isFormatInvalid = false
             formatInvalidReported = false
             var emitFailed = false
