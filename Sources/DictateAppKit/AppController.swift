@@ -186,7 +186,7 @@ public final class AppController {
         } catch {
             AppController.note("migration_error=\(error.localizedDescription)")
         }
-        keyStore.prefetch(services: ["groq-api"])
+        keyStore.prefetch(services: ["groq-api", "elevenlabs-api"])
         // Logged once the background read has had time to resolve (at request time it is always pending).
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.logKeyStates() }
         hotkeys.onSignal = { [weak self] signal in MainActor.assumeIsolated { self?.facade.handle(signal) } }
@@ -254,7 +254,7 @@ public final class AppController {
     func engineStart() {
         configureEngine()
         guard machine.state == .idle else { return }
-        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api"]) }
+        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api", "elevenlabs-api"]) }
         let requestAccess = dependencies?.requestMicrophoneAccess ?? AudioRecorder.requestMicrophoneAccess
         requestAccess { [weak self] in self?.micAvailable = $0 }
         doubleTap()
@@ -688,6 +688,9 @@ public final class AppController {
                 let streaming = GroqChunkedTranscriber(transport: sttTransport, apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
                     return key
+                }, scribeAPIKey: {
+                    guard let key = keys.key(for: "elevenlabs-api") else { throw TranscriptionError.missingKey }
+                    return key
                 }, prompt: prompt,
                    rejoinGuard: GroqChunkedTranscriber.rejoinGuardEnabled(environment: ProcessInfo.processInfo.environment),
                    lowSpeechGuard: GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: ProcessInfo.processInfo.environment),
@@ -1113,6 +1116,8 @@ public final class AppController {
             if micFallback { fields.append("mic_fallback=builtin") }
             fields.append("stt_dropped_loop=\((chunked?.droppedLoops ?? 0) + rawLoopCollapses)")
             if let chunked {
+                if chunked.scribeNoKey { fields.append("stt_lane=scribe:no_key") }
+                else if chunked.scribeChunks > 0 { fields.append("stt_lane=scribe chunks_scribe=\(chunked.scribeChunks)") }
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
                            "stt_dropped_low_speech_sentence=\(chunked.droppedLowSpeechSentences + chunked.droppedOpeningSentences + chunked.droppedTailSentences)",
