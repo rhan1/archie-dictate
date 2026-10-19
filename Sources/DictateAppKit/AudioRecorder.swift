@@ -78,6 +78,13 @@ public final class AudioRecorder: CaptureEngine {
         /// The capture part of the session-end line (counts only), shared by Dictate and hosts:
         /// `kind=… recording_ms=… capture_intervals=… [capture_intervals_truncated=1] speech_sections=…
         /// builtin_frames_after_fallback=… [builtin_backend=…] carrier=… headset_carried_ms=… io_ops=… io_held=…`.
+        /// Shared with AppController's timeline and a hosted conversation's
+        /// session-end line, so the first live session exposes the same clock
+        /// fields beside the actual native processing state.
+        public var startupFields: String {
+            "engine_start_ms=\(engineStartMs) first_buffer_ms=\(firstBufferMs.map(String.init) ?? "-") voice_processing=\(voiceProcessing)"
+        }
+
         public var sessionEndFields: String {
             var line = "kind=\(kind.rawValue) recording_ms=\(recordingMs) capture_intervals=\(captureIntervals)"
             if captureIntervalsTruncated { line += " capture_intervals_truncated=1" }
@@ -85,7 +92,7 @@ public final class AudioRecorder: CaptureEngine {
             if let backend = builtinBackend { line += " builtin_backend=\(backend)" }
             line += " carrier=\(carrier) headset_carried_ms=\(headsetCarriedMs)"
             // v1.12: the split io_ops / obligations, exact frame runs, the lease and the A/B fields.
-            return line + " voice_processing=\(voiceProcessing) engine_start_ms=\(engineStartMs) first_buffer_ms=\(firstBufferMs.map(String.init) ?? "-") \(ioOps) \(ioHeld) \(carrierFrames) \(lease) \(instrumentation)"
+            return line + " \(startupFields) \(ioOps) \(ioHeld) \(carrierFrames) \(lease) \(instrumentation)"
         }
     }
     /// Set by a host before `startAsync`. Conversation requests Apple AEC on a
@@ -988,9 +995,10 @@ public final class AudioRecorder: CaptureEngine {
         // Keep dictation and Bluetooth's existing device-query/IO sequence.
         let input = requested ? (selectedDevice == .builtIn ? .builtin : route.eligibility()?.0) : nil
         let bluetooth: Bool? = !requested ? false : input == .bluetooth ? true : route.outputIsBluetooth()
-        let state = try CaptureVoiceProcessing.start(requested: requested, builtin: input == .builtin,
-            bluetooth: bluetooth, make: make, note: { AppController.note($0) })
-        lock.withLock { stats.voiceProcessing = state.rawValue }
+        _ = try CaptureVoiceProcessing.start(requested: requested, builtin: input == .builtin,
+            bluetooth: bluetooth, make: make, note: { AppController.note($0) }, stateChanged: { state in
+                self.lock.withLock { self.stats.voiceProcessing = state.rawValue }
+            })
     }
 
     private var voiceProcessingEngine = false

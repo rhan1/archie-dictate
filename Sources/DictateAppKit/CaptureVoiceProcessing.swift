@@ -20,14 +20,15 @@ enum CaptureVoiceProcessing {
     /// unit, and errors starting the fallback still propagate to the host.
     static func start(requested: Bool, builtin: Bool, bluetooth: Bool?,
                       make: (Unit) throws -> CaptureInputUnit,
-                      note: (String) -> Void) throws -> State {
-        guard requested else { try make(.halout).start(); return .off }
+                      note: (String) -> Void, stateChanged: (State) -> Void = { _ in }) throws -> State {
+        guard requested else { stateChanged(.off); try make(.halout).start(); return .off }
         let reason: String?
         if bluetooth == true { reason = "bluetooth_route" }
         else if bluetooth == nil { reason = "route_unknown" }
         else if !builtin { reason = "unsupported_route" }
         else { reason = nil }
         if let reason {
+            stateChanged(.unavailable)
             note("voice_processing=unavailable reason=\(reason)")
             try make(.halout).start()
             return .unavailable
@@ -38,11 +39,13 @@ enum CaptureVoiceProcessing {
             processed = unit
             try unit.configure(AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min))
             try unit.start()
+            stateChanged(.on)
             note("voice_processing=on")
             return .on
         } catch {
             processed?.dispose()
             let reason = (error as? Refusal)?.reason ?? "unit_failed"
+            stateChanged(.unavailable)
             note("voice_processing=unavailable reason=\(reason)")
             try make(.halout).start()
             return .unavailable
