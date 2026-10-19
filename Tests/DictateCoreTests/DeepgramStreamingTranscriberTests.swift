@@ -89,6 +89,17 @@ private final class ChunkTexts: @unchecked Sendable {
     var indices: [Int] { lock.withLock { values.map(\.0) } }
 }
 
+private final class WholeWAVTransport: HTTPTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [URLRequest] = []
+    var requests: [URLRequest] { lock.withLock { storage } }
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        lock.withLock { storage.append(request) }
+        return (Data("{\"text\":\"Recovered entire dictation.\"}".utf8),
+            HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
 private func eventually(_ predicate: () -> Bool) async -> Bool {
     for _ in 0..<2000 {
         if predicate() { return true }
@@ -112,8 +123,10 @@ struct DeepgramStreamingTranscriberTests {
         let texts = ChunkTexts()
         let clock = ManualClock()
         socket.endAfterClose = false
+        let whole = WholeWAVTransport()
         let engine = DeepgramStreamingTranscriber(transport: transport, apiKey: { "scripted-key" },
-            clock: clock, onChunkText: { texts.append($0, $1) })
+            clock: clock, fallbackClient: TranscriptionClient(transport: whole, apiKey: { "fake" }),
+            onChunkText: { texts.append($0, $1) })
         engine.append([1, -2, 32767])
         #expect(await eventually { socket.sent.count == 1 })
         #expect(socket.sent == [Data([1, 0, 254, 255, 255, 127])])
@@ -129,6 +142,7 @@ struct DeepgramStreamingTranscriberTests {
         #expect(result.text == "Send the report. On Wednesday.")
         #expect(result.chunks == 2 && result.failedCount == 0)
         #expect(texts.indices == [0, 1])
+        #expect(whole.requests.isEmpty)
         // Negative controls: both interim frames and the whitespace final must be rejected.
         #expect(!texts.texts.contains("unfinished preview"))
         #expect(!texts.texts.contains("another preview"))
@@ -187,4 +201,88 @@ struct DeepgramStreamingTranscriberTests {
         #expect(repeated.text == result.text && socket.closeStreams == 1)
         print("ST1 CLOSE closestream=1 waited_ms<=1500")
     }
+    private func verifyFallback(_ reason: String) async throws {
+        let clock = ManualClock()
+        let socket = ScriptedSocket()
+        let transport = ScriptedWebSocket(socket)
+        transport.failConnect = reason == "connect"
+        let http = WholeWAVTransport()
+        let notes = ChunkTexts()
+        let texts = ChunkTexts()
+        let engine = DeepgramStreamingTranscriber(transport: transport, apiKey: {
+            if reason == "missing_key" { throw TranscriptionError.missingKey }
+            return "scripted-key"
+        }, clock: clock, fallbackClient: TranscriptionClient(transport: http, apiKey: { "fake-groq" }),
+           prompt: "fixture vocabulary", note: { notes.append(0, $0) },
+           onChunkText: { texts.append($0, $1) })
+        engine.append([1, -2])
+        if reason == "socket" || reason == "timeout" {
+            #expect(await eventually { socket.sent.count == 1 && clock.sleepers >= 1 })
+            socket.push(try fixture()[1])
+            #expect(await eventually { texts.texts.count == 1 })
+            if reason == "socket" { socket.breakSocket() }
+            else { clock.advance(by: .seconds(15)) }
+        }
+        #expect(await eventually { engine.fallbackReason == reason })
+        // More audio arrives after the failure: the fallback must include it as well.
+        engine.append([3, 4])
+        let expectedPCM: [Int16]
+        if reason == "socket" {
+            expectedPCM = [100, 200, 300, 400, 500]
+            engine.setFallbackPCM(expectedPCM) // recorder's authoritative retained capture
+        } else { expectedPCM = [1, -2, 3, 4] }
+        async let a = engine.finish()
+        async let b = engine.finish()
+        let (first, second) = await (a, b)
+        #expect(first.text == "Recovered entire dictation." && first.failedCount == 0)
+        #expect(second.text == first.text)
+        #expect(http.requests.count == 1)
+        #expect(socket.closeStreams == 0)
+        #expect(notes.texts == ["stt_fallback=groq reason=\(reason)"])
+        #expect(transport.count == (reason == "missing_key" ? 0 : 1))
+        let request = try #require(http.requests.first)
+        #expect(request.url == TranscriptionClient.groqEndpoint)
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer fake-groq")
+        let body = try #require(request.httpBody)
+        let wav = WAVEncoder.encode(samples: expectedPCM, sampleRate: 24_000)
+        #expect(body.range(of: wav) != nil)
+        #expect(String(decoding: body, as: UTF8.self).contains("fixture vocabulary"))
+        // Whole-WAV replacement must not append a duplicate after the partial streaming final.
+        #expect(!texts.texts.contains("Recovered entire dictation."))
+    }
+
+    @Test func socketFallback() async throws {
+        try await verifyFallback("socket")
+        print("ST1 FALLBACK reason=socket groq_requests=1 lost=0")
+    }
+
+    @Test func missingKeyFallback() async throws {
+        try await verifyFallback("missing_key")
+        print("ST1 FALLBACK reason=missing_key groq_requests=1 lost=0")
+    }
+
+    @Test func connectFallback() async throws {
+        try await verifyFallback("connect")
+        print("ST1 FALLBACK reason=connect groq_requests=1 lost=0")
+    }
+
+    @Test func timeoutFallback() async throws {
+        try await verifyFallback("timeout")
+        print("ST1 FALLBACK reason=timeout groq_requests=1 lost=0")
+    }
+
+    @Test func cancelledRunDoesNotFallback() async {
+        let socket = ScriptedSocket()
+        let http = WholeWAVTransport()
+        let engine = DeepgramStreamingTranscriber(transport: ScriptedWebSocket(socket), apiKey: { "fake" },
+            clock: ManualClock(), fallbackClient: TranscriptionClient(transport: http, apiKey: { "fake" }))
+        engine.append([1])
+        #expect(await eventually { socket.sent.count == 1 })
+        engine.cancel()
+        let result = await engine.finish()
+        #expect(result.failedCount == 1 && result.text.isEmpty)
+        #expect(http.requests.isEmpty && socket.closeStreams == 0)
+        print("ST1 CANCEL groq_requests=0 closestream=0")
+    }
+
 }
