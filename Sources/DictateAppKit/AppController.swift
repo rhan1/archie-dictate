@@ -11,6 +11,8 @@ public final class AppController {
     let pill: EnginePanel
     private var statusItem: StatusItemController?
     private let inserter: TextInserter
+    /// v1.19 (ST2): the delayed, read-only personal-dictionary observation after a confirmed insertion.
+    let editLearner: EditLearner
     private let keyStore: KeyStore
     private let paths: AppPaths
     /// v1.19 (ST1): the host's provider selection (explicit, else `DictationSTT.default`).
@@ -148,7 +150,17 @@ public final class AppController {
         let injectURL = Self.injectedAudioURL(injectedAudioURL, environment: ProcessInfo.processInfo.environment)
         if let injectURL { AppController.note("inject_wav=\(injectURL.lastPathComponent)") }
         recorder = dependencies?.recorder ?? injectURL.map { WAVInjectedRecorder(url: $0, scenario: WAVInjectedRecorder.scenario(environment: ProcessInfo.processInfo.environment)) } ?? AudioRecorder()
-        inserter = dependencies?.inserter ?? TextInserter()
+        let inserter = dependencies?.inserter ?? TextInserter()
+        // Injected (test) wiring never reaches live AX: without an injected reader the learner sees no focus.
+        let learner = EditLearner(store: KeytermsStore(url: keytermsURL ?? paths.keytermsURL),
+            focused: dependencies.map { $0.focusSnapshot ?? { nil } } ?? AXFocus.snapshot,
+            schedule: dependencies?.learnerSchedule ?? { delay, work in
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+            },
+            log: { AppController.note($0) })
+        inserter.onConfirmedReadBack = { learner.insertionConfirmed($0) }
+        self.inserter = inserter
+        editLearner = learner
         self.keyStore = keyStore
         self.paths = paths
         pill = EnginePanel(surface: surface, factory: dependencies?.panelFactory ?? { PillPanel() })
@@ -676,6 +688,8 @@ public final class AppController {
     // MARK: - Flow
 
     private func beginRecording() {
+        // ST2: a new dictation cancels the previous insertion's pending 20-s observation.
+        editLearner.cancelPending()
         clearOutcome()
         logKeyStates()
         sessionPolicy = EnginePolicy(mode: engineMode, fallback: forceFallback, quota: quotaStore.current, now: Date())
