@@ -444,8 +444,9 @@ public final class AppController {
                     self.showOutcome(.ok)
                 case .timedOut, .held:
                     let reason = result == .timedOut ? "paste_timeout" : "focus_changed"
-                    self.rememberHeldDictation(text)
-                    self.showOutcome(.held(reason), text: text)
+                    let recovery = self.inserter.heldText ?? text
+                    self.rememberHeldDictation(recovery)
+                    self.showOutcome(.held(reason), text: recovery)
                 }
             })
         }
@@ -608,6 +609,7 @@ public final class AppController {
         else { perform(machine.finishButton()) }
     }
     private func cancel() {
+        inserter.cancelTyping()
         if pillOutcome != nil { outcomeEvent(.dismissTap) }
         else {
             if machine.state == .idle { capture.end(.cancel) }
@@ -615,6 +617,7 @@ public final class AppController {
         }
     }
     private func escape() {
+        inserter.cancelTyping()
         if pillOutcome != nil { outcomeEvent(.escape) }
         else {
             if machine.state == .idle { capture.end(.cancel) }
@@ -972,8 +975,9 @@ public final class AppController {
                             case .timedOut, .held:
                                 let reason = result == .timedOut ? "paste_timeout" : "focus_changed"
                                 outcome = result == .timedOut ? .held("paste_timeout") : .held("focus_changed")
-                                self.rememberHeldDictation(text)
-                                if myGeneration === self.generation { self.showOutcome(.held(reason), text: text) }
+                                let recovery = self.inserter.heldText ?? text
+                                self.rememberHeldDictation(recovery)
+                                if myGeneration === self.generation { self.showOutcome(.held(reason), text: recovery) }
                             }
                             self.appendLog(entry(text.count, pasteApp, outcome), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
                         })
@@ -1155,6 +1159,7 @@ public final class AppController {
     }
 
     private func cancelAll() {
+        inserter.cancelTyping()
         micStarting = false
         let owned = takeSessionForOutcome()      // before the generation that owns it is replaced
         generation = CaptureEpoch()
