@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Carbon
+import DictateCore
 #if canImport(ApplicationServices)
 import ApplicationServices
 #endif
@@ -32,6 +33,11 @@ public final class TextInserter {
     private let substitutionPolicy: TextSubstitutionPolicy
     private let log: (String) -> Void
     private let now: () -> TimeInterval
+    private let focusIdentity: (() -> FocusIdentity?)?
+    /// v1.19 (ST2): read-only side channel for the edit learner. Called once per CONFIRMED non-empty
+    /// insertion, AFTER its result was delivered, with the read-back that confirmed it. It cannot change the
+    /// result, the held/recovery copy or the confirmation rule.
+    public var onConfirmedReadBack: ((ConfirmedInsertion) -> Void)?
 
     public init(
         pasteboard: NSPasteboard = .general,
@@ -45,8 +51,10 @@ public final class TextInserter {
         timeout: TimeInterval = defaultTimeout,
         axReader: (() -> [String]?)? = nil,
         logger: ((String) -> Void)? = nil,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        focusIdentity: (() -> FocusIdentity?)? = nil
     ) {
+        self.focusIdentity = focusIdentity
         self.keyEventPosting = keyEventPosting ?? postKeystroke.map(ClosureKeyEventPoster.init) ?? SystemKeyEventPoster()
         self.typingEligibility = typingEligibility
         self.targetBundleID = targetBundleID
@@ -89,14 +97,7 @@ public final class TextInserter {
     }
 
     private func currentFocusedElement() -> AXUIElement? {
-        guard Self.isAppRuntime() else { return nil }
-        let systemWide = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef)
-        guard err == .success, let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else {
-            return nil
-        }
-        return (focusedRef as! AXUIElement)
+        AXFocus.focusedElement()
     }
 
     private func currentTargetBundleID(element: AXUIElement?) -> String? {
@@ -114,16 +115,7 @@ public final class TextInserter {
     }
 
     private func readAXTexts(from element: AXUIElement) -> [String] {
-        var texts: [String] = []
-        var valueRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success, let valueRef {
-            if let str = valueRef as? String {
-                texts.append(str)
-            } else if let attr = valueRef as? NSAttributedString {
-                texts.append(attr.string)
-            }
-        }
-        return texts
+        AXFocus.readTexts(from: element)
     }
 
     private func sampleTexts(initialElement: AXUIElement?) -> [String]? {
@@ -243,6 +235,7 @@ public final class TextInserter {
         var postedUnits = 0
         var cancelled = false
         var finished = false
+        var confirmedReadBack: String?
 
         func complete(_ confirmed: Bool) {
             guard !finished else { return }
@@ -262,6 +255,11 @@ public final class TextInserter {
                     ? String(decoding: Array(text.utf16.dropFirst(postedUnits)), as: UTF16.self) : text
             }
             finish(confirmed ? .confirmed : .timedOut)
+            if confirmed, let observer = self.onConfirmedReadBack, let confirmedReadBack {
+                let identity = self.focusIdentity.map { $0() } ?? initialElement.flatMap(AXFocus.identity(of:))
+                observer(ConfirmedInsertion(text: text, initial: initialTexts.first ?? "",
+                                            confirmed: confirmedReadBack, identity: identity))
+            }
         }
 
         func checkConfirmed(_ currentTexts: [String]?) -> Bool {
@@ -272,7 +270,10 @@ public final class TextInserter {
             guard !finished else { return }
             let current = self.sampleTexts(initialElement: initialElement)
             if cancelled { complete(false) }
-            else if self.now() <= deadline, checkConfirmed(current) { complete(true) }
+            else if self.now() <= deadline, checkConfirmed(current) {
+                confirmedReadBack = current?.first
+                complete(true)
+            }
             else if self.now() >= deadline - 1e-6 { complete(false) }
             else {
                 self.schedule(min(self.pollInterval, max(0, deadline - self.now())), pollStep)
