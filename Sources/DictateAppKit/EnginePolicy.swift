@@ -10,6 +10,11 @@ struct EnginePolicy: Sendable {
     var cleanupQuotaLow = false
     /// The Groq key could not be read (denied / prompt suppressed): Apple STT + local cleanup.
     var keyUnavailable = false
+    /// v1.19 (ST1): the speech provider this session runs, decided at recording start from the host's
+    /// selection and the Deepgram key alone. Provider eligibility is separate from Groq's: the Groq quota
+    /// and Groq key below gate only Groq STT (chunked, or the whole-WAV recovery) and Groq cleanup.
+    var sttProvider: DictationSTT = .groqChunked
+    var usesStreamingSTT: Bool { sttProvider == .deepgramStreaming }
     var usesGroqSTT: Bool { fallback != .quota && !sttQuotaLow && !keyUnavailable }
     var usesGroqCleanup: Bool { fallback != .quota && !cleanupQuotaLow && !keyUnavailable }
     var usesCleanup: Bool { mode == .dictate }

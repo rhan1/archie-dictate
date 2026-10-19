@@ -26,5 +26,9 @@ struct EngineDependencies {
     var requestMicrophoneAccess: (@escaping (Bool) -> Void) -> Void
     var frontmostTarget: () -> InsertionTarget?
     var manageMedia: Bool
+    /// v1.19 (ST1): the streaming provider's socket, its clock (deadlines), and a test observer of
+    /// every final segment the session hands the pipeline.
     var wsTransport: any WebSocketTransport = URLSessionWebSocketTransport()
+    var streamingClock: any DictateClock = SystemClock()
+    var onStreamingSegment: (@Sendable (Int, String) -> Void)? = nil
 }

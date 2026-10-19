@@ -1,0 +1,6 @@
+# SYNTHETIC — hand-written from Deepgram's documented live-streaming `Results` / `Metadata` shapes; NOT captured from the provider (no deepgram-api key exists). Provider schema UNVERIFIED. Lines: interim alpha, final alpha, duplicate final alpha, final beta, terminal Metadata.
+{"type":"Results","channel_index":[0,1],"start":0.0,"duration":0.5,"is_final":false,"speech_final":false,"channel":{"alternatives":[{"transcript":"alpha","confidence":0.71,"words":[]}]}}
+{"type":"Results","channel_index":[0,1],"start":0.0,"duration":0.5,"is_final":true,"speech_final":false,"channel":{"alternatives":[{"transcript":"alpha","confidence":0.99,"words":[]}]}}
+{"type":"Results","channel_index":[0,1],"start":0.0,"duration":0.5,"is_final":true,"speech_final":false,"channel":{"alternatives":[{"transcript":"alpha","confidence":0.99,"words":[]}]}}
+{"type":"Results","channel_index":[0,1],"start":0.5,"duration":0.5,"is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"beta","confidence":0.99,"words":[]}]}}
+{"type":"Metadata","transaction_key":"deprecated","request_id":"00000000-0000-0000-0000-000000000000","sha256":"synthetic","created":"2026-10-20T00:00:00.000Z","duration":1.0,"channels":1}
