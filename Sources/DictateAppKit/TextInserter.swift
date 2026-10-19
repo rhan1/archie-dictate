@@ -99,6 +99,20 @@ public final class TextInserter {
         return (focusedRef as! AXUIElement)
     }
 
+    private func currentTargetBundleID(element: AXUIElement?) -> String? {
+        guard Self.isAppRuntime() else { return nil }
+        if let element {
+            var pid: pid_t = 0
+            if AXUIElementGetPid(element, &pid) == .success, pid > 0 {
+                if let app = NSRunningApplication(processIdentifier: pid),
+                   let bundleID = app.bundleIdentifier {
+                    return bundleID
+                }
+            }
+        }
+        return NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    }
+
     private func readAXTexts(from element: AXUIElement) -> [String] {
         var texts: [String] = []
         var valueRef: CFTypeRef?
@@ -207,8 +221,10 @@ public final class TextInserter {
         case .secure: reason = "secure"
         case .noFocus: reason = "no_focus"
         case .editable:
-            // A typed newline/control may submit a terminal prompt. Preserve it through paste.
-            if text.unicodeScalars.contains(where: {
+            let bundleID = targetBundleID != nil ? targetBundleID!() : currentTargetBundleID(element: initialElement)
+            if !substitutionPolicy.allowsTyping(bundleID: bundleID) {
+                reason = "text_substitution"
+            } else if text.unicodeScalars.contains(where: {
                 [.control, .lineSeparator, .paragraphSeparator].contains($0.properties.generalCategory)
             }) { reason = "control_chars" }
             else if chunks == nil { reason = "grapheme_too_long" }
