@@ -58,8 +58,11 @@ struct C1VoiceProcessingTests {
         conversation.offlineHeadsetBuffer(input)
         conversation.offlineHeadsetBuffer(input)
         #expect(!delivered.isEmpty)
-        #expect(delivered.allSatisfy { !$0.isEmpty && $0.count <= 2_400 })
-        #expect(delivered.last?.count == 2_400)
+        // Per-callback converter allocation is b74b068's (budget + 32); AudioRecorder re-chunks the
+        // pcm16 stream to `chunkSamples` downstream. Frames the resampler holds back are not lost:
+        // after an end-of-stream flush the two callbacks yield exactly 2 x 2 400 frames.
+        #expect(delivered.allSatisfy { !$0.isEmpty && $0.count <= 2_400 + 32 })
+        #expect(delivered.flatMap { $0 }.count + (try conversation.offlineFlushConverter()).count == 4_800)
         #expect(delivered.flatMap { $0 }.contains { abs($0) > 0.01 })
         #expect(AudioRecorder.sampleRate == 24_000 && AudioRecorder.chunkSamples == 2_400)
         print("C1 GREEN wiring unit=vpio ducking=min format_out=24000Hz/1ch/pcm16 dictation_unit=halout bluetooth_unit=unchanged")
@@ -95,6 +98,28 @@ struct C1VoiceProcessingTests {
             }
             #expect(r.stats.voiceProcessing == "unavailable")
         }
+    }
+    /// Raza's headset often falls back to the BUILT-IN mic while OUTPUT stays on the Bluetooth headset
+    /// (`headset_digital_silence`). VPIO opens the output side too (AVAudioIONode: "Enabling this mode
+    /// on either of the IO nodes automatically enables it on the other IO node") and was the prime
+    /// suspect for the WH-1000XM6 silent output, so a Bluetooth output alone keeps today's HAL path —
+    /// Archie's `shouldUseVoiceProcessing` rule (false when EITHER side is Bluetooth).
+    @Test func bluetoothOutputWithBuiltInInputKeepsTodaysPath() throws {
+        final class Notes: @unchecked Sendable { let lock = NSLock(); var lines: [String] = [] }
+        let notes = Notes()
+        AppController.setNoteSink { line in notes.lock.withLock { notes.lines.append(line) } }
+        defer { AppController.setNoteSink(nil) }
+        let r = recorder(input: .builtin, outputBluetooth: true)
+        var made: [CaptureVoiceProcessing.Unit] = []
+        try r.startCaptureInput { mode in
+            made.append(mode)
+            return CaptureInputUnit(start: {}, dispose: {}, configure: { _ in Issue.record("Bluetooth output enabled VPIO") })
+        }
+        let line = try #require(notes.lock.withLock { notes.lines.first { $0.contains("voice_processing=") } })
+        #expect(made == [.halout])
+        #expect(r.stats.voiceProcessing == "unavailable")
+        #expect(line.hasSuffix("voice_processing=unavailable reason=bluetooth_route"))
+        print("C1 CONTROL bt_output_builtin_input voice_processing=\(r.stats.voiceProcessing) reason=\(line.components(separatedBy: "reason=").last ?? "-")")
     }
     @Test func fallbackStartFailureStillPropagates() {
         struct Failed: Error {}
