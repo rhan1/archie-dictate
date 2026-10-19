@@ -1,3 +1,4 @@
+import Foundation
 import DictateCore
 
 /// Hardware boundary used by the existing controller. Hosts use the production
@@ -31,4 +32,7 @@ struct EngineDependencies {
     var wsTransport: any WebSocketTransport = URLSessionWebSocketTransport()
     var streamingClock: any DictateClock = SystemClock()
     var onStreamingSegment: (@Sendable (Int, String) -> Void)? = nil
+    /// v1.19 (ST2): the learner's focused-element reader and its delay scheduler (nil reader = no focus).
+    var focusSnapshot: (() -> FocusSnapshot?)? = nil
+    var learnerSchedule: ((TimeInterval, @escaping () -> Void) -> Void)? = nil
 }
