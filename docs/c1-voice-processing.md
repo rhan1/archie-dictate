@@ -1,7 +1,7 @@
 # Conversation capture voice processing (C1)
 
-Status: native wiring and offline AEC-model gate passed; latency and regression
-controls pending. The Archie companion report documents the playback/capture
+Status: native wiring, offline AEC-model gate and latency telemetry passed;
+regression controls pending. The Archie companion report documents the playback/capture
 timeline and unchanged RED/GREEN fixture.
 
 `AudioRecorder.kind = .conversation` opts a built-in, non-Bluetooth input into
@@ -47,3 +47,19 @@ No devices, providers, audio IO, event taps, windows or dispatcher are used.
 
 Archie compiles against the unchanged b74b068 pin using the existing
 CaptureKind parameter. The manager must re-pin after merging these commits.
+
+## Latency telemetry
+
+AppController's existing timeline and the hosted conversation session-end
+line share `CaptureStats.startupFields`. Refusal remains `unavailable` even
+when the fallback itself throws. The latency tests use synthetic stats and
+an injected unit factory only:
+
+```
+C1 LATENCY live=unmeasured logged_fields=engine_start_ms,first_buffer_ms,voice_processing
+Test run with 2 tests in 1 suite passed after 0.002 seconds.
+```
+
+The first live session will expose these fields for comparison. The required
+live before/after delta budget is at most +100 ms; that delta is unmeasured
+without microphone access, and no offline wall-time result substitutes for it.
