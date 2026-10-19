@@ -26,4 +26,5 @@ struct EngineDependencies {
     var requestMicrophoneAccess: (@escaping (Bool) -> Void) -> Void
     var frontmostTarget: () -> InsertionTarget?
     var manageMedia: Bool
+    var wsTransport: any WebSocketTransport = URLSessionWebSocketTransport()
 }
