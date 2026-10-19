@@ -22,6 +22,7 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
     private var completion: Task<GroqChunkedTranscriber.Result, Never>?
     private var connection: (any WebSocketConnection)?
     private var stopping = false
+    private var closeDeadline: ContinuousClock.Instant?
     private var cancelled = false
     private var failure: String?
     private var finals: [String] = []
@@ -123,29 +124,40 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
     }
 
     private enum ReceiveError: Error { case timeout }
+    private enum ReceiveEvent: Sendable { case message(String?), timeout }
     private func receiveResults(_ socket: any WebSocketConnection) async {
         do {
             while !Task.isCancelled {
-                let message = try await withThrowingTaskGroup(of: String?.self) { group in
-                    group.addTask { try await socket.receive() }
+                let message = try await withThrowingTaskGroup(of: ReceiveEvent.self) { group in
+                    group.addTask { .message(try await socket.receive()) }
                     group.addTask { [self] in
                         try await clock.sleep(for: receiveTimeout)
                         if !lock.withLock({ stopping || cancelled }) { fail("timeout") }
-                        socket.close() // also unblock transports whose receive is not cancellation-aware
-                        throw ReceiveError.timeout
+                        return .timeout
                     }
                     defer { group.cancelAll() }
-                    return try await group.next()!
+                    while let event = try await group.next() {
+                        switch event {
+                        case .message(let message): return message
+                        case .timeout:
+                            if lock.withLock({ failure == "timeout" }) { throw ReceiveError.timeout }
+                            // Stop owns a fresh 1500 ms deadline. An older recording watchdog
+                            // must not close the socket early and discard its last final.
+                        }
+                    }
+                    return nil
                 }
                 guard let message else {
                     if !lock.withLock({ stopping || cancelled }) { fail("socket") }
                     return
                 }
-                consume(message)
+                let pastCloseDeadline = lock.withLock { closeDeadline.map { clock.now() > $0 } ?? false }
+                if !pastCloseDeadline { consume(message) }
             }
         } catch {
             if !lock.withLock({ stopping || cancelled }) {
-                fail(error is ReceiveError ? "timeout" : "socket")
+                let timedOut = error is ReceiveError || (error as? URLError)?.code == .timedOut
+                fail(timedOut ? "timeout" : "socket")
             }
         }
     }
@@ -194,6 +206,7 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
             catch { fail("socket") }
             // A fixed deadline, never extended by interim or final messages.
             let deadline = clock.now().advanced(by: .milliseconds(1500))
+            lock.withLock { closeDeadline = deadline }
             let timeout = Task { [clock] in
                 do { try await clock.sleep(until: deadline); socket.close() }
                 catch { }
