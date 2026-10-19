@@ -54,6 +54,21 @@ enum AudioDevices {
         return (input, (try? builtInInput()) != nil)
     }
 
+    /// Read-only route eligibility for conversation AEC. No device is opened.
+    static func outputIsBluetooth() -> Bool? {
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr,
+              device != 0 else { return nil }
+        var transport: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        address.mSelector = kAudioDevicePropertyTransportType
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport) == noErr else { return nil }
+        return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
     static func selectBuiltIn(on input: AVAudioInputNode) throws {
         var device = try builtInInput()
         guard let unit = input.audioUnit else {

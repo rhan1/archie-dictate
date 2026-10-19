@@ -9,8 +9,8 @@ import DictateCore
 /// v1.8: an independent 100 ms health clock (L2) watches every carrying source and ends a
 /// dictation that hears nothing with `mic_dead`; one Bluetooth recovery episode (L3) admits
 /// every headset restart; PCM leaves the state lock in sequence order (GPT-6 B1).
-/// v1.11 (L2): what a capture session is for, as written on its session-end line. Labels only:
-/// a conversation captures exactly like a dictation.
+/// Capture purpose, also written as `kind=` on the session-end line.
+/// `.conversation` opts the built-in input into Apple voice processing; dictation does not.
 public enum CaptureKind: String, Sendable { case dictation, conversation }
 
 public final class AudioRecorder: CaptureEngine {
@@ -34,6 +34,7 @@ public final class AudioRecorder: CaptureEngine {
     public struct CaptureStats {
         public var device = ""
         public var startFormat = ""
+        public var voiceProcessing = "off"
         public var engineStartMs = 0
         public var firstBufferMs: Int?
         public var formatChanges = 0
@@ -84,10 +85,11 @@ public final class AudioRecorder: CaptureEngine {
             if let backend = builtinBackend { line += " builtin_backend=\(backend)" }
             line += " carrier=\(carrier) headset_carried_ms=\(headsetCarriedMs)"
             // v1.12: the split io_ops / obligations, exact frame runs, the lease and the A/B fields.
-            return line + " \(ioOps) \(ioHeld) \(carrierFrames) \(lease) \(instrumentation)"
+            return line + " voice_processing=\(voiceProcessing) engine_start_ms=\(engineStartMs) first_buffer_ms=\(firstBufferMs.map(String.init) ?? "-") \(ioOps) \(ioHeld) \(carrierFrames) \(lease) \(instrumentation)"
         }
     }
-    /// v1.11 (L2): set by a host before `startAsync`; written as `kind=` on the session-end line.
+    /// Set by a host before `startAsync`. Conversation requests Apple AEC on a
+    /// built-in, non-Bluetooth route. Dictation keeps its existing levels and IO.
     public var kind: CaptureKind {
         get { lock.withLock { captureKind } }
         set { lock.withLock { captureKind = newValue } }
@@ -391,7 +393,9 @@ public final class AudioRecorder: CaptureEngine {
         // v1.12 (L1): the lease's release waits for the headset client's teardown from here on.
         guard lock.withLock({ lease?.started(.headset) == true && engineEpoch === startEpoch }) else { throw CancellationError() }
         if unitArm {
-            try startHeadsetUnit(epoch: startEpoch)
+            try startCaptureInput { _ in
+                CaptureInputUnit(start: { try self.startHeadsetUnit(epoch: startEpoch) }, dispose: {})
+            }
         } else {
             registerConfigurationObserver()
             try installTapAndStart()
@@ -976,7 +980,74 @@ public final class AudioRecorder: CaptureEngine {
         return engine
     }
 
+    /// Shared by the real start/recovery paths and the offline unit-factory
+    /// fixture. CaptureKind is the existing public opt-in parameter Archie
+    /// can pass while its dependency remains pinned to the previous revision.
+    func startCaptureInput(make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit) throws {
+        let requested = kind == .conversation
+        // Keep dictation and Bluetooth's existing device-query/IO sequence.
+        let input = requested ? (selectedDevice == .builtIn ? .builtin : route.eligibility()?.0) : nil
+        let bluetooth: Bool? = !requested ? false : input == .bluetooth ? true : route.outputIsBluetooth()
+        let state = try CaptureVoiceProcessing.start(requested: requested, builtin: input == .builtin,
+            bluetooth: bluetooth, make: make, note: { AppController.note($0) })
+        lock.withLock { stats.voiceProcessing = state.rawValue }
+    }
+
+    private var voiceProcessingEngine = false
+
     private func installTapAndStart() throws {
+        var discarded = false
+        try startCaptureInput { mode in
+            if mode == .vpio {
+                return CaptureInputUnit(start: {
+                    // VPIO owns its rate/layout. A nil tap accepts its output;
+                    // consume converts every buffer to 24 kHz mono as before.
+                    do { try self.installConvertingTapAndStart() }
+                    catch { throw CaptureVoiceProcessing.Refusal(reason: "start_refused") }
+                }, dispose: {
+                    self.teardownEngine()
+                    discarded = true
+                }, configure: { ducking in
+                    do {
+                        try captureObjC {
+                            let input = try self.requireEngine().inputNode
+                            if !input.isVoiceProcessingEnabled { try input.setVoiceProcessingEnabled(true) }
+                            guard input.isVoiceProcessingEnabled else {
+                                throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
+                            }
+                            self.voiceProcessingEngine = true
+                        }
+                    } catch {
+                        throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
+                    }
+                    do {
+                        try captureObjC {
+                            let input = try self.requireEngine().inputNode
+                            input.voiceProcessingOtherAudioDuckingConfiguration = ducking
+                            let actual = input.voiceProcessingOtherAudioDuckingConfiguration
+                            guard !actual.enableAdvancedDucking.boolValue, actual.duckingLevel == .min else {
+                                throw CaptureVoiceProcessing.Refusal(reason: "ducking_refused")
+                            }
+                        }
+                    } catch {
+                        throw CaptureVoiceProcessing.Refusal(reason: "ducking_refused")
+                    }
+                })
+            }
+            return CaptureInputUnit(start: {
+                if self.voiceProcessingEngine { self.teardownEngine(); discarded = true }
+                if discarded {
+                    try self.rebuild()
+                    if self.selectedDevice == .builtIn {
+                        try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
+                    }
+                }
+                try self.installLegacyTapAndStart()
+            }, dispose: {})
+        }
+    }
+
+    private func installLegacyTapAndStart() throws {
         // v1.10 (L1): on Bluetooth after the first configuration notification, no rebuild and no
         // client-format alignment: the tap takes the node's own format and `consume` converts it.
         if lock.withLock({ ioGuard.convertsInTap }) { return try installConvertingTapAndStart() }
@@ -1064,7 +1135,7 @@ public final class AudioRecorder: CaptureEngine {
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
         // Drop even a poisoned engine; replacing it here would allocate while idle.
-        defer { lock.withLock { engine = nil; engineIdentity = CaptureEpoch() } }
+        defer { voiceProcessingEngine = false; lock.withLock { engine = nil; engineIdentity = CaptureEpoch() } }
         let calls: [() throws -> Void] = [
             { try self.removeTap() },
             { try captureObjC { self.engine?.stop() } },
@@ -1430,7 +1501,13 @@ public final class AudioRecorder: CaptureEngine {
         do {
             let out = try headsetNative.call("output_buffer") { () throws -> AVAudioPCMBuffer in
                 let target = converter.outputFormat
-                let capacity = Int(Double(buffer.frameLength) * (target.sampleRate / buffer.format.sampleRate)) + 32
+                let frameBudget = Double(buffer.frameLength) * (target.sampleRate / buffer.format.sampleRate)
+                // Bound VPIO's continuous stream to its input clock. Extra
+                // converter capacity can surface priming padding as capture
+                // frames; buffered converter input carries to the next call.
+                // Preserve the existing allocation for both legacy arms.
+                let processed = lock.withLock { stats.voiceProcessing == "on" }
+                let capacity = processed ? max(1, Int(ceil(frameBudget))) : Int(frameBudget) + 32
                 return try NativePCM.buffer(target, capacity: capacity)
             }
             try headsetNative.call("convert") {
