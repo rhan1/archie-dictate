@@ -375,7 +375,7 @@ struct V15PasteConfirmationTests {
         work?()
         #expect(finished)
         #expect(pb.string(forType: .string) == "RECOVERY")
-        #expect(log == ["paste_confirm=timeout"])
+        #expect(log == ["paste_confirm=timeout", "insertion=paste reason=no_focus confirmed=0"])
     }
 
 }

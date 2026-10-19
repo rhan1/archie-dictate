@@ -683,3 +683,65 @@ extension DictationEngineTests {
     }
 }
 
+
+/// C2 exercises the existing held outcome through the public engine with fake capture,
+/// providers, panel, focus, AX, event posting, private pasteboard and a virtual insertion clock.
+@MainActor @Suite(.serialized)
+struct V18TypedEngineTests {
+    private func waitFor(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < deadline {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        Issue.record("Timed out waiting for fake typed pipeline")
+        throw URLError(.timedOut)
+    }
+
+    @Test(arguments: [false, true])
+    func typedTimeoutAndCancellationPreserveEngineRecovery(cancel: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-c2-engine-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(home: root)
+        let keys = KeyStore(reader: { _ in "fixture" })
+        keys.prefetch(services: ["groq-api"])
+        try await waitFor { keys.key(for: "groq-api") != nil }
+        let f = V18TypedInsertionTests.Fixture()
+        f.confirmsTyping = false
+        let words = (0..<91).map { "token\($0)" }.joined(separator: " ")
+        let recorder = TestRecorder()
+        let deps = EngineDependencies(recorder: recorder, makeApple: { TestApple(words) },
+            sttTransport: TestHTTP(words), groqCleanupTransport: TestHTTP(words), localCleanupTransport: TestHTTP(words),
+            inserter: f.inserter, panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "fixture.host") }, manageMedia: false)
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate, dependencies: deps)
+        let engine = DictationEngine(controller: controller)
+        var states: [DictateAppKit.DictationState] = []
+        engine.onState = { states.append($0) }
+        let baseline = f.pb.changeCount
+        engine.start()
+        try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending }
+        engine.finish()
+        try await waitFor { !f.poster.posted.isEmpty }
+        let typedPayload = String(decoding: f.poster.prepared.filter(\.keyDown).flatMap(\.utf16), as: UTF16.self)
+        #expect(!typedPayload.isEmpty)
+        #expect(typedPayload == words)
+        #expect(!states.contains(.pasted))
+        f.clock.advance(to: cancel ? 0.03 : 9.9)
+        let count = f.poster.posted.count
+        let expectedRecovery = cancel ? String(typedPayload.dropFirst(f.typed.count)) : typedPayload
+        if cancel { engine.escape() }
+        f.clock.advance(to: 10.1)
+        #expect(f.inserter.heldText == expectedRecovery)
+        #expect(states.last == .held(preview: expectedRecovery))
+        #expect(!states.contains(.pasted))
+        #expect(f.poster.pasteCount == 0)
+        #expect(f.pb.changeCount == baseline)
+        if cancel { #expect(f.poster.posted.count == count) }
+        let sessionLog = try String(contentsOf: paths.logURL, encoding: .utf8)
+        #expect(sessionLog.contains("outcome=held:paste_timeout"))
+        #expect(!sessionLog.contains(typedPayload))
+        print("C2 ENGINE action=\(cancel ? "escape" : "timeout") outcome=held:paste_timeout recovery_chars=\(expectedRecovery.count) clipboard_changecount_delta=0")
+        engine.cancel()
+    }
+}
