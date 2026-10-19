@@ -31,7 +31,7 @@ struct V18TypedInsertionTests {
         var typed = ""
         var confirmsTyping = true
         var eligibility: TypingEligibility = .editable
-        var bundleID: String? = nil
+        var bundleID: String? = "dev.warp.Warp-Stable"
         var prefs: [String: Bool] = [:]
         var customReader: ((String, String) -> Bool?)? = nil
         lazy var inserter = TextInserter(pasteboard: pb, postKeystroke: { [unowned self] in poster.postPaste() },
@@ -278,5 +278,85 @@ struct V18TypedInsertionTests {
         #expect(f.poster.pasteCount == 1)
         #expect(f.poster.posted.isEmpty)
         #expect(f.logs.last == "insertion=paste reason=text_substitution confirmed=1")
+    }
+
+    @Test func terminalBundleAllowsTyping() async {
+        let f = Fixture()
+        f.bundleID = "dev.warp.Warp-Stable"
+        await f.start("fixture")
+        f.clock.advance(to: 10.1)
+        #expect(f.result == .confirmed)
+        #expect(f.poster.pasteCount == 0)
+        #expect(!f.poster.posted.isEmpty)
+        print("C2B CONTROL target=terminal bundle=dev.warp.Warp-Stable insertion=typed confirmed=\(f.result == .confirmed ? 1 : 0)")
+    }
+
+    @Test func cocoaAllOffAllowsTyping() async {
+        let f = Fixture()
+        f.bundleID = "com.apple.TextEdit"
+        for key in TextSubstitutionPolicy.substitutionKeys {
+            f.prefs[key] = false
+        }
+        await f.start("fixture")
+        f.clock.advance(to: 10.1)
+        #expect(f.result == .confirmed)
+        #expect(f.poster.pasteCount == 0)
+        #expect(!f.poster.posted.isEmpty)
+        print("C2B CONTROL target=cocoa_all_off insertion=typed")
+    }
+
+    @Test func cocoaOneKeyOnUsesPaste() async {
+        let f = Fixture()
+        f.bundleID = "com.apple.TextEdit"
+        for key in TextSubstitutionPolicy.substitutionKeys {
+            f.prefs[key] = false
+        }
+        f.prefs["NSAutomaticQuoteSubstitutionEnabled"] = true
+        await f.start("fixture")
+        f.clock.advance(to: 10.1)
+        #expect(f.result == .confirmed)
+        #expect(f.poster.pasteCount == 1)
+        #expect(f.poster.posted.isEmpty)
+        #expect(f.logs.last == "insertion=paste reason=text_substitution confirmed=1")
+        print("C2B CONTROL target=one_key_on key=NSAutomaticQuoteSubstitutionEnabled insertion=paste")
+    }
+
+    @Test func unknownBundleUsesPaste() async {
+        let f = Fixture()
+        f.bundleID = nil
+        await f.start("fixture")
+        f.clock.advance(to: 10.1)
+        #expect(f.result == .confirmed)
+        #expect(f.poster.pasteCount == 1)
+        #expect(f.poster.posted.isEmpty)
+        #expect(f.logs.last == "insertion=paste reason=text_substitution confirmed=1")
+        print("C2B CONTROL target=unknown_bundle insertion=paste reason=text_substitution")
+    }
+
+    @Test func globalOnAppOffResolvesApp() async {
+        var appPrefs: [String: [String: Bool]] = [
+            "com.apple.TextEdit": [:]
+        ]
+        var globalPrefs: [String: Bool] = [:]
+        for key in TextSubstitutionPolicy.substitutionKeys {
+            appPrefs["com.apple.TextEdit"]?[key] = false
+        }
+        globalPrefs["NSAutomaticQuoteSubstitutionEnabled"] = true
+        appPrefs["com.apple.TextEdit"]?["NSAutomaticQuoteSubstitutionEnabled"] = false
+
+        let f = Fixture()
+        f.bundleID = "com.apple.TextEdit"
+        f.customReader = { key, bundleID in
+            if let appVal = appPrefs[bundleID]?[key] {
+                return appVal
+            }
+            return globalPrefs[key]
+        }
+        await f.start("fixture")
+        f.clock.advance(to: 10.1)
+        #expect(f.result == .confirmed)
+        #expect(f.poster.pasteCount == 0)
+        #expect(!f.poster.posted.isEmpty)
+        print("C2B CONTROL global_on_app_off resolves=app")
     }
 }
