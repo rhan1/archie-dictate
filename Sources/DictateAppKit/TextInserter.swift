@@ -158,28 +158,7 @@ public final class TextInserter {
             // plus an unrelated edit is not evidence that this paste landed.
             for (index, current) in currentTexts.prefix(1).enumerated() {
                 let initial = index < initialTexts.count ? initialTexts[index] : ""
-                // Count complete new occurrences rather than a minimal string
-                // diff (which trims shared letters from a real replacement).
-                func occurrences(_ value: String, of needle: String) -> Int {
-                    value.components(separatedBy: needle).count - 1
-                }
-                if occurrences(current, of: text) > occurrences(initial, of: text) { return true }
-
-                // Terminals may hard-wrap and frame AXValue rows, or expose
-                // only the visible tail. Ignore presentation characters, but
-                // still require a new occurrence against the same baseline.
-                func normalized(_ value: String) -> String {
-                    String(String.UnicodeScalarView(value.unicodeScalars.filter {
-                        !$0.properties.isWhitespace && !(0x2500...0x257F).contains($0.value)
-                    }))
-                }
-                let payload = normalized(text)
-                guard !payload.isEmpty else { continue }
-                let currentValue = normalized(current)
-                let initialValue = normalized(initial)
-                if occurrences(currentValue, of: payload) > occurrences(initialValue, of: payload) { return true }
-                let tail = String(payload.suffix(48))
-                if occurrences(currentValue, of: tail) > occurrences(initialValue, of: tail) { return true }
+                if Self.hasCompleteNewOccurrence(of: text, initial: initial, current: current) { return true }
             }
             return false
         }
@@ -210,6 +189,28 @@ public final class TextInserter {
         schedule(pollInterval) {
             pollStep()
         }
+    }
+
+    /// H1b (v1.18): the COMPLETE payload must newly occur in the same attribute.
+    /// Verbatim first; then, for terminals that hard-wrap and frame long input,
+    /// the same complete payload with whitespace and box-drawing characters
+    /// (U+2500-U+257F) ignored on both sides. A suffix, a last visible row, a
+    /// length change or a clipboard change is never evidence.
+    static func hasCompleteNewOccurrence(of text: String, initial: String, current: String) -> Bool {
+        // Count complete new occurrences rather than a minimal string
+        // diff (which trims shared letters from a real replacement).
+        func occurrences(_ value: String, of needle: String) -> Int {
+            value.components(separatedBy: needle).count - 1
+        }
+        if occurrences(current, of: text) > occurrences(initial, of: text) { return true }
+        func normalized(_ value: String) -> String {
+            String(String.UnicodeScalarView(value.unicodeScalars.filter {
+                !$0.properties.isWhitespace && !(0x2500...0x257F).contains($0.value)
+            }))
+        }
+        let payload = normalized(text)
+        guard !payload.isEmpty else { return false }
+        return occurrences(normalized(current), of: payload) > occurrences(normalized(initial), of: payload)
     }
 
     public static func postCommandV() {

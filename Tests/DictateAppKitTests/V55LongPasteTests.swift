@@ -2,14 +2,16 @@ import AppKit
 import Testing
 @testable import DictateAppKit
 
+/// H1b (Archie v55): a long dictation pasted into a terminal that hard-wraps
+/// and frames its input confirms on the COMPLETE payload; partial evidence
+/// (last visible row, unchanged field, equal-length unrelated edit, a suffix
+/// that was already there) never confirms and the clipboard keeps the text.
 @MainActor @Suite(.serialized)
 struct V55LongPasteTests {
     private var payload: String {
         String((0..<100).map { "lorem\($0) ipsum\($0) dolor\($0) " }.joined().prefix(728))
     }
 
-    // The prompt offsets the final row so it contains the full 48-character
-    // normalized tail, even though it exposes only a fraction of the payload.
     private var prompt: String { "synthetic terminal prompt awaiting input in a synthetic workspace > " }
 
     private func framedRows(_ text: String) -> [String] {
@@ -27,71 +29,95 @@ struct V55LongPasteTests {
         return pb
     }
 
-    @Test func wrappedTerminalConfirms() async {
-        await checkLongPaste(target: "wrapped_tui")
-    }
-
-    @Test func lastVisibleRowConfirms() async {
-        await checkLongPaste(target: "last_row_only")
-    }
-
-    @Test func verbatimTextFieldControl() async {
-        await checkLongPaste(target: "text_field")
-    }
-
-    private func checkLongPaste(target: String) async {
+    /// Runs one paste against a fake AX target: `before` until 0.2 s after the
+    /// keystroke, `after` from then on. Returns the result, its time and logs.
+    private func paste(before: String, after: String) async -> (TextInserter.Result?, TimeInterval?, [String], NSPasteboard) {
         let pb = privatePasteboard()
-        defer { pb.releaseGlobally() }
         let clock = V15PasteConfirmationTests.ManualMainScheduler()
         let ax = V15PasteConfirmationTests.AXMockBox()
         let logs = V15PasteConfirmationTests.LogBox()
-        let text = payload
-        #expect(text.count == 728)
-        let rows = framedRows(prompt + text)
-        #expect(rows.count > 1)
-        #expect(rows.allSatisfy { $0.count == 124 })
-        let current: String
-        switch target {
-        case "wrapped_tui": current = rows.joined(separator: "\n")
-        case "last_row_only": current = rows.last!
-        default: current = prompt + text
-        }
-        if target != "text_field" {
-            #expect(!current.contains(text))
-        }
-        // Independently establish that the tail fixture really includes all
-        // 48 non-whitespace characters needed for the partial-visibility path.
-        let tail = String(text.filter { !$0.isWhitespace }.suffix(48))
-        #expect(current.filter { !$0.isWhitespace && $0 != "│" }.contains(tail))
-        ax.texts = [target == "text_field" ? prompt : framedRows(prompt).joined(separator: "\n")]
+        ax.texts = [before]
         var result: TextInserter.Result?
         var completedAt: TimeInterval?
         let inserter = TextInserter(pasteboard: pb, postKeystroke: {
-            clock.schedule(0.2) { ax.texts = [current] }
+            clock.schedule(0.2) { ax.texts = [after] }
         }, schedule: clock.schedule, pollInterval: 0.1, timeout: 10,
             axReader: { ax.texts }, logger: logs.log, now: { clock.now })
-        inserter.insert(text, onResult: { result = $0; completedAt = clock.now })
+        inserter.insert(payload, onResult: { result = $0; completedAt = clock.now })
         for _ in 0..<500 where clock.items.isEmpty {
             await Task.yield()
             try? await Task.sleep(for: .milliseconds(1))
         }
         #expect(!clock.items.isEmpty)
-        clock.advance(to: 0.1)
-        #expect(result == nil)
-        clock.advance(to: 0.9)
-        let confirmedWithinOneSecond = result == .confirmed && (completedAt ?? 10) < 1
         clock.advance(to: 10.1)
-        if target == "text_field" {
-            print("LONGPASTE CONTROL target=text_field result=\(result == .confirmed ? "confirmed" : "timedOut")")
-        } else {
-            let phase = result == .confirmed ? "GREEN" : "RED"
-            print("LONGPASTE \(phase) target=\(target) chars=\(text.count) result=\(result == .confirmed ? "confirmed" : "timedOut") log=\(logs.lines.last ?? "none")")
-        }
-        #expect(result == .confirmed)
-        #expect(confirmedWithinOneSecond)
-        #expect(logs.lines == ["paste_confirm=ax"])
+        return (result, completedAt, logs.lines, pb)
+    }
+
+    @Test func wrappedTerminalConfirmsOnTheCompletePayload() async {
+        let text = payload
+        #expect(text.count == 728)
+        let after = framedRows(prompt + text).joined(separator: "\n")
+        #expect(!after.contains(text))
+        let (result, at, logs, pb) = await paste(before: framedRows(prompt).joined(separator: "\n"), after: after)
+        defer { pb.releaseGlobally() }
         let restored = pb.string(forType: .string) == "ORIGINAL_CLIPBOARD"
+        print("H1B GREEN chars=\(text.count) full_new_occurrence=1 result=\(result == .confirmed ? "confirmed" : "timedOut") clipboard_restored=\(restored ? 1 : 0)")
+        #expect(result == .confirmed)
+        #expect((at ?? 10) < 1)
+        #expect(logs == ["paste_confirm=ax"])
         #expect(restored)
+    }
+
+    @Test(arguments: ["last_row_only", "unchanged", "equal_length_unrelated", "preexisting_suffix"])
+    func partialEvidenceNeverConfirms(target: String) async {
+        let text = payload
+        let rows = framedRows(prompt + text)
+        let empty = framedRows(prompt).joined(separator: "\n")
+        let before: String
+        let after: String
+        switch target {
+        case "last_row_only": before = empty; after = rows.last!
+        case "unchanged": before = empty; after = empty
+        case "equal_length_unrelated":
+            before = empty
+            after = framedRows(prompt + String(repeating: "x", count: text.count)).joined(separator: "\n")
+        default: // the field already showed the payload's last row before this paste
+            before = rows.last!; after = rows.last! + "\n" + rows.last!
+        }
+        let (result, at, logs, pb) = await paste(before: before, after: after)
+        defer { pb.releaseGlobally() }
+        let retained = pb.string(forType: .string) == text
+        print("H1B CONTROL target=\(target) complete_evidence=0 result=\(result == .confirmed ? "confirmed" : "timedOut") clipboard_retained=\(retained ? 1 : 0)")
+        #expect(result == .timedOut)
+        #expect(abs((at ?? 0) - 10) < 0.11)
+        #expect(logs == ["paste_confirm=timeout"])
+        #expect(retained)
+    }
+
+    /// The control above must catch a matcher that accepts a suffix.
+    @Test func suffixOnlyMatcherIsRejected() {
+        let text = payload
+        let initial = framedRows(prompt).joined(separator: "\n")
+        let current = framedRows(prompt + text).last!
+        func normalized(_ value: String) -> String {
+            String(String.UnicodeScalarView(value.unicodeScalars.filter {
+                !$0.properties.isWhitespace && !(0x2500...0x257F).contains($0.value)
+            }))
+        }
+        let tail = String(normalized(text).suffix(48))
+        let mutant = normalized(current).contains(tail) && !normalized(initial).contains(tail)
+        let real = TextInserter.hasCompleteNewOccurrence(of: text, initial: initial, current: current)
+        print("H1B MUTATION suffix_only confirmed=\(mutant ? 1 : 0) result=\(mutant && !real ? "FAIL" : "PASS") real_confirmed=\(real ? 1 : 0)")
+        #expect(mutant)
+        #expect(!real)
+    }
+
+    @Test func verbatimTextFieldControl() async {
+        let (result, _, logs, pb) = await paste(before: prompt, after: prompt + payload)
+        defer { pb.releaseGlobally() }
+        print("LONGPASTE CONTROL target=text_field result=\(result == .confirmed ? "confirmed" : "timedOut")")
+        #expect(result == .confirmed)
+        #expect(logs == ["paste_confirm=ax"])
     }
 
     @Test func unrelatedWrappedOutputNeverConfirms() async {
