@@ -14,6 +14,8 @@ public final class TextInserter {
     public static let defaultPollInterval: TimeInterval = 0.1
     private static let vKeyCode: CGKeyCode = 9
 
+    private let keyEventPosting: KeyEventPosting?
+    private let typingEligibility: (() -> TypingEligibility)?
     private let pasteboard: NSPasteboard
     private let postKeystroke: () -> Void
     // Accessed only on the main queue, including reentrant completion calls.
@@ -30,6 +32,8 @@ public final class TextInserter {
     public init(
         pasteboard: NSPasteboard = .general,
         postKeystroke: (() -> Void)? = nil,
+        keyEventPosting: KeyEventPosting? = nil,
+        typingEligibility: (() -> TypingEligibility)? = nil,
         schedule: ((TimeInterval, @escaping () -> Void) -> Void)? = nil,
         pollInterval: TimeInterval = defaultPollInterval,
         timeout: TimeInterval = defaultTimeout,
@@ -37,6 +41,8 @@ public final class TextInserter {
         logger: ((String) -> Void)? = nil,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
+        self.keyEventPosting = keyEventPosting
+        self.typingEligibility = typingEligibility
         self.pasteboard = pasteboard
         self.postKeystroke = postKeystroke ?? TextInserter.postCommandV
         self.schedule = schedule ?? { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) }
