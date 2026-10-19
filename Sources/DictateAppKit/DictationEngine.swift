@@ -61,6 +61,8 @@ public struct DictationTimeline: Sendable, Equatable {
     }
     /// Where Groq's rate-limit counts are persisted (counts only). Relocate via `init(quotaFileURL:)`.
     public var quotaFileURL: URL { controller.quotaStore.fileURL }
+    /// v1.19 (ST1): the selected speech provider. `nil` at init means `DictationSTT.default` (Groq);
+    /// an explicit choice survives any later change of that default.
     public var stt: DictationSTT { controller.dictationSTT }
     /// Latest counts from every Groq response this engine has seen (also read from the file at launch).
     public var groqQuota: GroqQuota { controller.quotaStore.current }
@@ -75,7 +77,7 @@ public struct DictationTimeline: Sendable, Equatable {
 
     public init(keyStore: KeyStore, paths: AppPaths, surface: Surface = .pill, mode: Mode = .dictate,
                 quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil,
-                stt: DictationSTT = .groqChunked, keytermsURL: URL? = nil) {
+                stt: DictationSTT? = nil, keytermsURL: URL? = nil) {
         let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode, quotaFileURL: quotaFileURL, injectedAudioURL: injectedAudioURL, stt: stt, keytermsURL: keytermsURL)
         self.controller = controller
         ownedController = controller

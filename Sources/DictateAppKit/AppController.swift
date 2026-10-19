@@ -13,9 +13,19 @@ public final class AppController {
     private let inserter: TextInserter
     private let keyStore: KeyStore
     private let paths: AppPaths
+    /// v1.19 (ST1): the host's provider selection (explicit, else `DictationSTT.default`).
     let dictationSTT: DictationSTT
     private let keytermsURL: URL
     private let wsTransport: any WebSocketTransport
+    private let streamingClock: any DictateClock
+    private let onStreamingSegment: (@Sendable (Int, String) -> Void)?
+    private var streaming: EngineStreamingSession?
+    /// The provider the latest recording actually ran (selection, minus a missing Deepgram key).
+    private(set) var effectiveSTT: DictationSTT?
+    /// ST1 RED MUTATION — tests only, never set in production. When true, `attachTranscribers` ignores
+    /// the Deepgram selection and builds the pre-ST1 Groq factory: the unchanged host behaviour the
+    /// ST1 RED receipt runs against.
+    var st1REDMutationForcePreST1Factory = false
     var engineOnState: ((DictateAppKit.DictationState) -> Void)?
     var engineOnTranscript: ((String, DictationTimeline) -> Void)?
     let quotaStore: GroqQuotaStore
@@ -118,16 +128,19 @@ public final class AppController {
     }
 
     public convenience init() {
-        self.init(keyStore: KeyStore(), paths: AppPaths(), surface: .pill, mode: .dictate)
+        self.init(keyStore: KeyStore(), paths: AppPaths(), surface: .pill, mode: .dictate,
+                  stt: DictationSTT.explicit(UserDefaults.standard.string(forKey: DictationSTT.preferenceKey)))
     }
 
     init(keyStore: KeyStore, paths: AppPaths, surface: Surface, mode: DictationEngine.Mode,
          dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil,
-         stt: DictationSTT = .groqChunked, keytermsURL: URL? = nil) {
+         stt: DictationSTT? = nil, defaultSTT: DictationSTT = .default, keytermsURL: URL? = nil) {
         self.dependencies = dependencies
-        dictationSTT = stt
+        dictationSTT = stt ?? defaultSTT
         self.keytermsURL = keytermsURL ?? paths.keytermsURL
         wsTransport = dependencies?.wsTransport ?? URLSessionWebSocketTransport()
+        streamingClock = dependencies?.streamingClock ?? SystemClock()
+        onStreamingSegment = dependencies?.onStreamingSegment
         // The default location shares GroqQuota.current; a host's relocated file gets its own store.
         let quotaFile = quotaFileURL ?? GroqQuotaStore.defaultFileURL(for: paths)
         quotaStore = quotaFile == GroqQuotaStore.defaultFileURL() ? .shared : GroqQuotaStore(fileURL: quotaFile)
@@ -178,7 +191,7 @@ public final class AppController {
             groqCleaner.hintsSentence = hints
         }
         // Real network pings only in production wiring: injected fakes and fake transcripts never schedule any.
-        if dependencies == nil, fakeTranscript == nil, dictationSTT == .groqChunked, GroqKeepWarm.isEnabled() {
+        if dependencies == nil, fakeTranscript == nil, GroqKeepWarm.isEnabled() {
             keepWarm = GroqKeepWarm(ping: { [weak self] in await self?.keepWarmPing() })
         }
     }
@@ -193,7 +206,8 @@ public final class AppController {
         } catch {
             AppController.note("migration_error=\(error.localizedDescription)")
         }
-        keyStore.prefetch(services: ["groq-api", "elevenlabs-api"] + (dictationSTT == .deepgramStreaming ? ["deepgram-api"] : []))
+        keyStore.prefetch(services: ["groq-api", "elevenlabs-api"])
+        prefetchStreamingKey()
         // Logged once the background read has had time to resolve (at request time it is always pending).
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.logKeyStates() }
         hotkeys.onSignal = { [weak self] signal in MainActor.assumeIsolated { self?.facade.handle(signal) } }
@@ -237,9 +251,7 @@ public final class AppController {
     func configureEngine() {
         guard !engineConfigured else { return }
         engineConfigured = true
-        if dictationSTT == .deepgramStreaming {
-            keyStore.prefetch(services: ["deepgram-api", "groq-api"])
-        }
+        prefetchStreamingKey()
         configureCapture()
         pill.onCancel = { [weak self] in self?.cancel() }
         pill.onFinish = { [weak self] in self?.finishButton() }
@@ -264,12 +276,18 @@ public final class AppController {
     func engineStart() {
         configureEngine()
         guard machine.state == .idle else { return }
-        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api", "elevenlabs-api"] + (dictationSTT == .deepgramStreaming ? ["deepgram-api"] : [])) }
+        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api", "elevenlabs-api"]) }
+        prefetchStreamingKey()
         let requestAccess = dependencies?.requestMicrophoneAccess ?? AudioRecorder.requestMicrophoneAccess
         requestAccess { [weak self] in self?.micAvailable = $0 }
         doubleTap()
     }
     func engineFinish() { finishButton() }
+    /// v1.19: the Deepgram key is read (once, cached) only when the host selected Deepgram; Groq's quota
+    /// override never gates it.
+    private func prefetchStreamingKey() {
+        if dictationSTT == .deepgramStreaming { keyStore.prefetch(services: [DictationSTT.deepgramKeyService]) }
+    }
     /// v1.14: turns the rig on only when `launchEnvironment` enables it (RigConfig); otherwise nothing
     /// is created, watched or redirected and this returns false.
     func engineEnableRig(launchEnvironment: [String: String], gesture: @escaping (RigGesture) -> Void) -> Bool {
@@ -704,26 +722,39 @@ public final class AppController {
         if fakeTranscript == nil {
             let engine = dependencies?.makeApple() ?? AppleTranscriber()
             apple = engine
-            if dictationSTT == .deepgramStreaming {
+            let selectedStreaming = dictationSTT == .deepgramStreaming && !st1REDMutationForcePreST1Factory
+            let streamingKeyDenied = selectedStreaming && keyStore.missing(for: DictationSTT.deepgramKeyService) == .denied
+            if selectedStreaming {
+                // Counts/reasons only. A denied key keeps this recording on the Groq path.
+                Self.note("stt_selected=deepgram stt_effective=\(streamingKeyDenied ? "groq" : "deepgram")")
+                if streamingKeyDenied { Self.note("stt_fallback=groq reason=missing_key") }
+            }
+            sessionPolicy.sttProvider = selectedStreaming && !streamingKeyDenied ? .deepgramStreaming : .groqChunked
+            effectiveSTT = sessionPolicy.sttProvider
+            if sessionPolicy.usesStreamingSTT {
                 let token = generation
                 let voiceStopEnabled = sessionPolicy.usesPaste
                 let keys = keyStore
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
                 incrementalCleaner = incremental
-                let streaming = DeepgramStreamingTranscriber(transport: wsTransport, apiKey: {
-                    guard let key = keys.key(for: "deepgram-api") else { throw TranscriptionError.missingKey }
+                let stopPhrase = StreamingStopPhrase()
+                let observer = onStreamingSegment
+                let session = DeepgramStreamingTranscriber(transport: wsTransport, apiKey: {
+                    guard let key = keys.key(for: DictationSTT.deepgramKeyService) else { throw TranscriptionError.missingKey }
                     return key
-                }, keytermsURL: keytermsURL, fallbackClient: groqSTT, prompt: prompt,
-                   note: { AppController.note($0) },
-                   onChunkText: { [weak self] index, text in
+                }, keytermsURL: keytermsURL, clock: streamingClock,
+                   onFinalSegment: { [weak self] index, text in
+                       observer?(index, text)
                        incremental?.append(index: index, text: text)
-                       if voiceStopEnabled, TrailingStopPhrase.endsDictation(text) { self?.voiceStopHeard(token: token) }
-                   })
-                chunked = streaming
+                       // The retained suffix catches a stop phrase split across final segments.
+                       if voiceStopEnabled, stopPhrase.append(text) { self?.voiceStopHeard(token: token) }
+                   },
+                   onFailure: { _ in incremental?.cancel() })
+                streaming = session
                 recorder.onPCMChunk = { [pcmTap] pcm in
                     engine.append(pcm)
-                    streaming.append(pcm)
+                    session.append(pcm)
                     pcmTap.send(pcm)
                 }
             } else if chunkedEnabled {
@@ -786,6 +817,8 @@ public final class AppController {
         recorder.onPCMChunk = nil
         chunked?.cancel()
         chunked = nil
+        streaming?.cancel()
+        streaming = nil
     }
 
     private func endRecording() {
@@ -809,10 +842,9 @@ public final class AppController {
         let appleSession = apple
         apple = nil
         let chunkedSession = chunked
-        if let streaming = chunkedSession as? DeepgramStreamingTranscriber {
-            streaming.setFallbackPCM(WAVEncoder.pcm16(from: samples))
-        }
         chunked = nil
+        let streamingSession = streaming
+        streaming = nil
         let incrementalSession = incrementalCleaner
         incrementalSession?.seal()   // the last chunk's text lands after this tap
         let myGeneration = generation
@@ -821,6 +853,7 @@ public final class AppController {
         if fakeTranscript == nil, AudioLevel.isSilent(samples) {
             appleSession?.cancel()
             chunkedSession?.cancel()
+            streamingSession?.cancel()
             machine.transcriptionFinished()
             fail(reason: "silence", duration: duration, bytes: bytes, latencyMs: 0)
             return
@@ -845,7 +878,18 @@ public final class AppController {
                 result = .success(fake)
             } else {
                 let sttStart = Date()
-                let stt = await policy.transcribe(apple: appleSession, chunked: chunkedSession, at: finishClock)
+                let stt: EnginePolicy.STTResult
+                if let streamingSession {
+                    // v1.19: the recording's full capture, encoded only if the stream turns out incomplete.
+                    stt = await policy.transcribe(apple: appleSession, streaming: streamingSession, at: finishClock,
+                        wholeWAV: {
+                            let wav = WAVEncoder.encode(samples: WAVEncoder.pcm16(from: samples), sampleRate: 24_000)
+                            return try await groqSTT.transcribe(wav: wav, prompt: vocabularyPrompt)
+                        },
+                        onIncomplete: { _ in incrementalSession?.cancel() })
+                } else {
+                    stt = await policy.transcribe(apple: appleSession, chunked: chunkedSession, at: finishClock)
+                }
                 result = stt.result
                 // M2: no path pastes or cleans a Whisper repetition loop (chunks were guarded already).
                 if case .success(let raw) = result {
@@ -853,7 +897,11 @@ public final class AppController {
                     if guarded.loops > 0 { result = .success(guarded.text); timeline.rawLoopCollapses = guarded.loops }
                 }
                 pipeline.path = stt.path
-                let incrementalSTT = pipeline.path == "groq-chunked" || pipeline.path == "deepgram-streaming"
+                let incrementalSTT = EnginePolicy.isIncrementalPath(pipeline.path)
+                if let streamed = stt.streamed {
+                    timeline.streaming = streamed
+                    if pipeline.path == "deepgram-streaming" { pipeline.chunks = streamed.finalSegments }
+                }
                 if let joined = stt.joined {
                     pipeline.chunks = joined.chunks
                     pipeline.lastChunkMs = joined.lastChunkMs
@@ -867,7 +915,7 @@ public final class AppController {
                         }
                     }
                 }
-                pipeline.sttMs = Int(Date().timeIntervalSince(chunkedSession == nil ? sttStart : finishedAt) * 1000)
+                pipeline.sttMs = Int(Date().timeIntervalSince(chunkedSession == nil && streamingSession == nil ? sttStart : finishedAt) * 1000)
                 if shadowEnabled, pipeline.path == "apple", case .success(let raw) = result,
                    ShadowScore.overlap(raw) >= 0.60 {
                     let appleNames = ShadowScore.nameCount(raw)
@@ -941,7 +989,7 @@ public final class AppController {
             if !policy.usesCleanup { pipeline.cleanupMode = "none"; timeline.incrementalSkipped = nil }
             timeline.cleanupMode = pipeline.cleanupMode
             if pipeline.cleanupMode == "single", timeline.incrementalSkipped == nil {
-                timeline.incrementalSkipped = (pipeline.path == "groq-chunked" || pipeline.path == "deepgram-streaming") ? "none_cleanable_before_finish" : "not_chunked"
+                timeline.incrementalSkipped = EnginePolicy.isIncrementalPath(pipeline.path) ? "none_cleanable_before_finish" : "not_chunked"
             }
             if let shadow, case .success(let raw) = result {
                 let pastedNames = ShadowScore.nameCount(pipeline.text ?? raw)
@@ -1164,6 +1212,8 @@ public final class AppController {
         var cleanupModelFallback: String?
         var incrementalSkipped: String?
         var keepWarmPings = 0
+        /// v1.19: the streaming provider's counts/reasons (nil on the Groq/Apple-only paths).
+        var streaming: StreamingSTTResult?
 
         func line(sttMs: Int?, cleanupMs: Int?, path: String, chunkFallback: Int?, keyState: String) -> String {
             var fields = [
@@ -1211,6 +1261,7 @@ public final class AppController {
                 }
             }
             if let chunkFallback { fields.append("chunk_fallback=\(chunkFallback)") }
+            if let streaming { fields.append(streaming.fields) }
             return fields.joined(separator: " ")
         }
     }

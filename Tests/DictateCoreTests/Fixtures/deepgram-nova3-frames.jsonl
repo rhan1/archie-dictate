@@ -1,5 +1,0 @@
-{"type":"Results","channel":{"alternatives":[{"transcript":"unfinished preview","confidence":0.9}]},"is_final":false,"speech_final":false}
-{"type":"Results","channel":{"alternatives":[{"transcript":"Send the report.","confidence":0.99}]},"is_final":true,"speech_final":false}
-{"type":"Results","channel":{"alternatives":[{"transcript":"another preview","confidence":0.8}]},"is_final":false,"speech_final":true}
-{"type":"Results","channel":{"alternatives":[{"transcript":"   ","confidence":0.0}]},"is_final":true,"speech_final":true}
-{"type":"Results","channel":{"alternatives":[{"transcript":"On Wednesday.","confidence":0.99}]},"is_final":true,"speech_final":true}

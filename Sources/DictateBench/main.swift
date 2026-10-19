@@ -1,10 +1,14 @@
-// Latency harness for gate G6 and the A3 cleanup-model choice. Prints
-// counts and milliseconds; streaming STT commands also print fixture transcripts, never keys.
+// Latency harness for gate G6 and the A3 cleanup-model choice. Prints only
+// counts and milliseconds — never transcript text, never the key (exception: `stt-deepgram`
+// prints the fixture's transcript per run, the hypothesis `wer` scores).
+//   DictateBench stt-deepgram <fixture.wav> [runs=3]  Deepgram nova-3 streaming, real-time paced (network)
+//   DictateBench wer <reference.txt> <hypothesis.txt>  offline word error rate (no network)
 //   DictateBench stt-groq     <fixture.wav> <runs>   time batch Groq transcription
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
 //   DictateBench eval         groq|local <model>    G7 quality: 11 cases, prints PASS/FAIL + misses
 //   DictateBench eval-incremental groq <model>     Incremental quality: 12 cases
+import CryptoKit
 import DictateAppKit
 import DictateCore
 import Foundation
@@ -468,7 +472,9 @@ if args.count >= 2 {
     switch args[1] {
     case "score-text": requireKey("GROQ_API_KEY")
     case "stt-groq" where args.count >= 4, "stt-groq-chunked" where args.count >= 4: requireKey("GROQ_API_KEY")
-    case "stt-deepgram-streaming" where args.count >= 4: requireKey("DEEPGRAM_API_KEY")
+    case "stt-deepgram" where args.count >= 3, "stt-deepgram-streaming" where args.count >= 3:
+        requireKey("DEEPGRAM_API_KEY")
+        requireKey("GROQ_API_KEY")   // cleanup, exactly as the app finalizes a Deepgram dictation
     case "cleanup" where args.count >= 4:
         requireKey("GROQ_API_KEY")
     case "eval-incremental" where args.count >= 4:
@@ -494,32 +500,47 @@ if args.count >= 2, args[1] == "score-text" {
     if let out = try? await groq.cleanWithStats(raw).text { print("GROQ-qwen3.8-27b \(scriptScore(out))") }
     exit(0)
 }
-guard args.count >= 4 else {
-    print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png> | pill-match <wav> | stt-groq|stt-groq-chunked|stt-deepgram-streaming <wav> <runs> | cleanup <model> <runs>")
-    print("stt-groq-chunked: BENCH_V3=0 uses old 2/3 s limits without fillers; default/BENCH_V3=1 uses V3 3/4 s limits with fillers (synthetic WAV fixtures only)")
-    exit(2)
+// wer: pure offline word error rate (lowercase, split on non-alphanumerics, word-level Levenshtein).
+if args.count >= 2, args[1] == "wer" {
+    guard args.count >= 4,
+          let reference = try? String(contentsOf: URL(fileURLWithPath: args[2]), encoding: .utf8),
+          let hypothesis = try? String(contentsOf: URL(fileURLWithPath: args[3]), encoding: .utf8) else {
+        print("usage: DictateBench wer <reference.txt> <hypothesis.txt>")
+        exit(2)
+    }
+    print(WordErrorRate.score(reference: reference, hypothesis: hypothesis).line)
+    exit(0)
 }
-let runs = Int(args[3]) ?? 5
-guard runs > 0 else { print("runs must be positive"); exit(2) }
-/// Extra text in other probes is opt-in; streaming STT always prints per-run fixture transcripts.
-let showText = ProcessInfo.processInfo.environment["BENCH_SHOW_TEXT"] == "1"
-let endToEnd = args[1] == "stt-groq-chunked" && ProcessInfo.processInfo.environment["BENCH_E2E"] == "1"
-var results: [Int] = []
-var lastText: String?
-var firstChunkMs: Int?   // STT ms of run 1's first chunk: what a cold connection inflates
-
-switch args[1] {
-case "stt-deepgram-streaming":
-    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
+// stt-deepgram (alias stt-deepgram-streaming): the WAV's SHA-256 first, then per real-time-paced run
+// first-text / final-after-end / end-to-cleanup / end-to-insertion-ready ms, then their medians.
+// "end" = the last PCM chunk fed. Cleanup mirrors the app: live finals feed an IncrementalCleaner,
+// finished with the single-call race; insertion-ready = the delivered text (stop phrase stripped).
+if args.count >= 3, args[1] == "stt-deepgram" || args[1] == "stt-deepgram-streaming" {
+    let url = URL(fileURLWithPath: args[2])
+    let wavData = try Data(contentsOf: url)
+    print("wav_sha256=" + SHA256.hash(data: wavData).map { String(format: "%02x", $0) }.joined()
+          + " file=\(url.lastPathComponent)")
+    let runCount = args.count >= 4 ? (Int(args[3]) ?? 3) : 3
+    guard runCount > 0 else { print("runs must be positive"); exit(2) }
+    let pcm = try samples(fromWAV: url)
     let transport = URLSessionWebSocketTransport()
-    let fallback = TranscriptionClient(transport: URLSessionTransport(timeout: 30),
-        apiKey: { try environmentKey("GROQ_API_KEY") })
-    for run in 1...runs {
+    var cleaner = TranscriptCleaner(transport: URLSessionTransport(timeout: 1.5), endpoint: TranscriptCleaner.groqEndpoint,
+                                    model: TranscriptCleaner.defaultModel, vocabulary: prompt,
+                                    apiKey: { try environmentKey("GROQ_API_KEY") })
+    cleaner.reasoningEffort = "none"
+    let groqCleaner = cleaner
+    var firstText: [Int] = [], finalAfterEnd: [Int] = [], endToCleanup: [Int] = [], endToInsertion: [Int] = []
+    func median(_ values: [Int]) -> String { values.isEmpty ? "-" : String(values.sorted()[(values.count - 1) / 2]) }
+    for run in 1...runCount {
         let timing = BenchSTTTiming()
+        let incremental = IncrementalCleaner(cleaner: groqCleaner)
         let engine = DeepgramStreamingTranscriber(transport: transport,
-            apiKey: { try environmentKey("DEEPGRAM_API_KEY") },
-            keytermsURL: AppPaths().keytermsURL, fallbackClient: fallback, prompt: prompt,
-            note: { print($0) }, onChunkText: { _, _ in timing.recordText() })
+            apiKey: { try environmentKey("DEEPGRAM_API_KEY") }, keytermsURL: AppPaths().keytermsURL,
+            onFinalSegment: { index, text in
+                timing.recordText()
+                incremental.append(index: index, text: text)
+            },
+            onFailure: { _ in incremental.cancel() })
         var fed = 0
         var lastPCMAt = timing.started
         for offset in stride(from: 0, to: pcm.count, by: 2_400) {
@@ -531,15 +552,53 @@ case "stt-deepgram-streaming":
             engine.append(chunk)
             lastPCMAt = .now()
         }
-        let joined = await engine.finish(at: lastPCMAt)
-        let finalAfterEnd = ms(since: lastPCMAt)
-        print("run \(run) first_text_ms=\(timing.firstTextMs) final_after_end_ms=\(finalAfterEnd) chunks=\(joined.chunks) chars=\(joined.text.count) failed=\(joined.failedCount)")
-        print("   raw: \(joined.text)")
-        if joined.failedCount == 0, !joined.text.isEmpty {
-            results.append(finalAfterEnd)
-            lastText = joined.text
+        incremental.seal()
+        let streamed = await engine.finish(at: lastPCMAt)
+        let finalMs = ms(since: lastPCMAt)
+        guard streamed.complete, !streamed.text.isEmpty else {
+            incremental.cancel()
+            print("run \(run) first_text_ms=\(timing.firstTextMs) final_after_end_ms=\(finalMs) end_to_cleanup_ms=- end_to_insertion_ready_ms=- \(streamed.fields)")
+            continue
         }
+        var cleaned = streamed.text
+        var mode = "skipped:short"
+        if TranscriptCleaner.shouldClean(streamed.text) {
+            let output = await incremental.finish(totalChunks: streamed.finalSegments, rawText: streamed.text,
+                single: { fullRaw in
+                    let outcome = await benchCleanUp(fullRaw, groq: groqCleaner)   // the app's Groq → local → raw order
+                    return .init(text: outcome.text, label: "ok", model: groqCleaner.model, stats: nil, calls: outcome.calls)
+                })
+            mode = output.mode
+            if let text = output.text { cleaned = text }
+            else { cleaned = await benchCleanUp(streamed.text, groq: groqCleaner).text }
+        } else { incremental.cancel() }
+        let cleanupMs = ms(since: lastPCMAt)
+        let stripped = TrailingStopPhrase.strip(cleaned)   // AppController.deliveredText's paste rule
+        let delivered = stripped.matched ? stripped.text : cleaned
+        let insertionMs = ms(since: lastPCMAt)
+        firstText.append(timing.firstTextMs); finalAfterEnd.append(finalMs)
+        endToCleanup.append(cleanupMs); endToInsertion.append(insertionMs)
+        print("run \(run) first_text_ms=\(timing.firstTextMs) final_after_end_ms=\(finalMs) end_to_cleanup_ms=\(cleanupMs) end_to_insertion_ready_ms=\(insertionMs) cleanup_mode=\(mode) chars=\(delivered.count) \(streamed.fields)")
+        print("   raw: \(streamed.text)\n   out: \(delivered)")
     }
+    print("MEDIAN stt-deepgram n=\(firstText.count)/\(runCount) first_text_ms=\(median(firstText)) final_after_end_ms=\(median(finalAfterEnd)) end_to_cleanup_ms=\(median(endToCleanup)) end_to_insertion_ready_ms=\(median(endToInsertion))")
+    exit(firstText.count == runCount ? 0 : 1)
+}
+guard args.count >= 4 else {
+    print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png> | pill-match <wav> | stt-groq|stt-groq-chunked <wav> <runs> | stt-deepgram <wav> [runs=3] | wer <reference.txt> <hypothesis.txt> | cleanup <model> <runs>")
+    print("stt-groq-chunked: BENCH_V3=0 uses old 2/3 s limits without fillers; default/BENCH_V3=1 uses V3 3/4 s limits with fillers (synthetic WAV fixtures only)")
+    exit(2)
+}
+let runs = Int(args[3]) ?? 5
+guard runs > 0 else { print("runs must be positive"); exit(2) }
+/// BENCH_SHOW_TEXT=1 prints fixture transcripts to the terminal (bench only; the app never logs text).
+let showText = ProcessInfo.processInfo.environment["BENCH_SHOW_TEXT"] == "1"
+let endToEnd = args[1] == "stt-groq-chunked" && ProcessInfo.processInfo.environment["BENCH_E2E"] == "1"
+var results: [Int] = []
+var lastText: String?
+var firstChunkMs: Int?   // STT ms of run 1's first chunk: what a cold connection inflates
+
+switch args[1] {
 case "stt-groq-chunked":
     let useV3 = ProcessInfo.processInfo.environment["BENCH_V3"] != "0"
     let finalSplitSeconds: Double? = ProcessInfo.processInfo.environment["BENCH_FINAL_SPLIT"] == "1" ? 2.0 : nil
@@ -580,7 +639,7 @@ case "stt-groq-chunked":
         let now = DispatchTime.now().uptimeNanoseconds
         if end > now { try await Task.sleep(nanoseconds: end - now) }
     }
-    print("probe keepwarm=\(keepWarmOn ? "on" : "off") idle_s=\(idleSeconds) pings=\(keepWarmPings) show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=on e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
+    print("probe keepwarm=\(keepWarmOn ? "on" : "off") idle_s=\(idleSeconds) pings=\(keepWarmPings) show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
     guard let tailMs = Int(tailValue), (0...60_000).contains(tailMs) else {
@@ -719,12 +778,12 @@ case "stt-groq-chunked":
                 results.append(pasteMs)
                 lastText = cleaned
                 print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : "") + " cleanup_label=\(cleanupLabel) cleanup_model=\(cleanupModel) script_exact=\(ShadowScore.scriptExact(cleaned))")
-                print("   raw: \(joined.text)\n   out: \(cleaned)")
+                if showText { print("   raw: \(joined.text)\n   out: \(cleaned)") }
             } else {
                 results.append(elapsed)
                 lastText = joined.text
                 print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
-                print("   raw: \(joined.text)")
+                if showText { print("   raw: \(joined.text)") }
             }
         } else {
             incremental?.cancel()

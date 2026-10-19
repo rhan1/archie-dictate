@@ -18,9 +18,9 @@ let package = Package(
         .executableTarget(name: "DictateApp", dependencies: ["DictateAppKit"]),
         // G6 latency harness + cleanup-model measurement (network; never run by `swift test`).
         .executableTarget(name: "DictateBench", dependencies: ["DictateCore", "DictateAppKit"]),
-        .testTarget(name: "DictateCoreTests", dependencies: ["DictateCore", "DictateObjC", "DictateAppKit"],
-                    resources: [.copy("Fixtures")]),
-        .testTarget(name: "DictateAppKitTests", dependencies: ["DictateAppKit"]),
+        .testTarget(name: "DictateCoreTests", dependencies: ["DictateCore", "DictateObjC"]),
+        // ST1: Fixtures/ holds SYNTHETIC Deepgram frames, read from the source tree by the tests.
+        .testTarget(name: "DictateAppKitTests", dependencies: ["DictateAppKit"], exclude: ["Fixtures"]),
     ],
     swiftLanguageModes: [.v5]
 )
