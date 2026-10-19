@@ -160,10 +160,26 @@ public final class TextInserter {
                 let initial = index < initialTexts.count ? initialTexts[index] : ""
                 // Count complete new occurrences rather than a minimal string
                 // diff (which trims shared letters from a real replacement).
-                func occurrences(_ value: String) -> Int {
-                    value.components(separatedBy: text).count - 1
+                func occurrences(_ value: String, of needle: String) -> Int {
+                    value.components(separatedBy: needle).count - 1
                 }
-                if occurrences(current) > occurrences(initial) { return true }
+                if occurrences(current, of: text) > occurrences(initial, of: text) { return true }
+
+                // Terminals may hard-wrap and frame AXValue rows, or expose
+                // only the visible tail. Ignore presentation characters, but
+                // still require a new occurrence against the same baseline.
+                func normalized(_ value: String) -> String {
+                    String(String.UnicodeScalarView(value.unicodeScalars.filter {
+                        !$0.properties.isWhitespace && !(0x2500...0x257F).contains($0.value)
+                    }))
+                }
+                let payload = normalized(text)
+                guard !payload.isEmpty else { continue }
+                let currentValue = normalized(current)
+                let initialValue = normalized(initial)
+                if occurrences(currentValue, of: payload) > occurrences(initialValue, of: payload) { return true }
+                let tail = String(payload.suffix(48))
+                if occurrences(currentValue, of: tail) > occurrences(initialValue, of: tail) { return true }
             }
             return false
         }
