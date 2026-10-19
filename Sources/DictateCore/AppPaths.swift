@@ -5,6 +5,7 @@ public struct AppPaths: Sendable {
     public let logURL: URL
     public let stderrURL: URL
     public let mutedStateURL: URL
+    public let keytermsURL: URL
     public let vocabularyURL: URL
 
     public init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
@@ -13,6 +14,7 @@ public struct AppPaths: Sendable {
         logURL = logs.appendingPathComponent("dictate.log")
         stderrURL = logs.appendingPathComponent("dictate.stderr.log")
         mutedStateURL = support.appendingPathComponent("muted.state")
+        keytermsURL = home.appendingPathComponent(".claude/dictate/keyterms.txt")
         vocabularyURL = support.appendingPathComponent("vocab-hints.txt")
     }
 

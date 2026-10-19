@@ -3,7 +3,7 @@
 IN PROGRESS. Five numbered build deliverables; scripted tests accompany their corresponding steps. No delegation, network, key reads, audio, browser, or bench execution.
 
 1. DONE WebSocket seam: injectable binary/text connection and URLSession production transport; EngineDependencies default. Lease build passed (11.92 s).
-2. NOT-DONE Streaming transcriber and scripted finals/URL/close tests.
+2. DONE Streaming transcriber: exact nova-3 URL, escaped/capped keyterms via AppPaths, binary PCM, final-only callbacks, idempotent finish, fixed virtual 1500 ms close deadline. Hand-written JSONL fixture. Lease filtered tests: 4 tests in 1 suite passed (0.005 s). Positive final callback arrived before stop; negative controls rejected two interims and empty final; a final at virtual +1200 ms survived CloseStream. Missing file gives zero terms; cap excludes term 51. Close verified exactly once at virtual 1500 ms.
 3. NOT-DONE Whole-WAV fallback and failure tests.
 4. NOT-DONE Selection and host plumbing.
 5. NOT-DONE Bench and final filtered verification.
