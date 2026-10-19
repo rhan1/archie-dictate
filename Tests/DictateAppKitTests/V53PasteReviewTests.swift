@@ -34,12 +34,12 @@ struct V53PasteReviewTests {
             #expect(pb.string(forType: .string) == "WORDS")
             clock.advance(to: scenario == "timeout" ? 10.1 : 1.6)
             let clipboard = pb.string(forType: .string) ?? "nil"
-            print("V522 PASTE scenario=\(scenario) target_read=\(targetRead) clipboard=\(clipboard) completed=\(completed) log=\(logs.lines)")
+            print("V522 PASTE scenario=\(scenario) target_read_chars=\(targetRead == "not-read" ? 0 : targetRead.count) clipboard_chars=\(clipboard.count) completed=\(completed) log=\(logs.lines)")
             #expect(completed)
             #expect(result == (scenario == "timeout" ? .timedOut : .confirmed))
             #expect(targetRead == (scenario == "timeout" ? "not-read" : "WORDS"))
             #expect(clipboard == (scenario == "timeout" ? "WORDS" : "ORIGINAL"))
-            #expect(logs.lines == [scenario == "timeout" ? "paste_confirm=timeout" : "paste_confirm=ax"])
+            #expect(logs.lines == [scenario == "timeout" ? "paste_confirm=timeout" : "paste_confirm=ax", "insertion=paste reason=no_focus confirmed=\(scenario == "timeout" ? 0 : 1)"])
         }
     }
     @Test func selectingExistingTextNeverConfirmsAnInsertion() async {
@@ -55,7 +55,7 @@ struct V53PasteReviewTests {
         inserter.insert("WORDS", onResult: { result = $0 })
         for _ in 0..<500 where clock.items.isEmpty { try? await Task.sleep(for: .milliseconds(1)) }
         clock.advance(to: 1)
-        print("R0 SELECTION_ONLY confirmed=\(result == .confirmed) clipboard=\(pb.string(forType: .string) ?? "nil")")
+        print("R0 SELECTION_ONLY confirmed=\(result == .confirmed) clipboard_chars=\(pb.string(forType: .string)?.count ?? 0)")
         #expect(result == nil)
         #expect(pb.string(forType: .string) == "WORDS")
         clock.advance(to: 10.1)

@@ -64,7 +64,7 @@ struct V55LongPasteTests {
         print("H1B GREEN chars=\(text.count) full_new_occurrence=1 result=\(result == .confirmed ? "confirmed" : "timedOut") clipboard_restored=\(restored ? 1 : 0)")
         #expect(result == .confirmed)
         #expect((at ?? 10) < 1)
-        #expect(logs == ["paste_confirm=ax"])
+        #expect(logs == ["paste_confirm=ax", "insertion=paste reason=no_focus confirmed=1"])
         #expect(restored)
     }
 
@@ -90,7 +90,7 @@ struct V55LongPasteTests {
         print("H1B CONTROL target=\(target) complete_evidence=0 result=\(result == .confirmed ? "confirmed" : "timedOut") clipboard_retained=\(retained ? 1 : 0)")
         #expect(result == .timedOut)
         #expect(abs((at ?? 0) - 10) < 0.11)
-        #expect(logs == ["paste_confirm=timeout"])
+        #expect(logs == ["paste_confirm=timeout", "insertion=paste reason=no_focus confirmed=0"])
         #expect(retained)
     }
 
@@ -117,7 +117,7 @@ struct V55LongPasteTests {
         defer { pb.releaseGlobally() }
         print("LONGPASTE CONTROL target=text_field result=\(result == .confirmed ? "confirmed" : "timedOut")")
         #expect(result == .confirmed)
-        #expect(logs == ["paste_confirm=ax"])
+        #expect(logs == ["paste_confirm=ax", "insertion=paste reason=no_focus confirmed=1"])
     }
 
     @Test func unrelatedWrappedOutputNeverConfirms() async {
@@ -151,7 +151,7 @@ struct V55LongPasteTests {
         print("LONGPASTE NEGATIVE target=busy_wrapped result=\(result == .timedOut ? "timedOut" : "confirmed")")
         #expect(result == .timedOut)
         #expect(abs((completedAt ?? 0) - 10) < 1e-6)
-        #expect(logs.lines == ["paste_confirm=timeout"])
+        #expect(logs.lines == ["paste_confirm=timeout", "insertion=paste reason=no_focus confirmed=0"])
         let retained = pb.string(forType: .string) == text
         #expect(retained)
     }
