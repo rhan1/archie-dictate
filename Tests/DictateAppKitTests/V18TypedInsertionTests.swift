@@ -31,8 +31,15 @@ struct V18TypedInsertionTests {
         var typed = ""
         var confirmsTyping = true
         var eligibility: TypingEligibility = .editable
+        var bundleID: String? = nil
+        var prefs: [String: Bool] = [:]
+        var customReader: ((String, String) -> Bool?)? = nil
         lazy var inserter = TextInserter(pasteboard: pb, postKeystroke: { [unowned self] in poster.postPaste() },
             keyEventPosting: poster, typingEligibility: { [unowned self] in eligibility },
+            targetBundleID: { [unowned self] in bundleID },
+            substitutionPolicy: TextSubstitutionPolicy(reader: { [unowned self] key, bundle in
+                customReader?(key, bundle) ?? prefs[key]
+            }),
             schedule: clock.schedule, axReader: { [unowned self] in texts },
             logger: { [unowned self] in logs.append($0) }, now: { [unowned self] in clock.now })
         init() {
@@ -251,5 +258,25 @@ struct V18TypedInsertionTests {
         f.clock.advance(to: 10)
         #expect(f.result == .timedOut)
         #expect(f.poster.pasteCount == 0)
+    }
+
+    @Test func cocoaDefaultPrefsUsesPaste() async {
+        let f = Fixture()
+        f.bundleID = "com.apple.TextEdit"
+        // fake prefs all unset
+        await f.start("fixture")
+        f.clock.advance(to: 10.1)
+        if f.poster.pasteCount == 0 && !f.poster.posted.isEmpty {
+            print("C2B RED target=cocoa_default_prefs insertion=typed")
+        } else {
+            let reason = f.logs.compactMap { log -> String? in
+                guard log.contains("reason=") else { return nil }
+                return log.components(separatedBy: "reason=").last?.components(separatedBy: " ").first
+            }.last ?? "none"
+            print("C2B GREEN target=cocoa_default_prefs insertion=paste reason=\(reason) typed_events=\(f.poster.posted.count)")
+        }
+        #expect(f.poster.pasteCount == 1)
+        #expect(f.poster.posted.isEmpty)
+        #expect(f.logs.last == "insertion=paste reason=text_substitution confirmed=1")
     }
 }

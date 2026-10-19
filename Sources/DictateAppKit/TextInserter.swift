@@ -28,6 +28,8 @@ public final class TextInserter {
     private let pollInterval: TimeInterval
     private let timeout: TimeInterval
     private let fakeReader: (() -> [String]?)?
+    private let targetBundleID: (() -> String?)?
+    private let substitutionPolicy: TextSubstitutionPolicy
     private let log: (String) -> Void
     private let now: () -> TimeInterval
 
@@ -36,6 +38,8 @@ public final class TextInserter {
         postKeystroke: (() -> Void)? = nil,
         keyEventPosting: KeyEventPosting? = nil,
         typingEligibility: (() -> TypingEligibility)? = nil,
+        targetBundleID: (() -> String?)? = nil,
+        substitutionPolicy: TextSubstitutionPolicy = TextSubstitutionPolicy(),
         schedule: ((TimeInterval, @escaping () -> Void) -> Void)? = nil,
         pollInterval: TimeInterval = defaultPollInterval,
         timeout: TimeInterval = defaultTimeout,
@@ -45,6 +49,8 @@ public final class TextInserter {
     ) {
         self.keyEventPosting = keyEventPosting ?? postKeystroke.map(ClosureKeyEventPoster.init) ?? SystemKeyEventPoster()
         self.typingEligibility = typingEligibility
+        self.targetBundleID = targetBundleID
+        self.substitutionPolicy = substitutionPolicy
         self.pasteboard = pasteboard
         self.schedule = schedule ?? { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) }
         self.pollInterval = max(0.01, pollInterval)
