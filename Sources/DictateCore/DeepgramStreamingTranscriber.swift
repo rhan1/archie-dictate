@@ -10,6 +10,10 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
     private let keytermsURL: URL?
     private let clock: any DictateClock
     private let receiveTimeout: Duration
+    private let fallbackClient: TranscriptionClient?
+    private let prompt: String
+    private let note: @Sendable (String) -> Void
+    private var retainedPCM: [Int16] = []
     private let onChunkText: (@Sendable (Int, String) -> Void)?
     private let stream: AsyncStream<[Int16]>
     private let input: AsyncStream<[Int16]>.Continuation
@@ -26,6 +30,8 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
                 apiKey: @escaping @Sendable () throws -> String,
                 keytermsURL: URL? = nil, clock: any DictateClock = SystemClock(),
                 receiveTimeout: Duration = .seconds(15),
+                fallbackClient: TranscriptionClient? = nil, prompt: String = "",
+                note: @escaping @Sendable (String) -> Void = { _ in },
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil) {
         self.transport = transport
         self.apiKey = apiKey
@@ -33,6 +39,9 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
         self.clock = clock
         self.receiveTimeout = receiveTimeout
         self.onChunkText = onChunkText
+        self.fallbackClient = fallbackClient
+        self.prompt = prompt
+        self.note = note
         let pair = AsyncStream<[Int16]>.makeStream()
         stream = pair.stream
         input = pair.continuation
@@ -57,9 +66,16 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
     public func append(_ pcm: [Int16]) {
         lock.withLock {
             guard !stopping, !cancelled else { return }
+            retainedPCM.append(contentsOf: pcm)
             input.yield(pcm)
             startLocked()
         }
+    }
+
+    /// The host supplies the recorder's complete retained capture after its final flush.
+    /// Standalone callers (including the bench) can use the identical PCM accumulated by append.
+    public func setFallbackPCM(_ pcm: [Int16]) {
+        lock.withLock { retainedPCM = pcm }
     }
 
     private func startLocked() {
@@ -186,6 +202,22 @@ public final class DeepgramStreamingTranscriber: @unchecked Sendable {
             timeout.cancel()
         }
         socket?.close()
+        await receiving?.value
+        let fallback = lock.withLock { (failure, cancelled, retainedPCM) }
+        if let reason = fallback.0, !fallback.1, let fallbackClient {
+            note("stt_fallback=groq reason=\(reason)")
+            do {
+                // Reuse the same encoder/client/request path as whole-file Groq STT.
+                let wav = WAVEncoder.encode(samples: fallback.2, sampleRate: 24_000)
+                let text = try await fallbackClient.transcribe(wav: wav, prompt: prompt)
+                let elapsed = Int((DispatchTime.now().uptimeNanoseconds - finish.uptimeNanoseconds) / 1_000_000)
+                return GroqChunkedTranscriber.Result(text: text, chunks: 1, rejoins: 0,
+                    failedCount: 0, lastChunkMs: elapsed, sttMs: elapsed,
+                    calls: [], hedges: 0, hedgeWins: 0, rateLimits: nil)
+            } catch {
+                // The host still has its existing Apple/error recovery path if Groq also fails.
+            }
+        }
         let elapsed = Int((DispatchTime.now().uptimeNanoseconds - finish.uptimeNanoseconds) / 1_000_000)
         return lock.withLock {
             GroqChunkedTranscriber.Result(text: finals.joined(separator: " "), chunks: finals.count,
