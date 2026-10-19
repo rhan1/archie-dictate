@@ -13,6 +13,9 @@ public final class AppController {
     private let inserter: TextInserter
     private let keyStore: KeyStore
     private let paths: AppPaths
+    let dictationSTT: DictationSTT
+    private let keytermsURL: URL
+    private let wsTransport: any WebSocketTransport
     var engineOnState: ((DictateAppKit.DictationState) -> Void)?
     var engineOnTranscript: ((String, DictationTimeline) -> Void)?
     let quotaStore: GroqQuotaStore
@@ -119,11 +122,15 @@ public final class AppController {
     }
 
     init(keyStore: KeyStore, paths: AppPaths, surface: Surface, mode: DictationEngine.Mode,
-         dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil) {
+         dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil,
+         stt: DictationSTT = .groqChunked, keytermsURL: URL? = nil) {
         self.dependencies = dependencies
+        dictationSTT = stt
+        self.keytermsURL = keytermsURL ?? paths.keytermsURL
+        wsTransport = dependencies?.wsTransport ?? URLSessionWebSocketTransport()
         // The default location shares GroqQuota.current; a host's relocated file gets its own store.
         let quotaFile = quotaFileURL ?? GroqQuotaStore.defaultFileURL(for: paths)
-        quotaStore = quotaFile == GroqQuotaStore.shared.fileURL ? .shared : GroqQuotaStore(fileURL: quotaFile)
+        quotaStore = quotaFile == GroqQuotaStore.defaultFileURL() ? .shared : GroqQuotaStore(fileURL: quotaFile)
         rateLimitRelay = EngineRateLimitRelay(store: quotaStore)
         let injectURL = Self.injectedAudioURL(injectedAudioURL, environment: ProcessInfo.processInfo.environment)
         if let injectURL { AppController.note("inject_wav=\(injectURL.lastPathComponent)") }
@@ -171,7 +178,7 @@ public final class AppController {
             groqCleaner.hintsSentence = hints
         }
         // Real network pings only in production wiring: injected fakes and fake transcripts never schedule any.
-        if dependencies == nil, fakeTranscript == nil, GroqKeepWarm.isEnabled() {
+        if dependencies == nil, fakeTranscript == nil, dictationSTT == .groqChunked, GroqKeepWarm.isEnabled() {
             keepWarm = GroqKeepWarm(ping: { [weak self] in await self?.keepWarmPing() })
         }
     }
@@ -186,7 +193,7 @@ public final class AppController {
         } catch {
             AppController.note("migration_error=\(error.localizedDescription)")
         }
-        keyStore.prefetch(services: ["groq-api", "elevenlabs-api"])
+        keyStore.prefetch(services: ["groq-api", "elevenlabs-api"] + (dictationSTT == .deepgramStreaming ? ["deepgram-api"] : []))
         // Logged once the background read has had time to resolve (at request time it is always pending).
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.logKeyStates() }
         hotkeys.onSignal = { [weak self] signal in MainActor.assumeIsolated { self?.facade.handle(signal) } }
@@ -230,6 +237,9 @@ public final class AppController {
     func configureEngine() {
         guard !engineConfigured else { return }
         engineConfigured = true
+        if dictationSTT == .deepgramStreaming {
+            keyStore.prefetch(services: ["deepgram-api", "groq-api"])
+        }
         configureCapture()
         pill.onCancel = { [weak self] in self?.cancel() }
         pill.onFinish = { [weak self] in self?.finishButton() }
@@ -254,7 +264,7 @@ public final class AppController {
     func engineStart() {
         configureEngine()
         guard machine.state == .idle else { return }
-        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api", "elevenlabs-api"]) }
+        if forceFallback != .quota { keyStore.prefetch(services: ["groq-api", "elevenlabs-api"] + (dictationSTT == .deepgramStreaming ? ["deepgram-api"] : [])) }
         let requestAccess = dependencies?.requestMicrophoneAccess ?? AudioRecorder.requestMicrophoneAccess
         requestAccess { [weak self] in self?.micAvailable = $0 }
         doubleTap()
@@ -694,7 +704,29 @@ public final class AppController {
         if fakeTranscript == nil {
             let engine = dependencies?.makeApple() ?? AppleTranscriber()
             apple = engine
-            if chunkedEnabled {
+            if dictationSTT == .deepgramStreaming {
+                let token = generation
+                let voiceStopEnabled = sessionPolicy.usesPaste
+                let keys = keyStore
+                let qStore = quotaStore
+                let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
+                incrementalCleaner = incremental
+                let streaming = DeepgramStreamingTranscriber(transport: wsTransport, apiKey: {
+                    guard let key = keys.key(for: "deepgram-api") else { throw TranscriptionError.missingKey }
+                    return key
+                }, keytermsURL: keytermsURL, fallbackClient: groqSTT, prompt: prompt,
+                   note: { AppController.note($0) },
+                   onChunkText: { [weak self] index, text in
+                       incremental?.append(index: index, text: text)
+                       if voiceStopEnabled, TrailingStopPhrase.endsDictation(text) { self?.voiceStopHeard(token: token) }
+                   })
+                chunked = streaming
+                recorder.onPCMChunk = { [pcmTap] pcm in
+                    engine.append(pcm)
+                    streaming.append(pcm)
+                    pcmTap.send(pcm)
+                }
+            } else if chunkedEnabled {
                 let token = generation
                 let voiceStopEnabled = sessionPolicy.usesPaste
                 let keys = keyStore
@@ -777,6 +809,9 @@ public final class AppController {
         let appleSession = apple
         apple = nil
         let chunkedSession = chunked
+        if let streaming = chunkedSession as? DeepgramStreamingTranscriber {
+            streaming.setFallbackPCM(WAVEncoder.pcm16(from: samples))
+        }
         chunked = nil
         let incrementalSession = incrementalCleaner
         incrementalSession?.seal()   // the last chunk's text lands after this tap
@@ -818,6 +853,7 @@ public final class AppController {
                     if guarded.loops > 0 { result = .success(guarded.text); timeline.rawLoopCollapses = guarded.loops }
                 }
                 pipeline.path = stt.path
+                let incrementalSTT = pipeline.path == "groq-chunked" || pipeline.path == "deepgram-streaming"
                 if let joined = stt.joined {
                     pipeline.chunks = joined.chunks
                     pipeline.lastChunkMs = joined.lastChunkMs
@@ -856,12 +892,12 @@ public final class AppController {
                 if case .success(let raw) = result, !raw.isEmpty, (!policy.usesCleanup || !TranscriptCleaner.shouldClean(raw)) {
                     incrementalSession?.cancel()
                     pipeline.cleanup = policy.usesCleanup ? "skipped:short" : "skipped:capture_only"
-                    timeline.incrementalSkipped = pipeline.path != "groq-chunked" ? "not_chunked" :
+                    timeline.incrementalSkipped = !incrementalSTT ? "not_chunked" :
                         (pipeline.chunks ?? 0) <= 2 ? "short" : "short_text"
                 } else if case .success(let raw) = result, !raw.isEmpty {
                     let cleanStart = Date()
                     let incremental: IncrementalCleaner.Result?
-                    if pipeline.path == "groq-chunked", let incrementalSession {
+                    if incrementalSTT, let incrementalSession {
                         incremental = await incrementalSession.finish(totalChunks: pipeline.chunks ?? 0, rawText: raw,
                             single: { fullRaw in
                                 let outcome = await policy.clean(fullRaw, groq: groqCleaner, local: localCleaner)
@@ -877,7 +913,7 @@ public final class AppController {
                     timeline.cleanupCalls = incremental?.calls ?? 0
                     timeline.cleanupFallbackReason = incremental?.fallbackReason
                     timeline.incrementalSkipped = incremental?.skippedReason ??
-                        (pipeline.path != "groq-chunked" ? "not_chunked" : nil)
+                        (!incrementalSTT ? "not_chunked" : nil)
                     if let text = incremental?.text {
                         pipeline.text = text
                         pipeline.cleanup = incremental?.single?.label ?? "ok"
@@ -905,7 +941,7 @@ public final class AppController {
             if !policy.usesCleanup { pipeline.cleanupMode = "none"; timeline.incrementalSkipped = nil }
             timeline.cleanupMode = pipeline.cleanupMode
             if pipeline.cleanupMode == "single", timeline.incrementalSkipped == nil {
-                timeline.incrementalSkipped = pipeline.path == "groq-chunked" ? "none_cleanable_before_finish" : "not_chunked"
+                timeline.incrementalSkipped = (pipeline.path == "groq-chunked" || pipeline.path == "deepgram-streaming") ? "none_cleanable_before_finish" : "not_chunked"
             }
             if let shadow, case .success(let raw) = result {
                 let pastedNames = ShadowScore.nameCount(pipeline.text ?? raw)
