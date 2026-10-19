@@ -1,5 +1,5 @@
-// Latency harness for gate G6 and the A3 cleanup-model choice. Prints only
-// counts and milliseconds — never transcript text, never the key.
+// Latency harness for gate G6 and the A3 cleanup-model choice. Prints
+// counts and milliseconds; streaming STT commands also print fixture transcripts, never keys.
 //   DictateBench stt-groq     <fixture.wav> <runs>   time batch Groq transcription
 //   DictateBench cleanup      <model> <runs>         time one cloud cleanup completion
 //   DictateBench cleanup-local <model> <runs>        time one local (Ollama) cleanup
@@ -444,6 +444,19 @@ if args.count >= 3, args[1] == "rig-play" {
     print(result.line)
     exit(result.outcome == "ok" ? 0 : 1)
 }
+/// The callback can arrive on any transport task; capture its first arrival once.
+final class BenchSTTTiming: @unchecked Sendable {
+    let started = DispatchTime.now()
+    private let lock = NSLock()
+    private var firstText: DispatchTime?
+    func recordText() { lock.withLock { if firstText == nil { firstText = .now() } } }
+    var firstTextMs: Int {
+        lock.withLock {
+            firstText.map { Int(($0.uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000) } ?? -1
+        }
+    }
+}
+
 final class PCMBox: @unchecked Sendable {
     private let lock = NSLock()
     private var all: [Int16] = []
@@ -455,6 +468,7 @@ if args.count >= 2 {
     switch args[1] {
     case "score-text": requireKey("GROQ_API_KEY")
     case "stt-groq" where args.count >= 4, "stt-groq-chunked" where args.count >= 4: requireKey("GROQ_API_KEY")
+    case "stt-deepgram-streaming" where args.count >= 4: requireKey("DEEPGRAM_API_KEY")
     case "cleanup" where args.count >= 4:
         requireKey("GROQ_API_KEY")
     case "eval-incremental" where args.count >= 4:
@@ -481,13 +495,13 @@ if args.count >= 2, args[1] == "score-text" {
     exit(0)
 }
 guard args.count >= 4 else {
-    print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png> | pill-match <wav> | stt-groq|stt-groq-chunked <wav> <runs> | cleanup <model> <runs>")
+    print("usage: DictateBench pill-render <held|error|raw> <reason> <hasText 0|1> <out.png> | pill-match <wav> | stt-groq|stt-groq-chunked|stt-deepgram-streaming <wav> <runs> | cleanup <model> <runs>")
     print("stt-groq-chunked: BENCH_V3=0 uses old 2/3 s limits without fillers; default/BENCH_V3=1 uses V3 3/4 s limits with fillers (synthetic WAV fixtures only)")
     exit(2)
 }
 let runs = Int(args[3]) ?? 5
 guard runs > 0 else { print("runs must be positive"); exit(2) }
-/// BENCH_SHOW_TEXT=1 prints fixture transcripts to the terminal (bench only; the app never logs text).
+/// Extra text in other probes is opt-in; streaming STT always prints per-run fixture transcripts.
 let showText = ProcessInfo.processInfo.environment["BENCH_SHOW_TEXT"] == "1"
 let endToEnd = args[1] == "stt-groq-chunked" && ProcessInfo.processInfo.environment["BENCH_E2E"] == "1"
 var results: [Int] = []
@@ -495,6 +509,37 @@ var lastText: String?
 var firstChunkMs: Int?   // STT ms of run 1's first chunk: what a cold connection inflates
 
 switch args[1] {
+case "stt-deepgram-streaming":
+    let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
+    let transport = URLSessionWebSocketTransport()
+    let fallback = TranscriptionClient(transport: URLSessionTransport(timeout: 30),
+        apiKey: { try environmentKey("GROQ_API_KEY") })
+    for run in 1...runs {
+        let timing = BenchSTTTiming()
+        let engine = DeepgramStreamingTranscriber(transport: transport,
+            apiKey: { try environmentKey("DEEPGRAM_API_KEY") },
+            keytermsURL: AppPaths().keytermsURL, fallbackClient: fallback, prompt: prompt,
+            note: { print($0) }, onChunkText: { _, _ in timing.recordText() })
+        var fed = 0
+        var lastPCMAt = timing.started
+        for offset in stride(from: 0, to: pcm.count, by: 2_400) {
+            let chunk = Array(pcm[offset..<min(pcm.count, offset + 2_400)])
+            fed += chunk.count
+            let deadline = timing.started.uptimeNanoseconds + UInt64(Double(fed) / 24_000 * 1_000_000_000)
+            let now = DispatchTime.now().uptimeNanoseconds
+            if deadline > now { try await Task.sleep(nanoseconds: deadline - now) }
+            engine.append(chunk)
+            lastPCMAt = .now()
+        }
+        let joined = await engine.finish(at: lastPCMAt)
+        let finalAfterEnd = ms(since: lastPCMAt)
+        print("run \(run) first_text_ms=\(timing.firstTextMs) final_after_end_ms=\(finalAfterEnd) chunks=\(joined.chunks) chars=\(joined.text.count) failed=\(joined.failedCount)")
+        print("   raw: \(joined.text)")
+        if joined.failedCount == 0, !joined.text.isEmpty {
+            results.append(finalAfterEnd)
+            lastText = joined.text
+        }
+    }
 case "stt-groq-chunked":
     let useV3 = ProcessInfo.processInfo.environment["BENCH_V3"] != "0"
     let finalSplitSeconds: Double? = ProcessInfo.processInfo.environment["BENCH_FINAL_SPLIT"] == "1" ? 2.0 : nil
@@ -535,7 +580,7 @@ case "stt-groq-chunked":
         let now = DispatchTime.now().uptimeNanoseconds
         if end > now { try await Task.sleep(nanoseconds: end - now) }
     }
-    print("probe keepwarm=\(keepWarmOn ? "on" : "off") idle_s=\(idleSeconds) pings=\(keepWarmPings) show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=\(showText ? "on" : "off") e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
+    print("probe keepwarm=\(keepWarmOn ? "on" : "off") idle_s=\(idleSeconds) pings=\(keepWarmPings) show_chunks=\(showChunks ? "on" : "off") lead_in=\(benchQuoted(leadIn ?? (useV3 ? GroqChunkedTranscriber.fillerLeadIn : ""))) lead_in_override=\(leadIn == nil ? "off" : "on") prompt_extra=\(benchQuoted(promptExtra ?? "")) final_model=\(benchQuoted(finalModel ?? "whisper-large-v3-turbo")) rejoin_guard=\(rejoinGuard ? "on" : "off") short_prompt=\(shortPrompt ? "on" : "off") show_text=on e2e=\(endToEnd ? "on" : "off") incremental=\(!endToEnd || env["BENCH_INCREMENTAL"] == "0" ? "off" : "on") tail_ms=\(env["BENCH_TAIL_MS"] ?? "1500") variant=\(useV3 ? "v3" : "old") first_min_s=\(firstMinimumSeconds) first_max_s=\(firstMaximumSeconds) final_split=\(finalSplitSeconds == nil ? "off" : "on")")
     let pcm = try samples(fromWAV: URL(fileURLWithPath: args[2]))
     let tailValue = ProcessInfo.processInfo.environment["BENCH_TAIL_MS"] ?? "1500"
     guard let tailMs = Int(tailValue), (0...60_000).contains(tailMs) else {
@@ -556,17 +601,20 @@ case "stt-groq-chunked":
         var chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
         let incremental = useIncremental ? IncrementalCleaner(cleaner: cleaner, finalIncludeExamples: !shortPrompt) : nil
         let rawChunkTexts = BenchChunkTexts()
+        let timing = BenchSTTTiming()
         var submittedChunks: [PauseChunker.Chunk] = []
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { try environmentKey("GROQ_API_KEY") }, prompt: benchPrompt,
                                            fillerLeadIn: useV3, leadIn: leadIn, firstMinimumSeconds: firstMinimumSeconds,
                                            firstMaximumSeconds: firstMaximumSeconds, finalSplitSeconds: finalSplitSeconds,
                                            finalModel: finalModel, rejoinGuard: rejoinGuard,
                                            onChunkText: { index, text in
+                                               timing.recordText()
                                                if showChunks { rawChunkTexts.append(index: index, text: text) }
                                                incremental?.append(index: index, text: text)
                                            },
                                            onGroqRateLimit: { GroqQuotaStore.shared.record($0) })
-        let started = DispatchTime.now().uptimeNanoseconds
+        let started = timing.started.uptimeNanoseconds
+        var lastPCMAt = timing.started
         var fed = 0
         func feed(_ samples: [Int16]) async throws {
             fed += samples.count
@@ -577,6 +625,7 @@ case "stt-groq-chunked":
                 if showChunks { submittedChunks.append(chunk) }
                 engine.submit(chunk)
             }
+            lastPCMAt = .now()
         }
         for offset in stride(from: 0, to: pcm.count, by: 2_400) {
             try await feed(Array(pcm[offset..<min(pcm.count, offset + 2_400)]))
@@ -594,12 +643,13 @@ case "stt-groq-chunked":
         }
         let joined = await engine.finish(at: finish)
         let elapsed = ms(since: finish)
+        let finalAfterEnd = ms(since: lastPCMAt)
         if showChunks {
             for line in benchChunkLines(submittedChunks, texts: rawChunkTexts.snapshot) { print(line) }
         }
         if firstChunkMs == nil { firstChunkMs = joined.calls.first { $0.index == 0 && !$0.isFinal && $0.status != nil }?.milliseconds }
         let finalCalls = joined.calls.filter { $0.isFinal }
-        let probeMetrics = " rejoins=\(joined.rejoins) final_model=\(benchQuoted(finalCalls.first?.model ?? "-")) final_chunk_ms=" +
+        let probeMetrics = " first_text_ms=\(timing.firstTextMs) final_after_end_ms=\(finalAfterEnd) rejoins=\(joined.rejoins) final_model=\(benchQuoted(finalCalls.first?.model ?? "-")) final_chunk_ms=" +
             (finalCalls.isEmpty ? "-" : finalCalls.map { "\($0.index):\($0.milliseconds)" }.joined(separator: ","))
         if joined.failedCount == 0, !joined.text.isEmpty {
             if endToEnd {
@@ -669,12 +719,12 @@ case "stt-groq-chunked":
                 results.append(pasteMs)
                 lastText = cleaned
                 print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) finish_to_paste_ms=\(pasteMs) chunks=\(joined.chunks) chars=\(cleaned.count) cleanup_mode=\(mode) cleanup_calls=\(calls) fallback_reason=\(reason) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins)" + (mode == "single" ? " incremental_skipped=\(skipped)" : "") + " cleanup_label=\(cleanupLabel) cleanup_model=\(cleanupModel) script_exact=\(ShadowScore.scriptExact(cleaned))")
-                if showText { print("   raw: \(joined.text)\n   out: \(cleaned)") }
+                print("   raw: \(joined.text)\n   out: \(cleaned)")
             } else {
                 results.append(elapsed)
                 lastText = joined.text
                 print("run \(run)" + probeMetrics + " finish_to_final_ms=\(elapsed) chunks=\(joined.chunks) chars=\(joined.text.count) hedges=\(joined.hedges) hedge_wins=\(joined.hedgeWins) rpm_remaining=\(joined.rateLimits?.rpmRemaining ?? "-") rpd_remaining=\(joined.rateLimits?.rpdRemaining ?? "-")")
-                if showText { print("   raw: \(joined.text)") }
+                print("   raw: \(joined.text)")
             }
         } else {
             incremental?.cancel()

@@ -134,6 +134,8 @@ struct DeepgramStreamingTranscriberTests {
         for frame in frames.prefix(4) { socket.push(frame) }
         // Positive control: a real final must arrive while finish has never been called.
         #expect(await eventually { texts.texts == ["Send the report."] })
+        #expect(await eventually { clock.sleepers == 1 })
+        clock.advance(by: .milliseconds(14900)) // stop just before the recording receive timeout
         var policy = EnginePolicy(mode: .captureOnly)
         policy.keyUnavailable = true // a working Deepgram lane does not require a Groq key
         let streamingPolicy = policy

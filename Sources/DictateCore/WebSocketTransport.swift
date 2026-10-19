@@ -19,7 +19,6 @@ public struct URLSessionWebSocketTransport: WebSocketTransport {
     public init(timeout: TimeInterval = 30) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = 0
         session = URLSession(configuration: configuration)
     }
 
@@ -28,11 +27,16 @@ public struct URLSessionWebSocketTransport: WebSocketTransport {
         task.resume()
         do {
             // Await the upgrade before reporting a successful connection.
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                task.sendPing { error in
-                    if let error { continuation.resume(throwing: error) }
-                    else { continuation.resume() }
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    task.sendPing { error in
+                        if let error { continuation.resume(throwing: error) }
+                        else { continuation.resume() }
+                    }
                 }
+            } onCancel: {
+                task.cancel(with: .goingAway, reason: nil)
             }
             return SessionWebSocketConnection(task: task)
         } catch {
