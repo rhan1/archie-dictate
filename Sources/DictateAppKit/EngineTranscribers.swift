@@ -14,6 +14,7 @@ protocol EngineChunkSession: Sendable {
 }
 extension AppleTranscriber: EngineAppleSession {}
 extension GroqChunkedTranscriber: EngineChunkSession {}
+extension DeepgramStreamingTranscriber: EngineChunkSession {}
 
 extension EnginePolicy {
     struct STTResult {
@@ -25,9 +26,12 @@ extension EnginePolicy {
 
     func transcribe(apple: EngineAppleSession?, chunked: EngineChunkSession?, at: DispatchTime) async -> STTResult {
         let appleFinal = Task { try? await apple?.finish() }
-        let joined = usesGroqSTT ? await chunked?.finish(at: at) : nil
+        let streaming = chunked as? DeepgramStreamingTranscriber
+        let joined = (usesGroqSTT || streaming != nil) ? await chunked?.finish(at: at) : nil
         if let joined, joined.failedCount == 0, !joined.text.isEmpty {
-            return STTResult(result: .success(joined.text), path: joined.scribeChunks > 0 ? "scribe-chunked" : "groq-chunked",
+            let path = streaming.map { $0.fallbackReason == nil ? "deepgram-streaming" : "groq-whole" }
+                ?? (joined.scribeChunks > 0 ? "scribe-chunked" : "groq-chunked")
+            return STTResult(result: .success(joined.text), path: path,
                              joined: joined, appleFinal: appleFinal)
         }
         if let text = await appleFinal.value, !text.isEmpty {

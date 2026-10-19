@@ -2,6 +2,7 @@
 import Foundation
 import Testing
 import DictateCore
+@testable import DictateAppKit
 
 private final class ScriptedSocket: WebSocketConnection, @unchecked Sendable {
     private let lock = NSLock()
@@ -133,12 +134,17 @@ struct DeepgramStreamingTranscriberTests {
         for frame in frames.prefix(4) { socket.push(frame) }
         // Positive control: a real final must arrive while finish has never been called.
         #expect(await eventually { texts.texts == ["Send the report."] })
-        let finishing = Task { await engine.finish() }
+        var policy = EnginePolicy(mode: .captureOnly)
+        policy.keyUnavailable = true // a working Deepgram lane does not require a Groq key
+        let streamingPolicy = policy
+        let finishing = Task { await streamingPolicy.transcribe(apple: nil, chunked: engine, at: .now()) }
         #expect(await eventually { socket.closeStreams == 1 && clock.sleepers >= 2 })
         clock.advance(by: .milliseconds(1200))
         socket.push(frames[4])
         socket.close()
-        let result = await finishing.value
+        let outcome = await finishing.value
+        #expect(outcome.path == "deepgram-streaming")
+        let result = try #require(outcome.joined)
         #expect(result.text == "Send the report. On Wednesday.")
         #expect(result.chunks == 2 && result.failedCount == 0)
         #expect(texts.indices == [0, 1])
@@ -232,8 +238,10 @@ struct DeepgramStreamingTranscriberTests {
             engine.setFallbackPCM(expectedPCM) // recorder's authoritative retained capture
         } else { expectedPCM = [1, -2, 3, 4] }
         async let a = engine.finish()
-        async let b = engine.finish()
-        let (first, second) = await (a, b)
+        async let b = EnginePolicy(mode: .captureOnly).transcribe(apple: nil, chunked: engine, at: .now())
+        let (first, outcome) = await (a, b)
+        #expect(outcome.path == "groq-whole")
+        let second = try #require(outcome.joined)
         #expect(first.text == "Recovered entire dictation." && first.failedCount == 0)
         #expect(second.text == first.text)
         #expect(http.requests.count == 1)
@@ -283,6 +291,27 @@ struct DeepgramStreamingTranscriberTests {
         #expect(result.failedCount == 1 && result.text.isEmpty)
         #expect(http.requests.isEmpty && socket.closeStreams == 0)
         print("ST1 CANCEL groq_requests=0 closestream=0")
+    }
+
+    @Test @MainActor func engineSelectionDefaultsToGroq() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let keys = KeyStore(reader: { _ in
+            Issue.record("Selection must not read API keys")
+            throw TranscriptionError.missingKey
+        })
+        let engine = DictationEngine(keyStore: keys, paths: AppPaths(home: root), surface: .none,
+            quotaFileURL: root.appendingPathComponent("quota.json"))
+        #expect(DictationSTT(rawValue: "groq") == .groqChunked)
+        #expect(DictationSTT(rawValue: "deepgram") == .deepgramStreaming)
+        #expect(DictationSTT(rawValue: "junk") == nil)
+        #expect(engine.stt == .groqChunked)
+        let selected = DictationEngine(keyStore: keys, paths: AppPaths(home: root), surface: .none,
+            quotaFileURL: root.appendingPathComponent("selected-quota.json"), stt: .deepgramStreaming,
+            keytermsURL: root.appendingPathComponent("terms.txt"))
+        #expect(selected.stt == .deepgramStreaming)
+        // Construction only: no start, microphone permissions, devices, sockets, or keys.
+        print("ST1 SELECT default=groq")
     }
 
 }

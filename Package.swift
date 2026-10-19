@@ -18,7 +18,7 @@ let package = Package(
         .executableTarget(name: "DictateApp", dependencies: ["DictateAppKit"]),
         // G6 latency harness + cleanup-model measurement (network; never run by `swift test`).
         .executableTarget(name: "DictateBench", dependencies: ["DictateCore", "DictateAppKit"]),
-        .testTarget(name: "DictateCoreTests", dependencies: ["DictateCore", "DictateObjC"],
+        .testTarget(name: "DictateCoreTests", dependencies: ["DictateCore", "DictateObjC", "DictateAppKit"],
                     resources: [.copy("Fixtures")]),
         .testTarget(name: "DictateAppKitTests", dependencies: ["DictateAppKit"]),
     ],
