@@ -69,13 +69,11 @@ public final class DeepgramStreamingTranscriber: StreamingSTTSession, @unchecked
 
     // MARK: - Request
 
-    /// The newest `maxKeyterms` non-empty lines (ST2 appends newest-last); a missing file is no terms.
+    /// The newest `maxKeyterms` terms of the ST2 learner's store (`KeytermsStore`, cap 200, newest-last);
+    /// a missing file is no terms.
     public static func keyterms(from url: URL?) -> [String] {
-        guard let url, let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-        let terms = text.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        return Array(terms.suffix(maxKeyterms))
+        guard let url else { return [] }
+        return KeytermsStore(url: url).newest(maxKeyterms)
     }
 
     /// `URLComponents` with every name/value percent-encoded to RFC 3986 unreserved characters,
