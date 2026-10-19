@@ -18,6 +18,11 @@ struct CaptureRouteProbe {
     /// Nil is an unreadable route; conservatively decline VPIO.
     var outputIsBluetooth: () -> Bool? = { false }
 
+    /// BT1 (v1.19): watches the system default input for one Bluetooth dictation. The handler gets the
+    /// new default (nil: unreadable) on a private queue; releasing the returned token removes the
+    /// watch. Read-only (a property listener; no device is opened). Nil: nothing is watched.
+    var watchDefaultInput: (@escaping (AudioDeviceID?) -> Void) -> AnyObject? = { _ in nil }
+
     static let system = CaptureRouteProbe(
         eligibility: { try? AudioDevices.bridgeEligibility() },
         defaultInput: { AudioDevices.defaultInputDevice() },
@@ -25,5 +30,26 @@ struct CaptureRouteProbe {
         defaultInputName: { AVCaptureDevice.default(for: .audio)?.localizedName },
         isRunningSomewhere: { AudioDevices.isRunningSomewhere($0) },
         hfpAlready: { BluetoothProfile.sample() == "hfp" },
-        outputIsBluetooth: { AudioDevices.outputIsBluetooth() })
+        outputIsBluetooth: { AudioDevices.outputIsBluetooth() },
+        watchDefaultInput: { DefaultInputWatch($0) })
+}
+
+/// BT1: a `kAudioHardwarePropertyDefaultInputDevice` listener on the system object for one dictation;
+/// the handler receives the default as read back after the change. Removed when released.
+final class DefaultInputWatch {
+    private let queue = DispatchQueue(label: "dictate.capture.default-input")
+    private var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    private let block: AudioObjectPropertyListenerBlock
+    private var added = false
+
+    init?(_ handler: @escaping (AudioDeviceID?) -> Void) {
+        block = { _, _ in handler(AudioDevices.defaultInputDevice()) }
+        added = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block) == noErr
+        if !added { return nil }
+    }
+
+    deinit {
+        if added { _ = AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block) }
+    }
 }

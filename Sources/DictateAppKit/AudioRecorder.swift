@@ -167,6 +167,10 @@ public final class AudioRecorder: CaptureEngine {
     private var ioGuard = HeadsetIOGuard(bluetooth: false)
     /// The headset device the dictation started on: the busy check polls it, never a re-resolved default.
     private var headsetDevice: AudioDeviceID?
+    /// BT1 (v1.19): this Bluetooth dictation's default-input watch (released by `stop()`), and whether
+    /// the default input left the headset and the built-in took over (nothing re-opens the old device).
+    private var defaultInputWatch: AnyObject?
+    private var inputMoved = false
     private var restarting = false
     private var restartEpoch = CaptureEpoch()
     /// L3: the admitted attempt being verified (frames within 1 s), bound to its own token.
@@ -250,6 +254,7 @@ public final class AudioRecorder: CaptureEngine {
             ioGuard = HeadsetIOGuard(bluetooth: bluetooth, warmRoute: warmRoute)
             if warmRoute { feed.setWarmRoute() }
             headsetDevice = headset
+            inputMoved = false
             instrumentation = CaptureInstrumentation(backend: headsetUnitArm(device: device, bluetooth: bluetooth) ? .auhal : .engine)
             instrumentation.routeUID = headsetUID
             builtinDriftNoted = false
@@ -261,6 +266,7 @@ public final class AudioRecorder: CaptureEngine {
             builtinActive = true
             return builtin
         }
+        if bluetooth, let headset { watchDefaultInput(headset: headset, epoch: epoch) }
         if let abandonedMs { AppController.note("bridge_abandoned=1 busy_ms=\(abandonedMs)") }
         guard let unit else {
             let reason = lock.withLock { engineEpoch === epoch ? feed.bridge.skipReason : nil }
@@ -297,6 +303,58 @@ public final class AudioRecorder: CaptureEngine {
             ready.signal()
         }
         _ = ready.wait(timeout: .now() + Self.builtinSetupWait)
+    }
+
+    /// BT1 (v1.19): watch the system default input while this Bluetooth dictation runs.
+    private func watchDefaultInput(headset: AudioDeviceID, epoch: CaptureEpoch) {
+        let watch = route.watchDefaultInput { [weak self] device in
+            self?.onExecutor { [weak self] in self?.defaultInputChanged(from: headset, to: device, epoch: epoch) }
+        }
+        let released: AnyObject? = lock.withLock {
+            guard engineEpoch === epoch else { return watch }          // stopped meanwhile
+            defer { defaultInputWatch = watch }
+            return defaultInputWatch
+        }
+        withExtendedLifetime(released) {}                              // a listener is removed outside the lock
+    }
+
+    /// BT1 (v1.19): the system default input changed mid-dictation. The AUHAL headset client is bound to
+    /// the UID the dictation started on, so v1.18 ignored the change and the old device kept carrying.
+    /// When the default leaves that device: a live, healthy built-in carries the rest — resumed from
+    /// standby where the headset stopped, nothing lost or doubled — the client on the old device is
+    /// stopped, and no recovery re-opens it this dictation. Without such a built-in the headset keeps
+    /// carrying (named). The engine arm's AVAudioEngine meets the change through its own configuration
+    /// notification (unchanged; noted). The next dictation binds to the new default. Runs on the executor.
+    private func defaultInputChanged(from headset: AudioDeviceID, to device: AudioDeviceID?, epoch: CaptureEpoch) {
+        guard let device, device != headset else { return }           // unreadable, or back on the headset
+        enum Action { case builtinCarries(CaptureBridge.Event?), headsetContinues(String), engineArm }
+        let now = ProcessInfo.processInfo.systemUptime
+        var switchNotes: [String] = []
+        let action: Action? = lock.withLock {
+            guard engineEpoch === epoch, feed.bridge.state != .off, !inputMoved else { return nil }
+            guard instrumentation.backend == .auhal else { return .engineArm }
+            guard feed.bridge.builtinIsAlive else { return .headsetContinues(feed.bridge.skipReason ?? "builtin_dead") }
+            guard feed.health.status(.builtin, at: now) == .healthy else { return .headsetContinues("builtin_not_healthy") }
+            inputMoved = true
+            verifying = nil
+            if episode.isRunning { episode.settled(.skipped) }
+            let out = feed.headsetFailed()                              // the built-in carries from the continuity point
+            deliverLocked(out.frames)
+            switchNotes = feed.takeSwitchNotes()
+            return .builtinCarries(out.event)
+        }
+        let line = "default_input_changed from=\(headset) to=\(device)"
+        switch action {
+        case nil: return
+        case .engineArm?: AppController.note("\(line) action=none arm=engine")
+        case .headsetContinues(let reason)?: AppController.note("\(line) action=headset_continues reason=\(reason)")
+        case .builtinCarries(let event)?:
+            delivery.drain()
+            teardownEngine()                                           // the client on the old device (this epoch's, on the executor)
+            AppController.note("\(line) action=builtin_carries headset_stopped=1")
+            switchNotes.forEach { AppController.note($0) }
+            if let event { Self.noteCarried(event, reason: "default_input_changed") }
+        }
     }
 
     /// The built-in unit could not start: the headset carries alone (today's behaviour).
@@ -545,6 +603,8 @@ public final class AudioRecorder: CaptureEngine {
             (engineEpoch, bridgeConfigured && episode.bluetooth, feed.health.status(.builtin, at: now) == .healthy)
         }
         guard bluetooth else { return .proceed(after: 0) }
+        // BT1: the default input left the headset and the built-in carries: nothing re-opens the old device.
+        if lock.withLock({ inputMoved }) { return .skip }
         if path == .firstBuffer, builtinCarries {
             // The built-in carries: only the headset engine is restarted, by the episode.
             requestHeadsetRestart(epoch: epoch, path: .firstBuffer)
@@ -853,9 +913,14 @@ public final class AudioRecorder: CaptureEngine {
     /// L3: every headset restart request goes through the episode.
     private func requestHeadsetRestart(epoch: CaptureEpoch, path: RecoveryPath) {
         let now = ProcessInfo.processInfo.systemUptime
-        let admission: BluetoothRecoveryEpisode.Admission = lock.withLock {
+        let admission: BluetoothRecoveryEpisode.Admission? = lock.withLock {
             guard engineEpoch === epoch else { return .exhausted }
+            guard !inputMoved else { return nil }                          // BT1: never the old device
             return episode.request(path, at: now)
+        }
+        guard let admission else {
+            AppController.note("bt_recovery=skipped path=\(path.rawValue) reason=default_input_changed")
+            return
         }
         switch admission {
         case .now: onExecutor { [weak self] in self?.restartHeadset(epoch: epoch, path: path, queued: false) }
@@ -881,6 +946,11 @@ public final class AudioRecorder: CaptureEngine {
              feed.health.isFresh(.headset, at: now), feed.health.status(.builtin, at: now) == .healthy, headsetDevice)
         }
         guard lock.withLock({ engineEpoch === epoch }) else { return }      // stale: never touch a newer episode
+        if lock.withLock({ inputMoved }) {                                  // BT1: admitted before the default moved
+            lock.withLock { episode.skip() }
+            AppController.note("bt_recovery=skipped path=\(path.rawValue) reason=default_input_changed")
+            return
+        }
         // restart_request_becomes_obsolete: re-validated when it runs, settled as skipped.
         guard current, !(queued && healthy) else {
             lock.withLock { episode.skip() }
@@ -1427,6 +1497,9 @@ public final class AudioRecorder: CaptureEngine {
         leaseEpoch = nil
         if let releasing { lastReleased = releasing }
         let restartResult = live ? feed.bridge.restart?.result : nil
+        let watch = defaultInputWatch                 // BT1: removed below, outside the lock
+        defaultInputWatch = nil
+        inputMoved = false
         feed.cancel() // a lone tap's ring is discarded here
         bridgeConfigured = false
         captureBoundary = nil
@@ -1456,6 +1529,7 @@ public final class AudioRecorder: CaptureEngine {
             builtinWatch = CaptureExecutorWatch()
         }
         lock.unlock()
+        withExtendedLifetime(watch) {}
         if let abandonedMs { AppController.note("bridge_abandoned=1 busy_ms=\(abandonedMs)") }
         if let restartResult { AppController.note("headset_restart=1 result=\(restartResult)") }
         if !remainder.isEmpty, let callback { delivery.enqueue(remainder, to: callback) }
