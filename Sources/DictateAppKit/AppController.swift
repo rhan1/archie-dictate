@@ -1134,7 +1134,7 @@ public final class AppController {
                 "timeline:", "keys=groq:\(keyState)", "bt_start=\(btStart)",
                 "mic=\"\(capture.device)\"", "warm_ms=\(warmMs.map(String.init) ?? "-")", "media=\(media)",
                 "conflict=\(AppController.conflictingDictationApps())", "fmt=\(capture.startFormat)",
-                "engine_start_ms=\(capture.engineStartMs)", "first_buffer_ms=\(capture.firstBufferMs.map(String.init) ?? "-")",
+                capture.startupFields,
                 "format_changes=\(capture.formatChanges)", "config_changes=\(capture.configChanges)",
                 "bridge_ms=\(capture.bridgeMs.map(String.init) ?? "-")", "bridge_src=\(capture.bridgeSource)",
                 "tap2_to_first_kept_buffer_ms=\(capture.tap2ToFirstKeptMs.map(String.init) ?? "-")",
