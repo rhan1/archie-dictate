@@ -18,6 +18,11 @@ struct CaptureRouteProbe {
     /// Nil is an unreadable route; conservatively decline VPIO.
     var outputIsBluetooth: () -> Bool? = { false }
 
+    /// BT1 (v1.19): watches the system default input for one Bluetooth dictation. The handler gets the
+    /// new default (nil: unreadable) on a private queue; releasing the returned token removes the
+    /// watch. Read-only (a property listener; no device is opened). Nil: nothing is watched.
+    var watchDefaultInput: (@escaping (AudioDeviceID?) -> Void) -> AnyObject? = { _ in nil }
+
     static let system = CaptureRouteProbe(
         eligibility: { try? AudioDevices.bridgeEligibility() },
         defaultInput: { AudioDevices.defaultInputDevice() },
