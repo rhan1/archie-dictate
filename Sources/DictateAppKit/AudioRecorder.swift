@@ -92,7 +92,9 @@ public final class AudioRecorder: CaptureEngine {
             if let backend = builtinBackend { line += " builtin_backend=\(backend)" }
             line += " carrier=\(carrier) headset_carried_ms=\(headsetCarriedMs)"
             // v1.12: the split io_ops / obligations, exact frame runs, the lease and the A/B fields.
-            return line + " \(startupFields) \(ioOps) \(ioHeld) \(carrierFrames) \(lease) \(instrumentation)"
+            // C1: the startup clock + voice-processing state go LAST, so the frozen host-contract
+            // adjacency `… carrier=… headset_carried_ms=… io_ops=…` (HostContractTests) is unchanged.
+            return line + " \(ioOps) \(ioHeld) \(carrierFrames) \(lease) \(instrumentation) \(startupFields)"
         }
     }
     /// Set by a host before `startAsync`. Conversation requests Apple AEC on a
@@ -1509,13 +1511,7 @@ public final class AudioRecorder: CaptureEngine {
         do {
             let out = try headsetNative.call("output_buffer") { () throws -> AVAudioPCMBuffer in
                 let target = converter.outputFormat
-                let frameBudget = Double(buffer.frameLength) * (target.sampleRate / buffer.format.sampleRate)
-                // Bound VPIO's continuous stream to its input clock. Extra
-                // converter capacity can surface priming padding as capture
-                // frames; buffered converter input carries to the next call.
-                // Preserve the existing allocation for both legacy arms.
-                let processed = lock.withLock { stats.voiceProcessing == "on" }
-                let capacity = processed ? max(1, Int(ceil(frameBudget))) : Int(frameBudget) + 32
+                let capacity = Int(Double(buffer.frameLength) * (target.sampleRate / buffer.format.sampleRate)) + 32
                 return try NativePCM.buffer(target, capacity: capacity)
             }
             try headsetNative.call("convert") {
@@ -1575,6 +1571,23 @@ public final class AudioRecorder: CaptureEngine {
     func offlineHeadsetBuffer(_ buffer: AVAudioPCMBuffer) {
         let token: CaptureEpoch = lock.withLock { captureRunning = true; return tapEpoch }
         consume(buffer, time: AVAudioTime(sampleTime: 0, atRate: buffer.format.sampleRate), epoch: token)
+    }
+
+    /// Offline harness (tests only): drain the engine arm's live converter with end-of-stream, so a
+    /// test can tell frames the resampler still holds (its trailing look-ahead) from frames lost.
+    /// Returns the tail; nothing reaches arbitration. No engine, device or audio.
+    func offlineFlushConverter() throws -> [Float] {
+        guard let converter = lock.withLock({ self.converter }) else { return [] }
+        var tail: [Float] = []
+        while true {
+            let out = try NativePCM.buffer(converter.outputFormat, capacity: 4_096)
+            let status = try NativePCM.convert(converter, to: out) { _, status in
+                status.pointee = .endOfStream
+                return nil
+            }
+            tail += Array(UnsafeBufferPointer(start: out.floatChannelData![0], count: Int(out.frameLength)))
+            if status == .endOfStream || out.frameLength == 0 { return tail }
+        }
     }
 
     /// Arbitration, accumulation and meter updates share this lock; PCM is enqueued in order
