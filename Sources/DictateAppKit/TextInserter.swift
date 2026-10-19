@@ -1,23 +1,25 @@
 import AppKit
 import CoreGraphics
+import Carbon
 #if canImport(ApplicationServices)
 import ApplicationServices
 #endif
 
-/// D3: borrow the clipboard, synthesize ⌘V, then put the clipboard back.
-/// D1 (v1.15): restore old clipboard only after inserted text is confirmed in the SAME initially
-/// focused accessibility element via an AXValue / AXSelectedText insertion delta.
+/// Prefer explicit, unmodified Unicode events; borrow the clipboard only when preflight
+/// rules out typing. Both paths require a complete new payload at the same AX destination.
 public final class TextInserter {
     public enum Result: Equatable, Sendable { case confirmed, timedOut, held }
     public static let restoreDelay: TimeInterval = 1.0
     public static let defaultTimeout: TimeInterval = 10.0
     public static let defaultPollInterval: TimeInterval = 0.1
-    private static let vKeyCode: CGKeyCode = 9
+    private static let typingInterval: TimeInterval = 0.01
 
-    private let keyEventPosting: KeyEventPosting?
+    private let keyEventPosting: KeyEventPosting
     private let typingEligibility: (() -> TypingEligibility)?
     private let pasteboard: NSPasteboard
-    private let postKeystroke: () -> Void
+    private var cancelActiveTyping: (() -> Void)?
+    /// Recovery copy; a cancelled partial insertion retains only its unposted remainder.
+    public private(set) var heldText: String?
     // Accessed only on the main queue, including reentrant completion calls.
     private var pending: [(text: String, shouldInsert: (() -> Bool)?, result: ((Result) -> Void)?, completion: (() -> Void)?)] = []
     private var inFlight = false
@@ -41,10 +43,9 @@ public final class TextInserter {
         logger: ((String) -> Void)? = nil,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
-        self.keyEventPosting = keyEventPosting
+        self.keyEventPosting = keyEventPosting ?? postKeystroke.map(ClosureKeyEventPoster.init) ?? SystemKeyEventPoster()
         self.typingEligibility = typingEligibility
         self.pasteboard = pasteboard
-        self.postKeystroke = postKeystroke ?? TextInserter.postCommandV
         self.schedule = schedule ?? { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) }
         self.pollInterval = max(0.01, pollInterval)
         self.timeout = max(0, timeout)
@@ -53,7 +54,7 @@ public final class TextInserter {
         self.log = logger ?? { AppController.note($0) }
     }
 
-    /// Pastes `text` verbatim at the cursor of the frontmost app. `completion`
+    /// Inserts `text` verbatim at the cursor of the frontmost app. `completion`
     /// runs on the main queue after the restore window (a newer copy is kept).
     /// `shouldInsert` runs when this request reaches the head of the queue,
     /// before borrowing the clipboard, so callers can recheck the destination.
@@ -115,86 +116,184 @@ public final class TextInserter {
         return readAXTexts(from: current)
     }
 
+    /// Called on the main queue by the controller's existing Esc/cancel path.
+    public func cancelTyping() {
+        if Thread.isMainThread { cancelActiveTyping?() }
+        else { DispatchQueue.main.async { self.cancelActiveTyping?() } }
+    }
+
+    private func eligibility(for element: AXUIElement?) -> TypingEligibility {
+        if let typingEligibility { return typingEligibility() }
+        // Injected AX readers and private pasteboards never reach system input/AX APIs.
+        guard fakeReader == nil, pasteboard.name == NSPasteboard.general.name,
+              Self.isAppRuntime() else { return .noFocus }
+        if IsSecureEventInputEnabled() { return .secure }
+        guard let element else { return .noFocus }
+        func attribute(_ name: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+            return value
+        }
+        let role = attribute(kAXRoleAttribute) as? String
+        let subrole = attribute(kAXSubroleAttribute) as? String
+        if role == kAXSecureTextFieldSubrole || subrole == kAXSecureTextFieldSubrole { return .secure }
+        guard attribute(kAXEnabledAttribute) as? Bool != false,
+              [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role ?? "") else { return .noFocus }
+        var settable: DarwinBoolean = false
+        guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+              settable.boolValue else { return .noFocus }
+        return .editable
+    }
+
+    /// Character iteration preserves extended grapheme clusters, including surrogate pairs.
+    /// An oversized cluster cannot satisfy both bounds and must use paste unchanged.
+    private static func unicodeChunks(_ text: String) -> [[UInt16]]? {
+        var chunks: [[UInt16]] = []
+        var chunk: [UInt16] = []
+        for character in text {
+            let units = Array(String(character).utf16)
+            guard units.count <= 32 else { return nil }
+            if chunk.count + units.count > 32 { chunks.append(chunk); chunk = [] }
+            chunk.append(contentsOf: units)
+        }
+        if !chunk.isEmpty { chunks.append(chunk) }
+        return chunks
+    }
+
     private func insertNext() {
         guard !inFlight, !pending.isEmpty else { return }
         inFlight = true
+        heldText = nil
         let (text, shouldInsert, onResult, completion) = pending.removeFirst()
-        if let shouldInsert, !shouldInsert() {
-            onResult?(.held)
+        let started = now()
+        func finish(_ result: Result) {
+            self.cancelActiveTyping = nil
+            onResult?(result)
             completion?()
-            inFlight = false
-            insertNext()
+            self.inFlight = false
+            self.insertNext()
+        }
+        if let shouldInsert, !shouldInsert() {
+            heldText = text
+            log("insertion=paste reason=focus_changed confirmed=0")
+            finish(.held)
             return
         }
-
-        let saved = PasteboardSnapshot.capture(pasteboard)
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        let ourChangeCount = pasteboard.changeCount
-
         if text.isEmpty {
-            saved.restore(to: pasteboard, ifUnchangedSince: ourChangeCount)
-            onResult?(.confirmed)
-            completion?()
-            inFlight = false
-            insertNext()
+            log("insertion=typed chars=0 events=0 ms=0 confirmed=1")
+            finish(.confirmed)
             return
         }
 
         let initialElement: AXUIElement?
         let initialTexts: [String]
-        if fakeReader != nil {
+        if let fakeReader {
             initialElement = nil
-            initialTexts = fakeReader!() ?? []
+            initialTexts = fakeReader() ?? []
         } else {
             initialElement = pasteboard.name == NSPasteboard.general.name ? currentFocusedElement() : nil
-            if let initialElement {
-                initialTexts = readAXTexts(from: initialElement)
-            } else {
-                initialTexts = []
-            }
+            initialTexts = initialElement.map(readAXTexts) ?? []
         }
 
-        postKeystroke()
-        let deadline = now() + timeout
-
-        func checkConfirmed(currentTexts: [String]?) -> Bool {
-            guard let currentTexts else { return false }
-            // Compare each AX attribute against its own baseline. An old suffix
-            // plus an unrelated edit is not evidence that this paste landed.
-            for (index, current) in currentTexts.prefix(1).enumerated() {
-                let initial = index < initialTexts.count ? initialTexts[index] : ""
-                if Self.hasCompleteNewOccurrence(of: text, initial: initial, current: current) { return true }
-            }
-            return false
+        let chunks = Self.unicodeChunks(text)
+        let reason: String?
+        switch eligibility(for: initialElement) {
+        case .secure: reason = "secure"
+        case .noFocus: reason = "no_focus"
+        case .editable:
+            // A typed newline/control may submit a terminal prompt. Preserve it through paste.
+            if text.unicodeScalars.contains(where: {
+                [.control, .lineSeparator, .paragraphSeparator].contains($0.properties.generalCategory)
+            }) { reason = "control_chars" }
+            else if chunks == nil { reason = "grapheme_too_long" }
+            else { reason = nil }
         }
+        let events = (chunks ?? []).flatMap { units in
+            [InsertionKeyEvent(utf16: units, keyDown: true, flags: []),
+             InsertionKeyEvent(utf16: units, keyDown: false, flags: [])]
+        }
+        // Preparing the entire batch is the final preflight. No event is posted yet.
+        let pasteReason = reason ?? (keyEventPosting.prepare(events) ? nil : "events_unavailable")
+        let deadline = started + timeout
+        var saved: PasteboardSnapshot?
+        var ourChangeCount: Int?
+        var eventCount = 0
+        var postedUnits = 0
+        var cancelled = false
+        var finished = false
 
-        func pollStep() {
-            let currentTexts = self.sampleTexts(initialElement: initialElement)
-            if self.now() <= deadline, checkConfirmed(currentTexts: currentTexts) {
-                saved.restore(to: self.pasteboard, ifUnchangedSince: ourChangeCount)
-                self.log("paste_confirm=ax")
-                onResult?(.confirmed)
-                completion?()
-                self.inFlight = false
-                self.insertNext()
-            } else if self.now() >= deadline - 1e-6 {
-                // Timeout: do NOT restore; retain dictation so manual command V can recover
-                self.log("paste_confirm=timeout")
-                onResult?(.timedOut)
-                completion?()
-                self.inFlight = false
-                self.insertNext()
-            } else {
-                self.schedule(self.pollInterval) {
-                    pollStep()
+        func complete(_ confirmed: Bool) {
+            guard !finished else { return }
+            finished = true
+            if let pasteReason {
+                if confirmed, let saved, let ourChangeCount {
+                    saved.restore(to: self.pasteboard, ifUnchangedSince: ourChangeCount)
                 }
+                self.log(confirmed ? "paste_confirm=ax" : "paste_confirm=timeout")
+                self.log("insertion=paste reason=\(pasteReason) confirmed=\(confirmed ? 1 : 0)")
+            } else {
+                self.log("insertion=typed chars=\(text.count) events=\(eventCount) ms=\(Int(max(0, self.now() - started) * 1000)) confirmed=\(confirmed ? 1 : 0)")
+            }
+            if !confirmed {
+                // Never resend an ambiguous insertion. The controller exposes this recovery copy.
+                self.heldText = cancelled && postedUnits < text.utf16.count
+                    ? String(decoding: Array(text.utf16.dropFirst(postedUnits)), as: UTF16.self) : text
+            }
+            finish(confirmed ? .confirmed : .timedOut)
+        }
+
+        func checkConfirmed(_ currentTexts: [String]?) -> Bool {
+            guard let current = currentTexts?.first else { return false }
+            return Self.hasCompleteNewOccurrence(of: text, initial: initialTexts.first ?? "", current: current)
+        }
+        func pollStep() {
+            guard !finished else { return }
+            let current = self.sampleTexts(initialElement: initialElement)
+            if cancelled { complete(false) }
+            else if self.now() <= deadline, checkConfirmed(current) { complete(true) }
+            else if self.now() >= deadline - 1e-6 { complete(false) }
+            else {
+                self.schedule(min(self.pollInterval, max(0, deadline - self.now())), pollStep)
             }
         }
 
-        schedule(pollInterval) {
-            pollStep()
+        if pasteReason != nil {
+            saved = PasteboardSnapshot.capture(pasteboard)
+            pasteboard.clearContents()
+            let item = NSPasteboardItem()
+            item.setString(text, forType: .string)
+            item.setData(Data(), forType: .init("org.nspasteboard.TransientType"))
+            item.setData(Data(), forType: .init("org.nspasteboard.ConcealedType"))
+            pasteboard.writeObjects([item])
+            ourChangeCount = pasteboard.changeCount
+            keyEventPosting.postPaste()
+            schedule(min(pollInterval, timeout), pollStep)
+            return
         }
+
+        cancelActiveTyping = { cancelled = true }
+        func typeStep(_ index: Int) {
+            guard !finished else { return }
+            // A changed destination or secure input appearing mid-stream stops typing;
+            // it never permits an automatic paste after an event has been posted.
+            guard !cancelled, self.now() < deadline,
+                  self.sampleTexts(initialElement: initialElement) != nil,
+                  self.eligibility(for: initialElement) == .editable else {
+                cancelled = true
+                complete(false)
+                return
+            }
+            self.keyEventPosting.postPreparedEvent(at: index)
+            self.keyEventPosting.postPreparedEvent(at: index + 1)
+            eventCount += 2
+            postedUnits += events[index].utf16.count
+            if index + 2 < events.count {
+                self.schedule(Self.typingInterval) { typeStep(index + 2) }
+            } else {
+                self.schedule(min(self.pollInterval, max(0, deadline - self.now())), pollStep)
+            }
+        }
+        typeStep(0)
     }
 
     /// H1b (v1.18): the COMPLETE payload must newly occur in the same attribute.
@@ -220,12 +319,6 @@ public final class TextInserter {
     }
 
     public static func postCommandV() {
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
-        let up = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
-        down?.flags = .maskCommand
-        up?.flags = .maskCommand
-        down?.post(tap: .cghidEventTap)
-        up?.post(tap: .cghidEventTap)
+        SystemKeyEventPoster().postPaste()
     }
 }
