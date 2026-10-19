@@ -603,6 +603,17 @@ public final class AppController {
         signalSource = source
     }
 
+    /// v1.18: what leaves the pipeline. A paste-mode dictation that ends with the spoken stop phrase
+    /// (`TrailingStopPhrase`) is delivered without it; a capture-only host (Archie's conversation) always
+    /// gets the full transcript, because it routes the phrase itself. Counts only are logged.
+    static func deliveredText(_ text: String, usesPaste: Bool) -> String {
+        guard usesPaste else { return text }
+        let stripped = TrailingStopPhrase.strip(text)
+        guard stripped.matched else { return text }
+        note("voice_stop=1 stage=final removed_chars=\(text.count - stripped.text.count)")
+        return stripped.text
+    }
+
     private func finishButton() {
         if pillOutcome?.isRecoverable == true { outcomeEvent(.recoverTap) }
         else { perform(machine.finishButton()) }
@@ -681,6 +692,8 @@ public final class AppController {
             let engine = dependencies?.makeApple() ?? AppleTranscriber()
             apple = engine
             if chunkedEnabled {
+                let token = generation
+                let voiceStopEnabled = sessionPolicy.usesPaste
                 let keys = keyStore
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
@@ -695,7 +708,10 @@ public final class AppController {
                    rejoinGuard: GroqChunkedTranscriber.rejoinGuardEnabled(environment: ProcessInfo.processInfo.environment),
                    lowSpeechGuard: GroqChunkedTranscriber.lowSpeechGuardEnabled(environment: ProcessInfo.processInfo.environment),
                    edgeGuard: GroqChunkedTranscriber.edgeGuardEnabled(environment: ProcessInfo.processInfo.environment),
-                   onChunkText: { index, text in incremental?.append(index: index, text: text) },
+                   onChunkText: { [weak self] index, text in
+                       incremental?.append(index: index, text: text)
+                       if voiceStopEnabled, TrailingStopPhrase.endsDictation(text) { self?.voiceStopHeard(token: token) }
+                   },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
                 recorder.onPCMChunk = { [pcmTap] pcm in
@@ -715,6 +731,17 @@ public final class AppController {
             }
         } else {
             recorder.onPCMChunk = { [pcmTap] pcm in pcmTap.send(pcm) }
+        }
+    }
+
+    /// v1.18: a chunk of the live recording ended with the standalone stop phrase -- finish like the
+    /// second Option tap would. Only the recording that heard it, and only while it is still recording;
+    /// the final transcript is stripped by the same rule, so a phrase that was NOT last stays dictated.
+    private func voiceStopHeard(token: CaptureEpoch) {
+        Task { @MainActor [weak self] in
+            guard let self, self.generation === token, self.machine.state == .recording else { return }
+            Self.note("voice_stop=1 stage=live")
+            self.perform(self.machine.finishButton())
         }
     }
 
@@ -913,9 +940,17 @@ public final class AppController {
                     }
                     return e
                 }
+                var delivered: String?
+                if case .success(let raw) = finalResult, !raw.isEmpty {
+                    delivered = Self.deliveredText(report.text ?? raw, usesPaste: policy.usesPaste)
+                }
                 switch finalResult {
+                case .success(let raw) where !raw.isEmpty && delivered?.isEmpty == true:
+                    // v1.18: the whole dictation was the spoken stop phrase -- nothing to paste.
+                    self.showOutcome(.held("no_stt"))
+                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_stt")), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
                 case .success(let raw) where !raw.isEmpty:
-                    let text = report.text ?? raw
+                    let text = delivered ?? raw
                     if fake == nil, ShadowScore.overlap(raw) >= 0.60 {
                         Self.note(ShadowScore.namesLine(rawNames: ShadowScore.nameCount(raw),
                                                        pastedNames: ShadowScore.nameCount(text), path: report.path,
