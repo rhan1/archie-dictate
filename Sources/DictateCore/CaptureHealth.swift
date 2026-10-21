@@ -58,6 +58,9 @@ public struct CaptureHealth: Sendable {
     private var builtin = SourceState()
     private var headset = SourceState()
     public private(set) var boundary: TimeInterval?
+    /// H1: only the never-first-buffer deadline moves when silent VP is replaced by plain input.
+    /// The recording boundary and duration/evidence stay attached to the original capture.
+    private var firstInputSince: TimeInterval?
     public private(set) var lastUseful: TimeInterval?
     public private(set) var warned: Reason?
     public private(set) var failed: Reason?
@@ -83,7 +86,16 @@ public struct CaptureHealth: Sendable {
 
     public mutating func recordingStarted(at time: TimeInterval) {
         boundary = time
+        firstInputSince = time
         lastUseful = nil
+        warned = nil
+        failed = nil
+    }
+
+    public mutating func restartInput(at time: TimeInterval) {
+        headset = SourceState()
+        sourceStarted(.headset, at: time)
+        firstInputSince = time
         warned = nil
         failed = nil
     }
@@ -177,11 +189,12 @@ public struct CaptureHealth: Sendable {
             actions.append(.builtinDead(problem))
         }
         guard let boundary, failed == nil else { return actions }
+        let firstInputSince = self.firstInputSince ?? boundary
         guard let carrying else {
             // No source configured yet (start still in flight): the never-first-buffer deadline runs anyway.
             guard lastUseful == nil else { return actions }
-            if warned == nil, now - boundary > Self.builtinGrace { warned = .noInput; actions.append(.warn(.noInput)) }
-            if now >= boundary + Self.failAfter { failed = .noInput; actions.append(.fail(.noInput)) }
+            if warned == nil, now - firstInputSince > Self.builtinGrace { warned = .noInput; actions.append(.warn(.noInput)) }
+            if now >= firstInputSince + Self.failAfter { failed = .noInput; actions.append(.fail(.noInput)) }
             return actions
         }
         let other: Source = carrying == .builtin ? .headset : .builtin
@@ -209,8 +222,8 @@ public struct CaptureHealth: Sendable {
         let usefulNow = reason == nil && lastUseful.map { now - $0 <= Self.staleAfter } == true
         if usefulNow { warned = nil; return actions }
         // Nothing useful is arriving (dead/silent carrier, or still waiting for a first buffer).
-        let deadline = (lastUseful ?? boundary) + Self.failAfter
-        let shown = reason ?? (lastUseful == nil && now - boundary > Self.builtinGrace ? .noInput : nil)
+        let deadline = (lastUseful ?? firstInputSince) + Self.failAfter
+        let shown = reason ?? (lastUseful == nil && now - firstInputSince > Self.builtinGrace ? .noInput : nil)
         if let shown, warned == nil {
             warned = shown
             actions.append(.warn(shown))
