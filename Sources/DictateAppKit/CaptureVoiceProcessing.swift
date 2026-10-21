@@ -18,6 +18,16 @@ enum CaptureVoiceProcessing {
     enum State: String { case off, on, unavailable, fallback }
     struct Refusal: Error { let reason: String }
 
+    /// Best effort: release VPIO's aggregate before the engine is discarded, even on refusal.
+    static func disableBeforeTeardown(_ disable: () throws -> Void, note: (String) -> Void) {
+        do {
+            try captureObjC(disable)
+            note("vp_disabled_before_teardown=1")
+        } catch {
+            note("vp_disable_error=\((error as NSError).code)")
+        }
+    }
+
     /// A refusal discards the entire possibly-mutated VPIO graph before a
     /// fresh legacy graph is started. There is no toggle-back on a poisoned
     /// unit, and errors starting the fallback still propagate to the host.
@@ -74,7 +84,12 @@ enum CaptureVoiceProcessing {
                               note: (String) -> Void, stateChanged: (State) -> Void = { _ in }) throws -> State {
         stateChanged(.fallback)
         note("voice_processing=fallback reason=\(reason)")
-        try make(.halout).start()
+        do { try make(.halout).start() }
+        catch {
+            let errorCode = (error as NSError).code
+            note("voice_processing=fallback_failed reason=select_err=\(errorCode)")
+            throw error
+        }
         return .fallback
     }
 }
