@@ -1081,6 +1081,17 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private var voiceProcessingEngine = false
+    var fallbackBuiltInSelector = CaptureBuiltInSelector()
+
+    private func selectPlainBuiltIn() throws {
+        if lock.withLock({ stats.voiceProcessing == "fallback" }) {
+            try fallbackBuiltInSelector.run(select: {
+                try captureObjC { try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode) }
+            }, note: { AppController.note($0) })
+        } else {
+            try AudioDevices.selectBuiltIn(on: requireEngine().inputNode)
+        }
+    }
 
     private func installTapAndStart() throws {
         // A configuration notification must not re-enable the graph this capture rejected.
@@ -1134,7 +1145,7 @@ public final class AudioRecorder: CaptureEngine {
             if self.lock.withLock({ self.engine == nil }) {
                 try self.rebuild()
                 if self.selectedDevice == .builtIn {
-                    try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
+                    try self.selectPlainBuiltIn()
                 }
             }
             try self.installLegacyTapAndStart()
@@ -1155,7 +1166,7 @@ public final class AudioRecorder: CaptureEngine {
                 try ioOp(.align) { try AudioDevices.alignClientFormat(on: requireEngine().inputNode) }
             }, rebuild: {
                 try rebuild()
-                if selectedDevice == .builtIn { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) }
+                if selectedDevice == .builtIn { try selectPlainBuiltIn() }
             })
             let input = try requireEngine().inputNode
             let hardware = input.inputFormat(forBus: 0)
