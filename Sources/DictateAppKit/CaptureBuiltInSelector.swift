@@ -1,5 +1,6 @@
 import Foundation
 import CoreAudio
+import DictateCore
 
 /// Device-selection boundary shared by the fallback engine and hardware-free fixtures.
 struct CaptureBuiltInSelector {
@@ -15,6 +16,8 @@ struct CaptureBuiltInSelector {
     final class Budget {
         var attempts = 0
         var retries = 0
+        var formatRetries = 0
+        var requiresExplicitSelection = false
         var lastError: Error?
     }
 
@@ -26,7 +29,7 @@ struct CaptureBuiltInSelector {
             do {
                 // A fresh engine may still expose 0 Hz / 0 ch after VPIO teardown,
                 // even when the system default already names the built-in device.
-                if try defaultIsBuiltIn(), try hardwareFormatValid() {
+                if !budget.requiresExplicitSelection, try defaultIsBuiltIn(), try hardwareFormatValid() {
                     note("builtin_select=skipped_default")
                     return
                 }
@@ -42,6 +45,33 @@ struct CaptureBuiltInSelector {
             }
         }
         throw budget.lastError ?? NSError(domain: "CaptureBuiltInSelector", code: 1)
+    }
+
+    /// Only fallback starts treat a zero hardware format as transient. Selection,
+    /// format waits and TapFormatPlan rebuilds all consume the same bounded budget.
+    func startFallback(budget: Budget = Budget(), hardwareFormatValid: () throws -> Bool,
+                       select: () throws -> Void, rebuild: () throws -> Void,
+                       start: () throws -> Void, note: (String) -> Void) throws {
+        while true {
+            try run(budget: budget, hardwareFormatValid: hardwareFormatValid, select: select, note: note)
+            do { try start(); return }
+            catch {
+                guard Self.isFormatNotReady(error) else { throw error }
+                budget.lastError = error
+                guard budget.attempts < 10, budget.retries < 9 else { throw error }
+                budget.retries += 1
+                budget.formatRetries += 1
+                budget.requiresExplicitSelection = true
+                note("builtin_format_retry=\(budget.formatRetries)")
+                sleep(0.15)
+                try rebuild()
+            }
+        }
+    }
+
+    static func isFormatNotReady(_ error: Error) -> Bool {
+        guard let mismatch = error as? TapFormatPlan.Mismatch else { return false }
+        return !mismatch.hardware.isValid
     }
 
     static func isHardwareError(_ error: Error) -> Bool {

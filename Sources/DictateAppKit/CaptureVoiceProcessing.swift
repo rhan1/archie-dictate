@@ -86,8 +86,9 @@ enum CaptureVoiceProcessing {
         note("voice_processing=fallback reason=\(reason)")
         do { try make(.halout).start() }
         catch {
-            let errorCode = (error as NSError).code
-            note("voice_processing=fallback_failed reason=select_err=\(errorCode)")
+            let reason = CaptureBuiltInSelector.isFormatNotReady(error)
+                ? "format_not_ready" : "select_err=\((error as NSError).code)"
+            note("voice_processing=fallback_failed reason=\(reason)")
             throw error
         }
         return .fallback

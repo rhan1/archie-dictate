@@ -18,6 +18,10 @@ struct H2FallbackStartTests {
         var failures = 1
         var defaultBuiltIn = false
         var hardwareReady = true
+        var readyAfterSelect = false
+        var formatReadFailures = 0
+        var formatReads = 0
+        var rebuilds = 0
         var channels: AVAudioChannelCount = 9
         var status = kAudioHardwareBadDeviceError
         var disableFails = false
@@ -50,11 +54,10 @@ struct H2FallbackStartTests {
             return CaptureInputUnit(start: {
                 if mode == .halout, self.vpAllocated { self.disposeVP() }
                 if mode == .halout, self.recorder.stats.voiceProcessing == "fallback" {
-                    try self.selector.run(hardwareFormatValid: { self.hardwareReady }, select: {
-                        self.selects += 1
-                        if self.selects <= self.failures {
-                            throw NSError(domain: NSOSStatusErrorDomain, code: Int(self.status))
-                        }
+                    try self.selector.startFallback(hardwareFormatValid: { self.hardwareReady }, select: {
+                        try self.selectBuiltIn()
+                    }, rebuild: { self.rebuilds += 1 }, start: {
+                        try self.checkFormat()
                     }, note: { self.notes.append($0) })
                 }
                 self.recorder.offlineInputStarted {
@@ -63,6 +66,20 @@ struct H2FallbackStartTests {
                 }
             }, dispose: { self.disposeVP() }, configure: { _ in self.vpAllocated = true },
                 hardwareChannels: { self.channels })
+        }
+        func selectBuiltIn() throws {
+            selects += 1
+            if selects <= failures {
+                throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+            }
+            if readyAfterSelect { hardwareReady = true }
+        }
+        func checkFormat() throws {
+            formatReads += 1
+            if !hardwareReady || formatReads <= formatReadFailures {
+                throw TapFormatPlan.Mismatch(hardware: .init(sampleRate: 0, channels: 0),
+                                             output: .init(sampleRate: 44_100, channels: 2))
+            }
         }
         func disposeVP() {
             if !selector.legacySingleAttempt {
@@ -140,12 +157,44 @@ struct H2FallbackStartTests {
         let f = Fixture()
         f.defaultBuiltIn = true
         f.hardwareReady = false
+        f.readyAfterSelect = true
         f.failures = 0
         try f.start()
         f.deliver()
         let captured = f.finish()
         try #require(f.selects == 1 && f.starts == 1 && captured.count == 2_400)
         try #require(!f.notes.contains("builtin_select=skipped_default"))
+    }
+
+    @Test func formatRecoveryRebuildsAndExplicitlySelectsWithinSharedBudget() throws {
+        let f = Fixture()
+        f.defaultBuiltIn = true
+        f.failures = 0
+        f.formatReadFailures = 2
+        try f.start()
+        f.deliver()
+        try f.requireHealthy()
+        let captured = f.finish()
+        try #require(f.formatReads == 3 && f.rebuilds == 2 && f.selects == 2)
+        try #require(f.waits == [0.15, 0.15] && captured.count == 2_400)
+        try #require(f.notes.contains("builtin_format_retry=1") && f.notes.contains("builtin_format_retry=2"))
+        try #require(f.recorder.stats.builtinFramesAfterFallback == 2_400)
+    }
+
+    @Test func formatNeverReadyFailsWithinTheSameBudget() throws {
+        let f = Fixture()
+        f.defaultBuiltIn = true
+        f.hardwareReady = false
+        f.failures = 0
+        var caught: Error?
+        do { try f.start() } catch { caught = error }
+        try #require(caught.map(CaptureBuiltInSelector.isFormatNotReady) == true)
+        try #require(f.selects == 10 && f.formatReads == 10 && f.rebuilds == 9)
+        try #require(f.waits.count == 9 && f.clock.now <= 1.5 && abs(f.clock.now - 1.35) < 0.000001)
+        try #require(f.starts == 0 && f.frames == 0)
+        try #require(f.notes.contains("voice_processing=fallback_failed reason=format_not_ready"))
+        try #require(f.healthDuringWait.allSatisfy { $0.warn == nil && $0.failure == nil })
+        try #require(f.finish().isEmpty && f.recorder.currentLease == nil)
     }
 
     @Test func persistentSelectionFailsWithinBoundAndReportsFallbackFailure() throws {
