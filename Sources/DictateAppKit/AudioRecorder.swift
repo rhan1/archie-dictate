@@ -161,6 +161,8 @@ public final class AudioRecorder: CaptureEngine {
     // v1.8 L2: the health clock (never driven by tap callbacks).
     private let healthQueue = DispatchQueue(label: "dictate.capture.health")
     private var healthTimer: DispatchSourceTimer?
+    // H1: one same-session VP → plain replacement; health pauses while it is on the executor.
+    private var voiceProcessingFallbackPending = false
     // v1.8 L3: one recovery episode per dictation, across engine replacements (state under `lock`).
     private var episode = BluetoothRecoveryEpisode(bluetooth: false)
     /// v1.10 (L1): this dictation's engine operations and the hands-off window (state under `lock`).
@@ -602,6 +604,11 @@ public final class AudioRecorder: CaptureEngine {
         let (epoch, bluetooth, builtinCarries) = lock.withLock {
             (engineEpoch, bridgeConfigured && episode.bluetooth, feed.health.status(.builtin, at: now) == .healthy)
         }
+        // H1: health owns the first-buffer deadline for VP and its plain fallback. The
+        // lifecycle must not stop the session or acquire a new lease at its 3 s deadline.
+        if path == .firstBuffer, lock.withLock({
+            stats.voiceProcessing == "on" || stats.voiceProcessing == "fallback" || voiceProcessingFallbackPending
+        }) { return .skip }
         guard bluetooth else { return .proceed(after: 0) }
         // BT1: the default input left the headset and the built-in carries: nothing re-opens the old device.
         if lock.withLock({ inputMoved }) { return .skip }
@@ -1076,55 +1083,62 @@ public final class AudioRecorder: CaptureEngine {
     private var voiceProcessingEngine = false
 
     private func installTapAndStart() throws {
-        var discarded = false
-        try startCaptureInput { mode in
-            if mode == .vpio {
-                return CaptureInputUnit(start: {
-                    // VPIO owns its rate/layout. A nil tap accepts its output;
-                    // consume converts every buffer to 24 kHz mono as before.
-                    do { try self.installConvertingTapAndStart() }
-                    catch { throw CaptureVoiceProcessing.Refusal(reason: "start_refused") }
-                }, dispose: {
-                    self.teardownEngine()
-                    discarded = true
-                }, configure: { ducking in
-                    do {
-                        try captureObjC {
-                            let input = try self.requireEngine().inputNode
-                            if !input.isVoiceProcessingEnabled { try input.setVoiceProcessingEnabled(true) }
-                            guard input.isVoiceProcessingEnabled else {
-                                throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
-                            }
-                            self.voiceProcessingEngine = true
-                        }
-                    } catch {
-                        throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
-                    }
-                    do {
-                        try captureObjC {
-                            let input = try self.requireEngine().inputNode
-                            input.voiceProcessingOtherAudioDuckingConfiguration = ducking
-                            let actual = input.voiceProcessingOtherAudioDuckingConfiguration
-                            guard !actual.enableAdvancedDucking.boolValue, actual.duckingLevel == .min else {
-                                throw CaptureVoiceProcessing.Refusal(reason: "ducking_refused")
-                            }
-                        }
-                    } catch {
-                        throw CaptureVoiceProcessing.Refusal(reason: "ducking_refused")
-                    }
-                })
-            }
-            return CaptureInputUnit(start: {
-                if self.voiceProcessingEngine { self.teardownEngine(); discarded = true }
-                if discarded {
-                    try self.rebuild()
-                    if self.selectedDevice == .builtIn {
-                        try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
-                    }
-                }
-                try self.installLegacyTapAndStart()
-            }, dispose: {})
+        // A configuration notification must not re-enable the graph this capture rejected.
+        if lock.withLock({ stats.voiceProcessing == "fallback" }) {
+            try makeCaptureInputUnit(.halout).start()
+        } else {
+            try startCaptureInput(make: makeCaptureInputUnit)
         }
+    }
+
+    private func makeCaptureInputUnit(_ mode: CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit {
+        if mode == .vpio {
+            return CaptureInputUnit(start: {
+                // VPIO owns its rate/layout. A nil tap accepts its output;
+                // consume converts every buffer to 24 kHz mono as before.
+                do { try self.installConvertingTapAndStart() }
+                catch { throw CaptureVoiceProcessing.Refusal(reason: "start_refused") }
+            }, dispose: {
+                self.teardownEngine()
+            }, configure: { ducking in
+                do {
+                    try captureObjC {
+                        let input = try self.requireEngine().inputNode
+                        if !input.isVoiceProcessingEnabled { try input.setVoiceProcessingEnabled(true) }
+                        guard input.isVoiceProcessingEnabled else {
+                            throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
+                        }
+                        self.voiceProcessingEngine = true
+                    }
+                } catch {
+                    throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
+                }
+                do {
+                    try captureObjC {
+                        let input = try self.requireEngine().inputNode
+                        input.voiceProcessingOtherAudioDuckingConfiguration = ducking
+                        let actual = input.voiceProcessingOtherAudioDuckingConfiguration
+                        guard !actual.enableAdvancedDucking.boolValue, actual.duckingLevel == .min else {
+                            throw CaptureVoiceProcessing.Refusal(reason: "ducking_refused")
+                        }
+                    }
+                } catch {
+                    throw CaptureVoiceProcessing.Refusal(reason: "ducking_refused")
+                }
+            }, hardwareChannels: {
+                try captureObjC { try self.requireEngine().inputNode.inputFormat(forBus: 0).channelCount }
+            })
+        }
+        return CaptureInputUnit(start: {
+            if self.voiceProcessingEngine { self.teardownEngine() }
+            if self.lock.withLock({ self.engine == nil }) {
+                try self.rebuild()
+                if self.selectedDevice == .builtIn {
+                    try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode)
+                }
+            }
+            try self.installLegacyTapAndStart()
+        }, dispose: {})
     }
 
     private func installLegacyTapAndStart() throws {
@@ -1426,7 +1440,7 @@ public final class AudioRecorder: CaptureEngine {
             feed.deviceProblem(.builtin, .drift)
             driftNote = check.note
         }
-        let out = feed.tick(at: now)
+        let (out, fallback) = inputHealthTickLocked(at: now)
         for note in out.notes {
             if note.hasPrefix("bridge_switch=headset") { instrumentation.takeover(at: now) }
             if note.hasPrefix("bridge_switchback=") { instrumentation.fallback(at: now) }
@@ -1441,6 +1455,21 @@ public final class AudioRecorder: CaptureEngine {
         if let driftNote { AppController.note(driftNote) }
         out.notes.forEach { AppController.note($0) }
         if let (unit, queue) = deadUnit { stopBuiltinUnit(unit, queue: queue, epoch: epoch) }
+        if fallback {
+            onExecutor { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.recoverVoiceProcessingInput(epoch: epoch,
+                        now: { ProcessInfo.processInfo.systemUptime }, make: self.makeCaptureInputUnit)
+                } catch {
+                    self.teardownEngine()
+                    self.lock.withLock {
+                        if self.engineEpoch === epoch { self.voiceProcessingFallbackPending = false }
+                    }
+                    self.reportEngineFailure(epoch: epoch)
+                }
+            }
+        }
         if obligationDue { onExecutor { [weak self] in self?.obligationReattach(epoch: epoch) } }
         if escalate {
             // v1.12 (L2): the obligation's re-attach brought no IO — one restart through the episode.
@@ -1455,12 +1484,78 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
+    /// Called under the recorder lock by both the independent health clock and offline fixtures.
+    private func inputHealthTickLocked(at now: TimeInterval) -> (CaptureFeed.TickOutput, Bool) {
+        if voiceProcessingFallbackPending { return (CaptureFeed.TickOutput(), false) }
+        if CaptureVoiceProcessing.firstBufferExpired(
+            state: CaptureVoiceProcessing.State(rawValue: stats.voiceProcessing) ?? .off,
+            receivedBuffer: stats.firstBufferMs != nil, health: feed.health, at: now) {
+            voiceProcessingFallbackPending = true
+            // Reject late callbacks from the graph we just decided to discard.
+            tapEpoch = CaptureEpoch()
+            return (CaptureFeed.TickOutput(), true)
+        }
+        return (feed.tick(at: now), false)
+    }
+
+    /// Runs on the engine executor, with the same epoch, lease and accumulated PCM.
+    private func recoverVoiceProcessingInput(epoch: CaptureEpoch, now: () -> TimeInterval,
+        make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit) throws {
+        guard lock.withLock({ engineEpoch === epoch && voiceProcessingFallbackPending }) else { return }
+        _ = try CaptureVoiceProcessing.startFallback(reason: "no_input", make: make,
+            note: { AppController.note($0) }, stateChanged: { state in
+                self.lock.withLock { if self.engineEpoch === epoch { self.stats.voiceProcessing = state.rawValue } }
+            })
+        let resumed = lock.withLock {
+            guard engineEpoch === epoch else { return false }
+            feed.restartInputHealth(at: now())
+            voiceProcessingFallbackPending = false
+            captureRunning = true
+            return true
+        }
+        if resumed { recording = true }
+        else { teardownEngine() }
+    }
+
+    /// Hardware-free fixture boundary: the real input policy, lease, feed and health path.
+    /// No timer or AVAudioEngine is allocated; the test drives ticks and supplies units.
+    func offlineStartInput(at time: TimeInterval,
+        make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit) throws {
+        let epoch = lock.withLock { engineEpoch }
+        try holdLease(epoch: epoch, wait: 0)
+        lock.withLock {
+            feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: epoch)
+            feed.sourceStarted(.headset, at: time)
+            captureBoundary = time
+            _ = feed.recordingStarted(at: time)
+        }
+        try startCaptureInput(make: make)
+        lock.withLock { captureRunning = true }
+    }
+
+    func offlineInputHealthTick(at time: TimeInterval,
+        make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit) throws -> CaptureFeed.TickOutput {
+        let (epoch, evaluation) = lock.withLock { (engineEpoch, inputHealthTickLocked(at: time)) }
+        if evaluation.1 { try recoverVoiceProcessingInput(epoch: epoch, now: { time }, make: make) }
+        return evaluation.0
+    }
+
+    func offlineInputFrames(_ frames: [Float], at time: TimeInterval) -> [Float] {
+        lock.withLock {
+            if !frames.isEmpty, stats.firstBufferMs == nil { stats.firstBufferMs = 0 }
+            let out = feed.accept(frames, source: .headset, at: time, arrivedAt: time, epoch: engineEpoch)
+            deliverLocked(out.frames)
+            return out.frames
+        }
+    }
+
     @discardableResult public func stop() -> [Float] {
         // Invalidates a queued/in-flight start without waiting for AVAudioEngine.
         lock.lock()
         let now = ProcessInfo.processInfo.systemUptime
         let stoppedEpoch = engineEpoch
         engineEpoch = CaptureEpoch()
+        voiceProcessingFallbackPending = false
         verifying = nil
         lifecycleAttemptPending = false
         tapEpoch = CaptureEpoch()

@@ -135,6 +135,7 @@ public struct CaptureFeed {
         public var stopBuiltin = false
         public var warn: CaptureHealth.Reason?
         public var failure: CaptureFailure?
+        public init() {}
     }
     public private(set) var bridge = CaptureBridge()
     public private(set) var ring: CaptureRing
@@ -182,6 +183,9 @@ public struct CaptureFeed {
     public mutating func sourceStarted(_ source: CaptureBridge.Source, at time: TimeInterval) {
         health.sourceStarted(source, at: time)
     }
+    /// A silent VP graph was discarded. Give plain input its own first-buffer window,
+    /// preserving the recording boundary, bridge, evidence, timeline and captured frames.
+    public mutating func restartInputHealth(at time: TimeInterval) { health.restartInput(at: time) }
     /// The device read-back or listener found a problem with a source.
     public mutating func deviceProblem(_ source: CaptureBridge.Source, _ problem: CaptureHealth.Problem) {
         health.deviceProblem(source, problem)
