@@ -1,6 +1,6 @@
 # H1 voice processing fallback
 
-NOT-DONE — deliverable 1/3: offline reproduction in progress.
+DONE — 3/3 deliverables. Implementation 39bb265; historical reproduction 7314b1b. Final required filtered run: 89 tests in 6 suites passed after 1.438 seconds.
 
 Scope: wt/dictate-v20 at 1e1c687. Three deliverables: offline reproduction; fallback implementation and controls; final filtered verification. No hardware, devices, live apps, other worktrees, external dispatch, or home-path writes.
 
@@ -20,4 +20,23 @@ DONE — deliverable 2/3: fallback implementation and required controls.
 - Verification: leased test --filter 'H1VoiceProcessingFallbackTests|C1VoiceProcessingTests|CaptureHealth|InjectedHealth|CaptureLifecycle': 77 tests in 5 suites passed after 0.259 seconds. git diff --check passed.
 - First build caught missing public TickOutput initializer; fixed before passing verification. No devices, live apps, or real home paths used by fixtures.
 
-NOT-DONE — deliverable 3/3: final required filtered run (including WAVInjected), merge-base diff review and cleanup/status receipts.
+DONE — deliverable 3/3: final required filtered run, merge-base diff review and cleanup/status receipts.
+- Ran once after implementation commit: `/Users/razakhan/.claude/handoffs/archie-v58-work/swift-lease.sh test --filter 'H1VoiceProcessingFallbackTests|C1VoiceProcessingTests|CaptureHealth|InjectedHealth|CaptureLifecycle|WAVInjected' 2>&1 | tail -40`.
+- Literal final summary: `Test run with 89 tests in 6 suites passed after 1.438 seconds.` Exact tail is in `handoffs/h1-filtered-test-tail.txt`.
+- Compared all changes to 1e1c687 and ran git diff --check. Branch remained wt/dictate-v20; main stayed at 1e1c687. No new worktree or task scratch directory created. Existing test temporary directories use defer cleanup. Mechanical git worktree list showed only original main and this requested worktree. du -sh: .build 576M (ignored reusable build output), handoffs 4.0K before final receipts.
+- No push, tag, live-app changes, browser, network/server checks, delegation, audio engine instantiation in new tests, device access, recording or playback. New timeout tests use a virtual clock only.
+
+Receipts (printed literally by tests):
+```
+H1 RED vp_requested=1 hw_channels=9 buffers=0 outcome=mic_dead
+H1 GREEN vp_requested=1 hw_channels=9 fallback=multichannel_input buffers>0 outcome=ok
+H1 GREEN vp_requested=1 hw_channels=1 no_buffer_window_elapsed=1 fallback=no_input buffers>0 outcome=ok
+H1 CONTROL vp_requested=1 hw_channels=1 buffers>0 fallback=none voice_processing=on
+H1 CONTROL bluetooth_route voice_processing=unavailable unchanged=1
+H1 CONTROL dictation vp_requested=0
+H1 CONTROL plain_capture_also_silent outcome=mic_dead
+```
+
+Hypothesis: PARTIALLY CONFIRMED.
+RED proves that an enabled 48 kHz/9-channel VP fixture supplying zero buffers is accepted as on and reaches no_input → mic_dead through real policy/health/lifecycle seams.
+It does not prove that the macOS aggregate format caused the live callback starvation; hardware investigation was expressly excluded.
