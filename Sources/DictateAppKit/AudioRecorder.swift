@@ -1097,7 +1097,12 @@ public final class AudioRecorder: CaptureEngine {
 
     private func selectPlainBuiltIn(budget: CaptureBuiltInSelector.Budget?) throws {
         if let budget {
-            try fallbackBuiltInSelector.run(budget: budget, select: {
+            try fallbackBuiltInSelector.run(budget: budget, hardwareFormatValid: {
+                try captureObjC {
+                    let hardware = try self.requireEngine().inputNode.inputFormat(forBus: 0)
+                    return hardware.sampleRate > 0 && hardware.channelCount > 0
+                }
+            }, select: {
                 try captureObjC { try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode) }
             }, note: { AppController.note($0) })
         } else {

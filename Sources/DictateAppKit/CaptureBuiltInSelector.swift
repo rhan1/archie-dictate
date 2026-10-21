@@ -18,12 +18,15 @@ struct CaptureBuiltInSelector {
         var lastError: Error?
     }
 
-    func run(budget: Budget = Budget(), select: () throws -> Void, note: (String) -> Void) throws {
+    func run(budget: Budget = Budget(), hardwareFormatValid: () throws -> Bool = { false },
+             select: () throws -> Void, note: (String) -> Void) throws {
         if legacySingleAttempt { return try select() }
         while budget.attempts < 10 {
             budget.attempts += 1
             do {
-                if try defaultIsBuiltIn() {
+                // A fresh engine may still expose 0 Hz / 0 ch after VPIO teardown,
+                // even when the system default already names the built-in device.
+                if try defaultIsBuiltIn(), try hardwareFormatValid() {
                     note("builtin_select=skipped_default")
                     return
                 }

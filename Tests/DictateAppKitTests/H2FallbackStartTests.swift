@@ -17,6 +17,7 @@ struct H2FallbackStartTests {
         var frames = 0
         var failures = 1
         var defaultBuiltIn = false
+        var hardwareReady = true
         var channels: AVAudioChannelCount = 9
         var status = kAudioHardwareBadDeviceError
         var disableFails = false
@@ -49,7 +50,7 @@ struct H2FallbackStartTests {
             return CaptureInputUnit(start: {
                 if mode == .halout, self.vpAllocated { self.disposeVP() }
                 if mode == .halout, self.recorder.stats.voiceProcessing == "fallback" {
-                    try self.selector.run(select: {
+                    try self.selector.run(hardwareFormatValid: { self.hardwareReady }, select: {
                         self.selects += 1
                         if self.selects <= self.failures {
                             throw NSError(domain: NSOSStatusErrorDomain, code: Int(self.status))
@@ -133,6 +134,18 @@ struct H2FallbackStartTests {
         try #require(f.notes.contains("builtin_select=skipped_default"))
         try #require(f.recorder.stats.builtinFramesAfterFallback == 2_400)
         print("H2 GREEN fallback=multichannel_input select=skipped_default frames>0 outcome=ok")
+    }
+
+    @Test func defaultBuiltInWithInvalidFormatRequiresExplicitSelect() throws {
+        let f = Fixture()
+        f.defaultBuiltIn = true
+        f.hardwareReady = false
+        f.failures = 0
+        try f.start()
+        f.deliver()
+        let captured = f.finish()
+        try #require(f.selects == 1 && f.starts == 1 && captured.count == 2_400)
+        try #require(!f.notes.contains("builtin_select=skipped_default"))
     }
 
     @Test func persistentSelectionFailsWithinBoundAndReportsFallbackFailure() throws {
