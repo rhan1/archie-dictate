@@ -61,6 +61,7 @@ public enum TapFormatPlan {
     public struct Mismatch: Error, Equatable, CustomStringConvertible, LocalizedError {
         public let hardware: Format
         public let output: Format
+        public init(hardware: Format, output: Format) { self.hardware = hardware; self.output = output }
         public var description: String { "format_mismatch hw=\(hardware) out=\(output)" }
         public var errorDescription: String? { description }
     }

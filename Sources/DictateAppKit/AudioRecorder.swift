@@ -1095,16 +1095,21 @@ public final class AudioRecorder: CaptureEngine {
     private var voiceProcessingEngine = false
     var fallbackBuiltInSelector = CaptureBuiltInSelector()
 
+    private func builtInHardwareFormatValid() throws -> Bool {
+        try captureObjC {
+            let hardware = try requireEngine().inputNode.inputFormat(forBus: 0)
+            return hardware.sampleRate > 0 && hardware.channelCount > 0
+        }
+    }
+
+    private func explicitlySelectBuiltIn() throws {
+        try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) }
+    }
+
     private func selectPlainBuiltIn(budget: CaptureBuiltInSelector.Budget?) throws {
         if let budget {
-            try fallbackBuiltInSelector.run(budget: budget, hardwareFormatValid: {
-                try captureObjC {
-                    let hardware = try self.requireEngine().inputNode.inputFormat(forBus: 0)
-                    return hardware.sampleRate > 0 && hardware.channelCount > 0
-                }
-            }, select: {
-                try captureObjC { try AudioDevices.selectBuiltIn(on: self.requireEngine().inputNode) }
-            }, note: { AppController.note($0) })
+            try fallbackBuiltInSelector.run(budget: budget, hardwareFormatValid: builtInHardwareFormatValid,
+                select: explicitlySelectBuiltIn, note: { AppController.note($0) })
         } else {
             try AudioDevices.selectBuiltIn(on: requireEngine().inputNode)
         }
@@ -1164,9 +1169,16 @@ public final class AudioRecorder: CaptureEngine {
             if self.voiceProcessingEngine { self.teardownEngine() }
             if self.lock.withLock({ self.engine == nil }) {
                 try self.rebuild()
-                if fallback || self.selectedDevice == .builtIn {
+                if !fallback, self.selectedDevice == .builtIn {
                     try self.selectPlainBuiltIn(budget: budget)
                 }
+            }
+            if let budget {
+                return try self.fallbackBuiltInSelector.startFallback(budget: budget,
+                    hardwareFormatValid: self.builtInHardwareFormatValid,
+                    select: self.explicitlySelectBuiltIn, rebuild: self.rebuild,
+                    start: { try self.installLegacyTapAndStart(fallbackBudget: budget) },
+                    note: { AppController.note($0) })
             }
             try self.installLegacyTapAndStart(fallbackBudget: budget)
         }, dispose: {})
@@ -1180,8 +1192,12 @@ public final class AudioRecorder: CaptureEngine {
             let plan = try TapFormatPlan.run(device: selectedDevice, formats: {
                 let input = try requireEngine().inputNode
                 let hardware = input.inputFormat(forBus: 0), output = input.outputFormat(forBus: 0)
-                return (TapFormatPlan.Format(sampleRate: hardware.sampleRate, channels: hardware.channelCount),
-                        TapFormatPlan.Format(sampleRate: output.sampleRate, channels: output.channelCount))
+                let hw = TapFormatPlan.Format(sampleRate: hardware.sampleRate, channels: hardware.channelCount)
+                let out = TapFormatPlan.Format(sampleRate: output.sampleRate, channels: output.channelCount)
+                // The fallback owns the wait/rebuild/select budget. Do not let the
+                // ordinary format plan rebuild immediately into another unbound node.
+                if fallbackBudget != nil, !hw.isValid { throw TapFormatPlan.Mismatch(hardware: hw, output: out) }
+                return (hw, out)
             }, align: {
                 try ioOp(.align) { try AudioDevices.alignClientFormat(on: requireEngine().inputNode) }
             }, rebuild: {
