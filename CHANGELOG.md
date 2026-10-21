@@ -43,3 +43,6 @@
 - Personal dictionary: 20 s after a confirmed insertion, a word corrected in the same field is added to `~/.claude/dictate/keyterms.txt` (read-only check; skipped when the app, field or surrounding text changed). Streaming uses the newest 50 terms.
 - A change of the default input device during dictation hands over to the built-in microphone instead of staying on the old headset.
 - Bench: `stt-deepgram` mode and a word-error-rate scorer (`wer`).
+
+## v1.20 — 2026-10-21
+- Echo cancellation falls back instead of failing. Raza (18:5x, on Archie 57.0): "I just tried talking to Archie, the visualization flashed, and it did absolutely nothing." When a host conversation asks for echo cancellation on the built-in microphone and enabling it yields a multi-channel input (more than 2 channels, e.g. the aggregate macOS builds with monitor/camera microphones present), capture switches to the plain microphone before starting (`voice_processing=fallback reason=multichannel_input`); if echo cancellation starts but delivers no audio within the health window, the same capture is rebuilt on the plain microphone (`voice_processing=fallback reason=no_input`). `mic_dead` only when the plain microphone is silent too. Bluetooth routes and dictation are unchanged.
