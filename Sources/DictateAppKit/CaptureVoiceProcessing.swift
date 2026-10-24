@@ -88,7 +88,9 @@ enum CaptureVoiceProcessing {
         catch {
             let reason = CaptureBuiltInSelector.isFormatNotReady(error)
                 ? "format_not_ready" : "select_err=\((error as NSError).code)"
+            let native = error as NSError
             note("voice_processing=fallback_failed reason=\(reason)")
+            note("voice_processing=fallback_error domain=\(native.domain) code=\(native.code) phase=plain_start")
             throw error
         }
         return .fallback
