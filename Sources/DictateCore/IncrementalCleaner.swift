@@ -64,6 +64,8 @@ public final class IncrementalCleaner: @unchecked Sendable {
         self.quotaProvider = quotaProvider ?? { GroqQuota.current }
         self.clock = clock
     }
+    /// v1.27 (B3): each cleaner call's output text — set only with the opt-in transcript trace.
+    public var onCleaned: (@Sendable (String) -> Void)?
     public var needsFallback: Bool { lock.withLock { failed } }
     public var callCount: Int { lock.withLock { calls + singleCalls } }
     public var fallbackReason: String? { lock.withLock { failure } }
@@ -112,6 +114,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
         pending = Task.detached { [self] in
             do {
                 let output = try await cleaner.cleanIncrementalWithStats(text, context: context, final: false)
+                onCleaned?(output.text)
                 lock.withLock {
                     guard mine == epoch else { return }
                     if !cancelled {
@@ -193,6 +196,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
                 finalCleaner.includeExamples = false
                 lock.withLock { calls += 1 }
                 let (text, stats) = try await finalCleaner.cleanWithStats(fullText)
+                onCleaned?(text)
                 return snapshot(text: text, stats: stats, mode: "single", skipped: "tpm")
             } catch {
                 if let single {
@@ -287,6 +291,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
                 finalCleaner.includeExamples = false
                 lock.withLock { calls += 1 }
                 let (text, stats) = try await finalCleaner.cleanWithStats(fullText)
+                onCleaned?(text)
                 return snapshot(text: text, stats: stats, mode: "single", skipped: "tpm")
             } catch {
                 return snapshot(text: nil, stats: nil, mode: "single", skipped: "tpm")
@@ -309,6 +314,7 @@ public final class IncrementalCleaner: @unchecked Sendable {
             var finalCleaner = cleaner
             finalCleaner.includeExamples = finalIncludeExamples
             let output = try await finalCleaner.cleanIncrementalWithStats(text, context: context, final: true)
+            onCleaned?(output.text)
             return snapshot(text: lock.withLock { cancelled } ? nil : Self.join(prefix: context, tail: output.text), stats: output.stats)
         } catch {
             lock.withLock {

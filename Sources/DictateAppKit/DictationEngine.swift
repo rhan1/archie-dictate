@@ -115,6 +115,10 @@ public struct DictationTimeline: Sendable, Equatable {
     public func enableRig(launchEnvironment: [String: String], gesture: @escaping @MainActor (RigGesture) -> Void) -> Bool {
         controller.engineEnableRig(launchEnvironment: launchEnvironment) { g in MainActor.assumeIsolated { gesture(g) } }
     }
+    /// v1.27 (B3): the opt-in local transcript trace (`DictateTranscriptTrace`, read at each session start).
+    /// Hosts pass the preference through here, as they pass their launch environment to `enableRig`; without
+    /// this call the Dictate domain (`com.razakhan.dictate`) is read. Off unless that key is true.
+    public func transcriptTrace(defaults: UserDefaults?) { controller.transcriptTraceDefaults = defaults }
     public func pasteHeld() { controller.enginePasteHeld() }
     public func copyHeld() { controller.engineCopyHeld() }
 

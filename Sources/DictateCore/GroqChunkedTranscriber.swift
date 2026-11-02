@@ -171,6 +171,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var rejoins = 0
     private let onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)?
     private let onChunkText: (@Sendable (Int, String) -> Void)?
+    /// v1.27 (B3): (index, isFinal, prompt `full|none|skipped`, Whisper's raw text) — only with the opt-in trace.
+    private let onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)?
     private var chunker: PauseChunker
     private var tasks: [Task<Void, Never>] = []
     private var texts: [Int: String] = [:]
@@ -189,13 +191,15 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                             finalModel: String? = nil, rejoinGuard: Bool = false, lowSpeechGuard: Bool = false,
                             edgeGuard: Bool = true,
                             onChunkText: (@Sendable (Int, String) -> Void)? = nil,
+                            onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
                             onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
                             clock: any DictateClock = SystemClock()) {
         self.init(transport: transport, apiKey: apiKey, prompt: prompt, fillerLeadIn: fillerLeadIn, leadIn: leadIn,
                   firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds,
                   hedgeAfterMs: hedgeAfterMs, finalSplitSeconds: finalSplitSeconds, finalModel: finalModel,
                   rejoinGuard: rejoinGuard, lowSpeechGuard: lowSpeechGuard, edgeGuard: edgeGuard,
-                  scribeAPIKey: scribeAPIKey, onChunkText: onChunkText, onGroqRateLimit: onGroqRateLimit, clock: clock)
+                  scribeAPIKey: scribeAPIKey, onChunkText: onChunkText, onChunkTrace: onChunkTrace,
+                  onGroqRateLimit: onGroqRateLimit, clock: clock)
     }
 
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
@@ -205,6 +209,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 edgeGuard: Bool = true,
                 scribeAPIKey: (@Sendable () throws -> String)? = nil,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil,
+                onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
                 clock: any DictateClock = SystemClock()) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
@@ -224,6 +229,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         self.edgeGuard = edgeGuard
         self.onGroqRateLimit = onGroqRateLimit
         self.onChunkText = onChunkText
+        self.onChunkTrace = onChunkTrace
         chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
     }
 
@@ -252,6 +258,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         // v1.27 (B2): the tap's click alone is never sent (nothing is recorded for it: no windows, no text).
         if isFinal, atTap, Self.isClickOnly(windows, reference: referenceWindowsLocked + windows) {
             droppedClick += 1
+            onChunkTrace?(chunk.index, true, "skipped", "")
             return nil
         }
         if rejoinGuard { originalChunks[chunk.index] = chunk }
@@ -460,6 +467,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 return true
             }
             if accepted, let text = outcome.text {
+                onChunkTrace?(chunk.index, isFinal, emptyPrompt ? "none" : "full", text)
                 emitChunk(chunk, fallbackText: text)
                 return
             }
@@ -512,6 +520,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 return false
             }
             if accepted, let text = response.text {
+                onChunkTrace?(chunk.index, isFinal, "none", text)    // Scribe takes no prompt
                 emitChunk(chunk, fallbackText: text)
                 return
             }

@@ -29,6 +29,10 @@ actor WhisperPromptEchoStub: HTTPTransport {
         if seconds > 1.5 { text = "Please send the report." }
         else if loud >= 6 { text = "yes." }
         else { text = prompt.isEmpty ? "" : "Dictate." }
+        // C MISSING-EVENT (gate self-test): V127_MISSING_EVENT=b2 never answers the final chunk's request.
+        if ProcessInfo.processInfo.environment["V127_MISSING_EVENT"] == "b2", seconds < 3 {
+            try await Task.sleep(nanoseconds: 3_600 * 1_000_000_000)
+        }
         let data = try JSONSerialization.data(withJSONObject: ["text": text])
         return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:])!)
     }
@@ -89,13 +93,30 @@ struct V127FinishTapTests {
         }
     }
 
+    final class ResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: GroqChunkedTranscriber.Result?
+        func set(_ v: GroqChunkedTranscriber.Result) { lock.withLock { value = v } }
+        func get() -> GroqChunkedTranscriber.Result? { lock.withLock { value } }
+    }
+
     struct Run { let text: String; let sent: [WhisperPromptEchoStub.Sent]; let result: GroqChunkedTranscriber.Result }
 
     static func transcribe(_ pcm: [Int16]) async -> Run {
         let stub = WhisperPromptEchoStub()
         let transcriber = GroqChunkedTranscriber(transport: stub, apiKey: { "fixture" }, prompt: vocabulary)
         for start in stride(from: 0, to: pcm.count, by: 2_400) { transcriber.append(Array(pcm[start..<min(pcm.count, start + 2_400)])) }
-        let result = await transcriber.finish()
+        // Bounded: a result that never comes fails the gate with a literal message (≤ 15 s), never a hang.
+        let box = ResultBox()
+        Task.detached { box.set(await transcriber.finish()) }
+        let deadline = ContinuousClock.now + .seconds(15)
+        while box.get() == nil, ContinuousClock.now < deadline { try? await Task.sleep(nanoseconds: 5_000_000) }
+        guard let result = box.get() else {
+            Issue.record("missing event=result after 15s requests=\(await stub.sent.count)")
+            transcriber.cancel()
+            return Run(text: "<missing>", sent: await stub.sent, result: GroqChunkedTranscriber.Result(text: "", chunks: 0, rejoins: 0,
+                failedCount: 0, lastChunkMs: 0, sttMs: 0, calls: [], hedges: 0, hedgeWins: 0, rateLimits: nil))
+        }
         return Run(text: result.text, sent: await stub.sent, result: result)
     }
     static func promptKind(_ prompt: String) -> String {
