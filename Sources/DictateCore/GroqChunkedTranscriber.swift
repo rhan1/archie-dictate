@@ -4,6 +4,13 @@ import Foundation
 /// WAV is encoded in memory using the existing Core encoder. No file APIs.
 public final class GroqChunkedTranscriber: @unchecked Sendable {
     public static let fillerLeadIn = "Um, so, uh, like, Tuesday, no, Wednesday."
+    /// v1.27 (B2): a final chunk shorter than this is transcribed with an EMPTY prompt (no lead-in, no
+    /// vocabulary, no previous text): on the near-silence after the finish tap, Whisper answers with prompt
+    /// words ("Dictate.", 2026-11-03 03:13). Longer final chunks keep the full prompt.
+    public static let shortFinalSeconds = 1.5
+    /// v1.27 (B2): a final chunk whose only speech-like windows lie within this much of its end (the
+    /// finish tap: the key's press and release) is not sent at all (`stt_dropped_click_chunk`).
+    public static let clickWindowSeconds = 0.15
 
     /// A chunk that starts like this is probably the tail of a split "uh, the X".
     /// Keep this small list public so probe runs can tune it in one place.
@@ -74,6 +81,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public let hedgeFired: Bool
         /// 1 = primary, 2 = duplicate; nil when neither succeeded.
         public let winningRequest: Int?
+        /// v1.27 (B2): `full` (lead-in + vocabulary + previous text) or `none` (a short final chunk).
+        public var prompt: String = "full"
     }
     public struct Result: Sendable {
         public let text: String
@@ -101,6 +110,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public var droppedLoops: Int = 0
         public var scribeChunks: Int = 0
         public var scribeNoKey: Bool = false
+        /// v1.27 (B2): final chunks not sent because their only speech-like sound was the finish tap.
+        public var droppedClickChunks: Int = 0
 
         public init(text: String, chunks: Int, rejoins: Int, failedCount: Int, lastChunkMs: Int, sttMs: Int,
                     calls: [Call], hedges: Int, hedgeWins: Int, rateLimits: RateLimits?,
@@ -151,6 +162,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var loopEvents = 0
     private var scribeChunks = 0
     private var scribeNoKey = false
+    private var droppedClick = 0
     private var openingIndex: Int?
     private var openingDrops: [EdgeSentenceGuard.Drop] = []
     private var tailJudged = false
@@ -233,17 +245,35 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     }
 
     // Called with the lock held. Detached tasks never inherit the UI executor.
+    /// `atTap`: this final piece ends at the finish tap (the last piece `finish()` cut).
     @discardableResult
-    private func enqueue(_ chunk: PauseChunker.Chunk, isFinal: Bool = false) -> Task<Void, Never> {
-        if rejoinGuard { originalChunks[chunk.index] = chunk }
+    private func enqueue(_ chunk: PauseChunker.Chunk, isFinal: Bool = false, atTap: Bool = false) -> Task<Void, Never>? {
         let windows = LowSpeechSentenceGuard.windows(of: chunk.samples)
+        // v1.27 (B2): the tap's click alone is never sent (nothing is recorded for it: no windows, no text).
+        if isFinal, atTap, Self.isClickOnly(windows, reference: referenceWindowsLocked + windows) {
+            droppedClick += 1
+            return nil
+        }
+        if rejoinGuard { originalChunks[chunk.index] = chunk }
         windowsByIndex[chunk.index] = windows
         speechRatios[chunk.index] = windows.isEmpty ? 0 :
             Double(CaptureEvidence.speechWindows(windows).filter { $0 }.count) / Double(windows.count)
         let model = isFinal ? finalModel ?? client.modelName : client.modelName
-        let task = Task.detached { [self] in await upload(chunk, model: model, isFinal: isFinal) }
+        // v1.27 (B2): a short final chunk carries no prompt for Whisper to echo.
+        let emptyPrompt = isFinal && Self.seconds(chunk.samples.count) < Self.shortFinalSeconds
+        let task = Task.detached { [self] in await upload(chunk, model: model, isFinal: isFinal, emptyPrompt: emptyPrompt) }
         tasks.append(task)
         return task
+    }
+
+    /// v1.27 (B2): true when the chunk's speech-like windows (by the dictation's floor) all lie within its
+    /// last `clickWindowSeconds` — the key press/release of the finish tap. A chunk with no speech-like
+    /// window at all is not a click (it is sent; v1.11's silent-chunk guard judges its text).
+    public static func isClickOnly(_ windows: [Float], reference: [Float]) -> Bool {
+        let speech = CaptureEvidence.possibleSpeechWindows(windows, reference: reference)
+        guard let first = speech.firstIndex(of: true) else { return false }
+        let tail = Int((clickWindowSeconds * CaptureEvidence.rate / Double(CaptureEvidence.windowFrames)).rounded())
+        return first >= speech.count - tail
     }
 
     /// Windowed-sinc low-pass resampling: removes frequencies above 8 kHz
@@ -392,7 +422,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         onChunkText?(chunk.index, current)
     }
 
-    private func upload(_ chunk: PauseChunker.Chunk, model: String, isFinal: Bool) async {
+    private func upload(_ chunk: PauseChunker.Chunk, model: String, isFinal: Bool, emptyPrompt: Bool = false) async {
         let wav = WAVEncoder.encode(samples: Self.resampleTo16k(chunk.samples), sampleRate: 16_000)
         for attempt in 1...2 {
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
@@ -403,7 +433,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 do { key = try client.apiKey().trimmingCharacters(in: .whitespacesAndNewlines) }
                 catch { throw TranscriptionError.missingKey }
                 guard !key.isEmpty else { throw TranscriptionError.missingKey }
-                let prompt = lock.withLock {
+                let prompt = emptyPrompt ? "" : lock.withLock {
                     let tail = texts[chunk.index - 1].map { String($0.suffix(200)) } ?? ""
                     return (leadIn.isEmpty ? "" : leadIn + " ") + vocabulary +
                            (tail.isEmpty ? "" : " " + tail)
@@ -421,7 +451,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 guard !cancelled else { return false }
                 calls.append(Call(index: chunk.index, attempt: attempt, model: model, isFinal: isFinal, isRejoin: false, milliseconds: Self.ms(from: start),
                                   status: outcome.status, hedgeFired: outcome.hedgeFired,
-                                  winningRequest: outcome.winningRequest))
+                                  winningRequest: outcome.winningRequest, prompt: emptyPrompt ? "none" : "full"))
                 guard let text = outcome.text else { return false }
                 // M2: a Whisper repetition loop is collapsed or dropped before it is streamed or joined.
                 let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
@@ -496,7 +526,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 let final = chunker.finish(splitOver: finalSplitSeconds)
                 // Splitting must preserve even a tiny opening piece. Keep the
                 // existing 300 ms floor only for an unsplit final partial.
-                for chunk in final where final.count > 1 || chunk.samples.count >= 7_200 { enqueue(chunk, isFinal: true) }
+                let pieces = final.filter { final.count > 1 || $0.samples.count >= 7_200 }
+                for (offset, chunk) in pieces.enumerated() { enqueue(chunk, isFinal: true, atTap: offset == pieces.count - 1) }
             }
             return tasks
         }
@@ -530,6 +561,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedOpeningSentences: openingDrops.filter { $0 == .lowSpeech }.count,
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
                           droppedSilentChunks: droppedSilent).withLoops(loopEvents).withScribe(chunks: scribeChunks, noKey: scribeNoKey)
+                .withClickChunks(droppedClick)
         }
     }
 
@@ -696,6 +728,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 extension GroqChunkedTranscriber.Result {
     /// M2: the same result with the loop count set (keeps the long memberwise init unchanged).
     func withLoops(_ loops: Int) -> Self { var copy = self; copy.droppedLoops = loops; return copy }
+    func withClickChunks(_ count: Int) -> Self { var copy = self; copy.droppedClickChunks = count; return copy }
     func withScribe(chunks: Int, noKey: Bool) -> Self {
         var copy = self
         copy.scribeChunks = chunks
