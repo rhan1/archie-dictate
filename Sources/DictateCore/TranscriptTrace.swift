@@ -6,7 +6,8 @@ import Foundation
 /// `defaults write com.razakhan.dictate DictateTranscriptTrace -bool true` turns it on; it is read at each
 /// session start. When off, no `TranscriptTrace` exists, so nothing is created, formatted or written.
 /// When on: `~/Library/Logs/Dictate/trace/<session-id>.txt` (directory 0700, file 0600), one line per event:
-/// `chunk=<i> final=<0|1> prompt=<full|none|skipped> raw=<text>`, `cleaned=<text>`, `pasted=<text>`.
+/// `chunk=<i> final=<0|1> prompt=<full|none> raw=<text>`, `cleaned=<text>`, and `pasted=<text>` only when the
+/// paste/type (or a capture-only host's delivery) succeeded. The file is closed when the session ends.
 /// Nothing here is uploaded or sent anywhere.
 public final class TranscriptTrace: @unchecked Sendable {
     public static let domain = "com.razakhan.dictate"
@@ -42,6 +43,15 @@ public final class TranscriptTrace: @unchecked Sendable {
     }
 
     deinit { try? handle?.close() }
+
+    /// FR1-F: the session ended — the file is closed and later writes are ignored.
+    public func close() {
+        lock.withLock {
+            try? handle?.close()
+            handle = nil
+        }
+    }
+    public var isClosed: Bool { lock.withLock { handle == nil } }
 
     public func chunk(index: Int, final: Bool, prompt: String, raw: String) {
         write("chunk=\(index) final=\(final ? 1 : 0) prompt=\(prompt) raw=\(raw)")
