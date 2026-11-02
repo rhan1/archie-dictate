@@ -104,7 +104,7 @@ struct V127FinishTapTests {
     static func literal(_ name: String, _ run: Run) -> String {
         let finals = run.sent.sorted { $0.seconds > $1.seconds }.dropFirst().map { "final_s=\(String(format: "%.2f", $0.seconds)) prompt=\(promptKind($0.prompt))" }
         let r = run.result
-        return "\(name) text=\"\(run.text)\" requests=\(run.sent.count) \(finals.joined(separator: " ")) stt_dropped_silent_chunk=\(r.droppedSilentChunks) stt_dropped_artifact=\(r.droppedArtifacts) stt_dropped_tail=\(r.droppedTailSentences)"
+        return "\(name) text=\"\(run.text)\" requests=\(run.sent.count) \(finals.joined(separator: " ")) stt_dropped_silent_chunk=\(r.droppedSilentChunks) stt_dropped_artifact=\(r.droppedArtifacts) stt_dropped_tail=\(r.droppedTailSentences) stt_dropped_click_chunk=\(r.droppedClickChunks) call_prompts=\(r.calls.map { "\($0.index):\($0.prompt)" }.joined(separator: ","))"
     }
 
     // Speech (3.4 s) → 0.6 s of room noise → the click. RED on 55cb366: "Please send the report. Dictate."
@@ -113,6 +113,7 @@ struct V127FinishTapTests {
         print("B2 LITERAL click_only \(Self.literal("click_only", run))")
         #expect(run.text == "Please send the report.")
         #expect(run.sent.count == 1)                                   // the click chunk is never sent
+        #expect(run.result.droppedClickChunks == 1)
     }
 
     // A short final chunk with a soft breath first (a speech-like window before the click): sent, with NO prompt.
@@ -121,7 +122,8 @@ struct V127FinishTapTests {
                                         + Self.noise(0.4, seed: 11) + Self.click())
         print("B2 LITERAL short_final \(Self.literal("short_final", run))")
         #expect(run.text == "Please send the report.")
-        #expect(run.sent.count == 2 && Self.promptKind(run.sent[1].prompt) == "none")
+        #expect(run.sent.count == 2 && run.sent.contains { Self.promptKind($0.prompt) == "none" })
+        #expect(run.result.droppedClickChunks == 0 && run.result.calls.contains { $0.isFinal && $0.prompt == "none" })
     }
 
     // Controls.
@@ -129,8 +131,10 @@ struct V127FinishTapTests {
         let run = await Self.transcribe(Self.lead + Self.speech(3.4) + Self.noise(0.3) + Self.speech(2.5))
         print("B2 LITERAL long_final \(Self.literal("long_final", run))")
         #expect(run.sent.count == 2)
-        #expect(run.sent.last.map { Self.promptKind($0.prompt) } == "full")
-        #expect(run.sent.last?.prompt.contains(Self.vocabulary) == true)
+        let final = run.sent.max { $0.seconds < $1.seconds }
+        #expect(final.map { Self.promptKind($0.prompt) } == "full")
+        #expect(final?.prompt.contains(Self.vocabulary) == true)
+        #expect(run.result.calls.contains { $0.isFinal && $0.prompt == "full" })
         #expect(run.text == "Please send the report. Please send the report.")
     }
 
@@ -138,6 +142,7 @@ struct V127FinishTapTests {
         let run = await Self.transcribe(Self.lead + Self.speech(3.4) + Self.noise(0.3) + Self.speech(0.8))
         print("B2 LITERAL short_speech \(Self.literal("short_speech", run))")
         #expect(run.sent.count == 2)
+        #expect(run.result.droppedClickChunks == 0 && run.result.calls.contains { $0.isFinal && $0.prompt == "none" })
         #expect(run.text == "Please send the report. yes.")
     }
 }
