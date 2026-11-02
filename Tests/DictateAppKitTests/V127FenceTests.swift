@@ -111,7 +111,7 @@ struct V127FenceTests {
         let pcm = Box<[Int16]>([])
         recorder.onPCMChunk = { chunk in pcm.mutate { $0 += chunk } }
         headset.level = 0                                   // the link delivers zeros: the built-in keeps carrying
-        headset.startReturnsAt = now() + 1.0
+        headset.startReturnsAt = now() + 2.5                // wide enough that the first health tick lands inside it under load
         let start = Task { try await recorder.startAsync(device: .default) }
         try await Task.sleep(nanoseconds: 30_000_000)
         recorder.resetCapture()
