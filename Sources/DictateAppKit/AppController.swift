@@ -70,6 +70,10 @@ public final class AppController {
     private var transcriptTrace: TranscriptTrace?
     /// v1.27 (B3): a host's pass-through of the `DictateTranscriptTrace` preference (nil: the Dictate domain).
     var transcriptTraceDefaults: UserDefaults?
+    /// v1.27 FR1-F: every open trace by session id; closed when that session's end line is written.
+    private var transcriptTraces: [String: TranscriptTrace] = [:]
+    /// Tests: traces still open (0 once every session has ended).
+    var openTranscriptTraces: Int { transcriptTraces.count }
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private lazy var capture = CaptureLifecycle(engine: recorder, scheduler: captureScheduler)
@@ -710,6 +714,7 @@ public final class AppController {
         // v1.27 (B3): read at session start; off by default (then no trace object exists at all).
         transcriptTrace = TranscriptTrace.enabled(transcriptTraceDefaults)
             ? TranscriptTrace(directory: TranscriptTrace.directory(logURL: paths.logURL), sessionID: session) : nil
+        if let transcriptTrace { transcriptTraces[session] = transcriptTrace }
         if transcriptTrace != nil { sessionNote("transcript_trace=on") }
         btStart = BluetoothProfile.sample()
         btEndNotePending = true
@@ -1078,13 +1083,18 @@ public final class AppController {
                     let publicTimeline = DictationTimeline(latency_ms: latency, stt_ms: report.sttMs,
                         cleanup_ms: report.cleanupMs, chunks: report.chunks, path: report.path,
                         cleanup_mode: policy.usesCleanup ? report.cleanupMode : "none", fallback: policy.fallbackLabel)
-                    trace?.pasted(text)
-                    policy.deliver(text, transcript: { self.engineOnTranscript?($0, publicTimeline) }, paste: { text in
+                    // v1.27 FR1-F: `pasted=` only on success — a capture-only host's delivery here, a paste/type
+                    // once it is confirmed (below), the rig's file once written.
+                    policy.deliver(text, transcript: {
+                        if !policy.usesPaste { trace?.pasted($0) }
+                        self.engineOnTranscript?($0, publicTimeline)
+                    }, paste: { text in
                         // v1.14: under the rig the paste goes to the row's file, never to the frontmost app.
                         if let rig = self.rig {
                             let row = rig.row ?? "none"
                             do {
                                 try RigSink.write(text, row: row, config: rig.config)
+                                trace?.pasted(text)
                                 Self.note("rig_sink=file row=\(row) chars=\(text.count)")
                                 self.showOutcome(.ok)
                                 self.appendLog(entry(text.count, "rig", .ok), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
@@ -1118,6 +1128,7 @@ public final class AppController {
                             switch result {
                             case .confirmed:
                                 outcome = .ok
+                                trace?.pasted(text)
                                 if myGeneration === self.generation {
                                     if let cleanup = report.cleanup, cleanup != "skipped:short", cleanup.hasPrefix("skipped:") || cleanup.hasPrefix("rejected:") {
                                         self.showOutcome(.rawPasted(cleanup))
@@ -1384,6 +1395,11 @@ public final class AppController {
     /// `CaptureStats.sessionEndFields` (kind=… recording_ms=… … carrier=… headset_carried_ms=… io_ops=…
     /// io_held=…; counts only). A host writing its own session line appends the same fields.
     private func noteSessionEnd(id: String, stats: AudioRecorder.CaptureStats, outcome: String, entry: DictationLogEntry?) {
+        // v1.27 FR1-F: the session's trace is closed with its end line (a later write is ignored).
+        if let trace = transcriptTraces.removeValue(forKey: id) {
+            trace.close()
+            if transcriptTrace === trace { transcriptTrace = nil }
+        }
         var line = "session=\(id) event=end outcome=\(outcome)"
         if let entry {
             line += " duration_ms=\(Int((entry.durationSeconds * 1000).rounded())) bytes=\(entry.audioBytes) chars=\(entry.chars)"

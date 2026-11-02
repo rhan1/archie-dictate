@@ -40,6 +40,12 @@ private actor EchoHTTP: HTTPTransport {
                 HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [:])!)
     }
 }
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func get() -> Int { lock.withLock { value } }
+    func set(_ v: Int) { lock.withLock { value = v } }
+}
 private final class Lines: @unchecked Sendable {
     let lock = NSLock()
     var all: [String] = []
@@ -67,9 +73,10 @@ struct V127TraceAndParityTests {
         throw URLError(.timedOut)
     }
 
-    struct Outcome { let end: String; let transcript: String; let traceFiles: [URL]; let logText: String }
+    struct Outcome { let end: String; let transcript: String; let traceFiles: [URL]; let logText: String; var openTraces = -1 }
 
-    @MainActor private func dictate(traceDefaults: UserDefaults?) async throws -> Outcome {
+    /// `focusMoves`: a paste-mode dictation whose target app changes before the paste — the paste is held.
+    @MainActor private func dictate(traceDefaults: UserDefaults?, focusMoves: Bool = false) async throws -> Outcome {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-v127-trace-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -86,12 +93,17 @@ struct V127TraceAndParityTests {
         recorder.mediaLimit = 4.4
         let notes = Lines()
         recorder.note = { notes.add($0) }
+        let targetCalls = Counter()
         let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple() },
             sttTransport: EchoHTTP(), groqCleanupTransport: EchoHTTP(), localCleanupTransport: EchoHTTP(),
             inserter: TextInserter(pasteboard: clipboard, postKeystroke: {}),
             panelFactory: { Panel() }, requestMicrophoneAccess: { $0(true) },
-            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
-        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .captureOnly,
+            frontmostTarget: {
+                let calls = targetCalls.get() + 1
+                targetCalls.set(calls)
+                return focusMoves && calls > 1 ? InsertionTarget(pid: 2, bundleID: "other.app") : InsertionTarget(pid: 1, bundleID: "test.host")
+            }, manageMedia: false)
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: focusMoves ? .dictate : .captureOnly,
                                        dependencies: dependencies)
         controller.onSessionNote = { notes.add($0) }
         let engine = DictationEngine(controller: controller)
@@ -117,7 +129,7 @@ struct V127TraceAndParityTests {
         }
         let log = (try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? ""
         return Outcome(end: notes.snapshot.first { $0.contains("event=end") } ?? "", transcript: transcripts.snapshot.last ?? "",
-                       traceFiles: kept, logText: log + notes.snapshot.joined(separator: "\n"))
+                       traceFiles: kept, logText: log + notes.snapshot.joined(separator: "\n"), openTraces: controller.openTranscriptTraces)
     }
 
     private static func suite(_ name: String, trace: Bool?) -> UserDefaults {
@@ -153,6 +165,25 @@ struct V127TraceAndParityTests {
         let session = on.end.components(separatedBy: "session=").dropFirst().first?.components(separatedBy: " ").first ?? "?"
         #expect(file.lastPathComponent == "\(session).txt")
         for f in off.traceFiles + on.traceFiles { try? FileManager.default.removeItem(at: f.deletingLastPathComponent()) }
+    }
+
+    /// FR1-F: a paste that fails (held: focus moved) writes no `pasted=`; every trace is closed at session end.
+    @MainActor @Test func traceClosedAtEndAndPastedOnlyOnSuccess() async throws {
+        let name = "dictate-v127-trace-fr1f-\(UUID().uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: name) }
+        let held = try await dictate(traceDefaults: Self.suite(name, trace: true), focusMoves: true)
+        let outcome = held.end.components(separatedBy: " outcome=").dropFirst().first?.components(separatedBy: " ").first ?? "none"
+        let file = try #require(held.traceFiles.first)
+        let lines = try String(contentsOf: file, encoding: .utf8).split(separator: "\n").map(String.init)
+        let pasted = lines.contains { $0.hasPrefix("pasted=") }
+        let ok = try await dictate(traceDefaults: Self.suite(name, trace: true))
+        let okLines = try String(contentsOf: try #require(ok.traceFiles.first), encoding: .utf8).split(separator: "\n").map(String.init)
+        print("FR1-F GREEN trace_closed_at_end=\(held.openTraces == 0 && ok.openTraces == 0 ? 1 : 0) pasted_on_success_only=\(!pasted && okLines.contains { $0.hasPrefix("pasted=") } ? 1 : 0) held_outcome=\(outcome) held_lines=\(lines.count) ok_lines=\(okLines.count)")
+        #expect(outcome.hasPrefix("held"))
+        #expect(!pasted && lines.contains { $0.hasPrefix("chunk=0 ") })
+        #expect(okLines.contains { $0.hasPrefix("pasted=") })
+        #expect(held.openTraces == 0 && ok.openTraces == 0)
+        for f in held.traceFiles + ok.traceFiles { try? FileManager.default.removeItem(at: f.deletingLastPathComponent()) }
     }
 
     /// C: an ordinary dictation is unchanged (outcome and delivered text), whatever the trace setting.
