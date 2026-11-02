@@ -1281,7 +1281,6 @@ public final class AppController {
                            "stt_dropped_low_speech_pos=\(Self.droppedPosition(chunked))",
                            "stt_dropped_artifact=\(chunked.droppedArtifacts)",
                            "stt_dropped_silent_chunk=\(chunked.droppedSilentChunks)",
-                           "stt_dropped_click_chunk=\(chunked.droppedClickChunks)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
                            "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
                 for call in chunked.calls {
