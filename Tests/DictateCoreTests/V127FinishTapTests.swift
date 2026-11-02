@@ -160,6 +160,20 @@ struct V127FinishTapTests {
         #expect(run.result.calls.contains { $0.isFinal && $0.prompt == "none" })
     }
 
+    // FR1-D: a dictation that is ONE short piece (chunk 0, e.g. "Politrace" alone) keeps the full prompt;
+    // a short residual TAIL (chunk > 0) is the one sent without it.
+    @Test func wholeShortDictationKeepsTheFullPrompt() async {
+        let run = await Self.transcribe(Self.lead + Self.speech(1.0))
+        let prompt = run.sent.first.map { Self.promptKind($0.prompt) } ?? "none_sent"
+        print("FR1-D GREEN whole_short prompt=\(prompt) requests=\(run.sent.count) text=\"\(run.text)\" call_prompts=\(run.result.calls.map { "\($0.index):\($0.prompt)" }.joined(separator: ","))")
+        #expect(run.sent.count == 1 && prompt == "full")
+        #expect(run.sent.first?.prompt.contains(Self.vocabulary) == true)
+        #expect(run.result.calls.allSatisfy { $0.index == 0 && $0.isFinal && $0.prompt == "full" })
+        let tail = await Self.transcribe(Self.lead + Self.speech(3.4) + Self.noise(0.3) + Self.speech(0.8))
+        print("FR1-D GREEN tail_short prompt=\(tail.result.calls.first { $0.isFinal }?.prompt ?? "?") call_prompts=\(tail.result.calls.map { "\($0.index):\($0.prompt)" }.joined(separator: ","))")
+        #expect(tail.result.calls.contains { $0.isFinal && $0.index > 0 && $0.prompt == "none" })
+    }
+
     // Controls.
     @Test func longFinalChunkKeepsTheFullPrompt() async {
         let run = await Self.transcribe(Self.lead + Self.speech(3.4) + Self.noise(0.3) + Self.speech(2.5))

@@ -6,7 +6,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     public static let fillerLeadIn = "Um, so, uh, like, Tuesday, no, Wednesday."
     /// v1.27 (B2): a final chunk shorter than this is transcribed with an EMPTY prompt (no lead-in, no
     /// vocabulary, no previous text): on the near-silence after the finish tap, Whisper answers with prompt
-    /// words ("Dictate.", 2026-11-03 03:13). Longer final chunks keep the full prompt.
+    /// words ("Dictate.", 2026-11-03 03:13). Longer final chunks keep the full prompt, and so does a dictation
+    /// that is one short piece (chunk 0: FR1-D).
     public static let shortFinalSeconds = 1.5
 
     /// A chunk that starts like this is probably the tail of a split "uh, the X".
@@ -253,8 +254,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         speechRatios[chunk.index] = windows.isEmpty ? 0 :
             Double(CaptureEvidence.speechWindows(windows).filter { $0 }.count) / Double(windows.count)
         let model = isFinal ? finalModel ?? client.modelName : client.modelName
-        // v1.27 (B2): a short final chunk carries no prompt for Whisper to echo.
-        let emptyPrompt = isFinal && Self.seconds(chunk.samples.count) < Self.shortFinalSeconds
+        // v1.27 (B2): a short final chunk carries no prompt for Whisper to echo. FR1-D: only a residual
+        // TAIL (index > 0); a dictation that is one short piece (index 0) keeps the full prompt (its names).
+        let emptyPrompt = isFinal && chunk.index > 0 && Self.seconds(chunk.samples.count) < Self.shortFinalSeconds
         let task = Task.detached { [self] in await upload(chunk, model: model, isFinal: isFinal, emptyPrompt: emptyPrompt) }
         tasks.append(task)
         return task
