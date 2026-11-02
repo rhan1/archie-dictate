@@ -179,6 +179,9 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinRebuilt = false
     /// v1.27 (B1): the last device read-back was unreadable (logged once per streak).
     private var builtinUnreadable = false
+    /// v1.27 FR1-C: queues of built-in units replaced under this lease; the built-in part of the release
+    /// is acknowledged only after each of their queued teardowns completed.
+    private var retiredBuiltinQueues: [DispatchQueue] = []
     // Arbitration, health and the first-tap pre-roll ring, serialized by `lock`.
     private var feed = CaptureFeed()
     private var bridgeConfigured = false
@@ -320,11 +323,16 @@ public final class AudioRecorder: CaptureEngine {
     private func startBuiltin(_ unit: BuiltinCapture, epoch: CaptureEpoch, queue: DispatchQueue) -> DispatchSemaphore {
         // v1.12 (L1): per-callback identity — the unit stamps every callback with the epoch it was
         // started for; a reused unit's late callback from an earlier session never enters this one.
-        unit.onFrames = { [weak self] chunk, time, stamped in
-            guard stamped === epoch else { return }
-            self?.acceptConverted(chunk, at: time, source: .builtin, epoch: epoch)
+        // v1.27 FR1-B/E: and only the CURRENT unit (identity, checked under the recorder lock) — a replaced
+        // unit's late frames never enter the dictation; the unit is captured weakly (no retain cycle).
+        unit.onFrames = { [weak self, weak unit] chunk, time, stamped in
+            guard stamped === epoch, let unit else { return }
+            self?.acceptConverted(chunk, at: time, source: .builtin, epoch: epoch, builtinUnit: unit)
         }
-        unit.onDeviceLost = { [weak self] _ in self?.builtinLost(unit, epoch: epoch) }
+        unit.onDeviceLost = { [weak self, weak unit] _ in
+            guard let unit else { return }
+            self?.builtinLost(unit, epoch: epoch)
+        }
         let ready = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
             guard let self else { ready.signal(); return }
@@ -343,7 +351,9 @@ public final class AudioRecorder: CaptureEngine {
                 // stop() (or a later rebuild) may have run while the unit was starting.
                 if !current { unit.stop(epoch: epoch) }
             } catch {
-                self.bridgeFailed(epoch: epoch, error: error)
+                // v1.27 FR1-B: a replaced unit's failed start only concerns that unit.
+                if self.lock.withLock({ self.builtin === unit }) { self.bridgeFailed(epoch: epoch, error: error) }
+                else { unit.stop(epoch: epoch) }
             }
             ready.signal()
         }
@@ -354,14 +364,18 @@ public final class AudioRecorder: CaptureEngine {
     /// still starting; otherwise (and the second time) dead, as in v1.8.
     private func builtinLost(_ unit: BuiltinCapture, epoch: CaptureEpoch) {
         let now = ProcessInfo.processInfo.systemUptime
+        var retired = false
         let replace: BuiltinReplacement? = lock.withLock {
             guard engineEpoch === epoch else { return nil }
-            guard builtinActive, builtin === unit else { feed.deviceProblem(.builtin, .lost); return nil }
+            // v1.27 FR1-B: a replaced unit's late device-lost never touches its replacement.
+            guard builtin === unit else { retired = true; return nil }
+            guard builtinActive else { feed.deviceProblem(.builtin, .lost); return nil }
             switch BuiltinWatch.judge(problem: .lost, headsetStarting: feed.health.headsetStarting(at: now), rebuilt: builtinRebuilt) {
             case .rebuild: return prepareBuiltinRebuildLocked()
             default: feed.deviceProblem(.builtin, .lost); return nil
             }
         }
+        if retired { return }
         AppController.note("bridge_device_check=lost")
         if let replace { rebuildBuiltin(replace, reason: .lost, epoch: epoch) }
     }
@@ -374,6 +388,7 @@ public final class AudioRecorder: CaptureEngine {
         builtinRebuilt = true
         builtinUnreadable = false
         let old = (builtin, builtinQueue)
+        retiredBuiltinQueues.append(builtinQueue)
         builtin = makeBuiltin()
         builtinQueue = DispatchQueue(label: "dictate.capture.builtin")
         builtinWatch = CaptureExecutorWatch()
@@ -1974,6 +1989,8 @@ public final class AudioRecorder: CaptureEngine {
         // Any earlier stop of the unit (health clock, failed start) is queued here too: the
         // acknowledgement runs after it on the same serial queue.
         let builtinAckQueue = builtinQueue
+        let retiredQueues = retiredBuiltinQueues
+        retiredBuiltinQueues = []
         builtinActive = false
         var abandonedMs: Int?
         // Its queued teardown would wait forever behind a wedged call (D-b).
@@ -1996,7 +2013,16 @@ public final class AudioRecorder: CaptureEngine {
             }
             releasing.release()
             // A wedged built-in queue never acknowledges: the lease is quarantined, never reused.
-            if abandonedMs == nil { builtinAckQueue.async { releasing.partReleased(.builtin) } }
+            // v1.27 FR1-C: nor does a replaced unit's teardown that never completes — the built-in part is
+            // acknowledged only after the current AND every retired queue ran what was queued on it.
+            if abandonedMs == nil {
+                let teardowns = DispatchGroup()
+                for queue in [builtinAckQueue] + retiredQueues {
+                    teardowns.enter()
+                    queue.async { teardowns.leave() }
+                }
+                teardowns.notify(queue: .global(qos: .utility)) { releasing.partReleased(.builtin) }
+            }
         }
         onExecutor { [self] in
             teardownEngine(counted: live)
@@ -2123,9 +2149,10 @@ public final class AudioRecorder: CaptureEngine {
     /// under it and delivered after it (a switch cannot overtake a buffer's delivery).
     private func acceptConverted(_ converted: [Float], at time: TimeInterval,
                                  source: CaptureBridge.Source, epoch: CaptureEpoch,
-                                 tap: CaptureEpoch? = nil) {
+                                 tap: CaptureEpoch? = nil, builtinUnit: BuiltinCapture? = nil) {
         lock.lock()
         guard engineEpoch === epoch, tap == nil || (tapEpoch === tap && captureRunning),
+              builtinUnit.map({ $0 === builtin }) ?? true,
               captureKind != .conversation || (!routeApplying && routeGeneration == appliedRouteGeneration)
         else { lock.unlock(); return }
         let arrival = ProcessInfo.processInfo.systemUptime
