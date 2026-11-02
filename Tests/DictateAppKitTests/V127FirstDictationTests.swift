@@ -207,6 +207,8 @@ struct V127FirstDictationTests {
         var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
         var onEvent: ((HeadsetCaptureEvent, CaptureEpoch) -> Void)?
         var startReturnsAt: TimeInterval = 0
+        /// The level the headset delivers once started (0: digital zeros — a link that never carries).
+        var level: Float = 0.2
         private let lock = NSLock()
         private var epoch: CaptureEpoch?
         private var timer: DispatchSourceTimer?
@@ -217,7 +219,7 @@ struct V127FirstDictationTests {
             timer.schedule(deadline: .now() + 0.02, repeating: 0.02)
             timer.setEventHandler { [weak self] in
                 guard let self, let epoch = self.lock.withLock({ self.epoch }) else { return }
-                self.onFrames?([Float](repeating: 0.2, count: 480), ProcessInfo.processInfo.systemUptime - 0.02, epoch)
+                self.onFrames?([Float](repeating: self.level, count: 480), ProcessInfo.processInfo.systemUptime - 0.02, epoch)
             }
             lock.withLock { self.epoch = epoch; self.timer = timer }
             onEvent?(.started(deviceUID: deviceUID, sampleRate: 16_000, channels: 1), epoch)
