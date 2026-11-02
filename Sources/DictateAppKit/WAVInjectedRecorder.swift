@@ -52,6 +52,12 @@ import DictateCore
 ///   there (a switchback splice).
 /// - `live_pause` (L1 c): the 10-13 A/B as modeled — the WAV with the inserted pause, through the
 ///   Sony's mic gate (`gatePeak` per 20 ms → exact zeros) on the headset, distant on the built-in.
+/// - `builtin_start_slow` (v1.27 B1): 2026-11-03 03:11:39 (cc891096), the first dictation after a pause.
+///   The built-in AUHAL's `start(epoch:)` blocks `slowBuiltinStartReturnsAt` (its device read-back is
+///   unreadable until then: `currentDeviceID == nil`), then it hears the WAV; the Bluetooth headset's start
+///   is in flight until `slowHeadsetStartReturnsAt`, then it hears the WAV and takes over. The model runs
+///   the recorder's per-tick device check (`BuiltinCapture.deviceCheck()` on an injected unit) and its
+///   handling, then the production health clock.
 public final class WAVInjectedRecorder: EngineRecorder {
     /// Which re-attach the `sco_torn_down_250ms` IO model runs.
     public enum IOPolicy: Sendable { case v19, v110 }
@@ -61,6 +67,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case headsetTakeover = "headset_takeover"
         case pauseZeros = "pause_zeros", headsetDrops = "headset_drops", livePause = "live_pause"
         case warmHFP = "warm_hfp", spliceLag = "splice_lag"
+        case builtinStartSlow = "builtin_start_slow"
         var hasHeadset: Bool { self != .plain }
         /// v1.13: the headset and the built-in each play their own track.
         public var usesTracks: Bool {
@@ -120,9 +127,19 @@ public final class WAVInjectedRecorder: EngineRecorder {
     private var warmVerify: (token: CaptureEpoch, since: TimeInterval, firstFrame: TimeInterval?, signal: SustainedSignal, firstSignal: TimeInterval?)?
     /// Every note with its media ms after the boundary (tests read when a switch happened).
     public private(set) var timedNotes: [(ms: Int, line: String)] = []
+    /// Media ms since the recording boundary (tests wait on the media clock, not on wall time).
+    public var mediaMs: Int { lock.withLock { Int(((mediaTime - boundary) * 1000).rounded()) } }
     private var headsetTrack: [Float] = []
     private var builtinTrack: [Float] = []
     private var trackCursor = 0
+    /// `builtin_start_slow`: media time after the boundary at which the built-in's start returns
+    /// (cc891096: `builtin_backend=auhal device=81 bridge_device_check=ok` at +1.577).
+    public static let slowBuiltinStartReturnsAt: TimeInterval = 1.5
+    /// `builtin_start_slow`: the headset's start returns and its frames flow (cc891096 `engine_start_ms=1932`; takeover 2.2–2.5 s).
+    public static let slowHeadsetStartReturnsAt: TimeInterval = 2.2
+    /// `builtin_start_slow`: the injected built-in unit whose read-back the model checks every tick.
+    private let slowUnit = InjectedBuiltinUnit()
+    private var slowDriftNoted = false
     /// Built-in frames stop after this much media time in the dying scenarios.
     public static let builtinLifetime: TimeInterval = 0.5
     /// `sco_torn_down_250ms` timing (s after the headset start; R1 01:53:08.300 + …).
@@ -382,6 +399,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
         ioSettleAt = nil
         ioRestartAt = nil
         scoKept = false
+        slowDriftNoted = false
+        slowUnit.reset()
         if scenario == .warmHFP {
             warmRunning = true
             warmTapOK = true
@@ -705,6 +724,22 @@ public final class WAVInjectedRecorder: EngineRecorder {
             }
             kept += pendingWarmFrames
             pendingWarmFrames = []
+        } else if scenario == .builtinStartSlow {
+            let offset = time - boundary
+            if offset + 1e-9 >= Self.slowBuiltinStartReturnsAt { slowUnit.startReturned() }
+            // The recorder's health tick: the device read-back of the active built-in, every 100 ms (v1.8 L1).
+            if !builtinStopped, let check = slowUnit.deviceCheck(), check != .ok, !slowDriftNoted {
+                slowDriftNoted = true
+                feed.deviceProblem(.builtin, .drift)
+                notes.append(check.note)
+            }
+            var outs: [CaptureFeed.Output] = []
+            if slowUnit.isStarted, !builtinStopped { outs.append(feed.accept(wav, source: .builtin, at: time)) }
+            if offset + 1e-9 >= Self.slowHeadsetStartReturnsAt { outs.append(feed.accept(wav, source: .headset, at: time)) }
+            for out in outs {
+                notes += out.notes
+                kept += out.frames
+            }
         } else if scenario.hasHeadset {
             // Built-in = the WAV (until it dies), headset = digital zeros, same 100 ms window.
             let dying = scenario == .builtinDies || scenario == .builtinDrifts
@@ -754,6 +789,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             let health = feed.tick(at: mediaTime)
             kept += health.frames
             notes += health.notes
+            if scenario == .builtinStartSlow, health.stopBuiltin { builtinStopped = true }
             if scenario == .warmHFP { notes += warmObserve(at: mediaTime) }
             // Plain injection delivers a frame on every tick by construction, so exact zeros (leading, between
             // words, EOF tail) are the fixture's silence, not a dead mic. Only the dead-stream scenarios judge it.
@@ -859,4 +895,22 @@ public final class WAVInjectedRecorder: EngineRecorder {
             if feed.bridge.state != .off { boundaryAt(mediaTime) }
         }
     }
+}
+
+/// v1.27 B1 (`builtin_start_slow`): the built-in AUHAL as observed in cc891096 — its device resolves at once
+/// (`expectedDeviceID`), but the unit's device property is unreadable until `start(epoch:)` returns.
+final class InjectedBuiltinUnit: BuiltinCapture {
+    var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
+    var onDeviceLost: ((CaptureEpoch) -> Void)?
+    private(set) var isStarted = false
+    func reset() { isStarted = false }
+    func startReturned() { isStarted = true }
+    func start(epoch: CaptureEpoch) throws { isStarted = true }
+    func stop() { isStarted = false }
+    func stop(epoch: CaptureEpoch) { stop() }
+    var isDelivering: Bool { isStarted }
+    var currentDeviceID: UInt32? { isStarted ? 81 : nil }
+    var expectedDeviceID: UInt32? { 81 }
+    var lastBufferTime: TimeInterval? { nil }
+    let backend = "injected"
 }
