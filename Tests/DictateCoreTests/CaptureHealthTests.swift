@@ -106,11 +106,17 @@ struct CaptureHealthTests {
         #expect(rig.feed.bridge.state == .switched)                     // the headset took over and carries
     }
 
-    @Test func neverFirstBufferFailsByTwoSecondsAfterTheBoundary() {
+    /// v1.27 (B1 rule 4): a Bluetooth dictation where nothing ever arrives waits up to the 4.0 s cap for
+    /// the headset (was 2.0 s, cc891096: the headset's start was still in flight at 2.0 s); non-Bluetooth keeps 2.0 s.
+    @Test func neverFirstBufferFailsByTheDeadlineAfterTheBoundary() {
+        var plain = Rig(bluetooth: false)
+        for _ in 0..<40 { plain.step() }
+        #expect(plain.failures.count == 1)
+        #expect(abs((plain.failures.first?.0 ?? 99) - (10 + CaptureHealth.failAfter)) < 0.0001)
         var rig = Rig()
-        for _ in 0..<40 { rig.step() }
+        for _ in 0..<60 { rig.step() }
         #expect(rig.failures.count == 1)
-        #expect(abs((rig.failures.first?.0 ?? 99) - (10 + CaptureHealth.failAfter)) < 0.0001)
+        #expect(abs((rig.failures.first?.0 ?? 99) - (10 + CaptureHealth.bluetoothNoInputCap)) < 0.0001)
         #expect(rig.failures.first?.1.health == .noInput && rig.failures.first?.1.bytes == 44)
         #expect(rig.warns.first?.1 == .noInput)
     }
@@ -150,6 +156,7 @@ struct CaptureHealthTests {
         func stop() {}
         func stop(epoch: CaptureEpoch) {}
         var isDelivering = true
+        var started = true
         var currentDeviceID: UInt32? { current }
         var expectedDeviceID: UInt32? = 81
         var lastBufferTime: TimeInterval?
@@ -176,7 +183,7 @@ struct CaptureHealthTests {
         let unit = FakeBuiltin()
         #expect(unit.deviceCheck() == .ok)
         unit.current = nil
-        #expect(unit.deviceCheck() == .drift(from: 0))                  // unreadable is never "ok"
+        #expect(unit.deviceCheck() == .unreadable)                      // unreadable is never "ok" (v1.27 B1: nor drift)
         var rig = Rig()
         for _ in 0..<30 { rig.step(builtin: Self.tone(), headset: Self.zeros) }
         #expect(rig.stopBuiltin.isEmpty && rig.failures.isEmpty)

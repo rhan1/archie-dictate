@@ -192,6 +192,7 @@ struct V127FirstDictationTests {
         func stop() { lock.withLock { running = nil; timer?.cancel(); timer = nil } }
         func stop(epoch: CaptureEpoch) { if lock.withLock({ running === epoch }) { stop() } }
         var isDelivering: Bool { lock.withLock { running != nil } }
+        var started: Bool { lock.withLock { running != nil } }
         var currentDeviceID: UInt32? { lock.withLock { running != nil ? 81 : nil } }
         var expectedDeviceID: UInt32? { 81 }
         var lastBufferTime: TimeInterval? { nil }
@@ -252,6 +253,49 @@ struct V127FirstDictationTests {
         print("B1 LITERAL real_recorder fail=\(fail) carrier=\(stats.carrier) headset_carried_ms=\(stats.headsetCarriedMs) builtin_starts=\(builtin.starts)")
         #expect(fail == "none")
         #expect(stats.carrier.hasPrefix("builtin:") && stats.carrier.contains(",headset:"))
+        _ = await recorder.awaitRelease()
+    }
+
+    /// A built-in whose read-back names another device as soon as its start returns (a genuine drift).
+    final class DriftingBuiltin: BuiltinCapture, @unchecked Sendable {
+        var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
+        var onDeviceLost: ((CaptureEpoch) -> Void)?
+        private let lock = NSLock()
+        private var running: CaptureEpoch?
+        func start(epoch: CaptureEpoch) throws { lock.withLock { running = epoch } }
+        func stop() { lock.withLock { running = nil } }
+        func stop(epoch: CaptureEpoch) { if lock.withLock({ running === epoch }) { stop() } }
+        var isDelivering: Bool { false }
+        var started: Bool { lock.withLock { running != nil } }
+        var currentDeviceID: UInt32? { 154 }
+        var expectedDeviceID: UInt32? { 81 }
+        var lastBufferTime: TimeInterval? { nil }
+        let backend = "fake"
+    }
+
+    /// Rule 3: a genuine drift while the headset is still starting is rebuilt once (new unit, same epoch);
+    /// the second loss keeps v1.8 (`bridge_builtin_lost=1`). The headset then carries.
+    @Test func driftWhileTheHeadsetStartsIsRebuiltOnceThenLost() async throws {
+        // The timeline notes (`builtin_rebuilt=1 reason=drift`, then `bridge_builtin_lost=1`) go to stderr; the
+        // global note sink is not taken here (other suites own it concurrently). Units are counted instead.
+        let units = Lines()
+        let headset = SlowHeadset()
+        let recorder = AudioRecorder(builtin: { units.add("unit"); return DriftingBuiltin() }, headset: { headset },
+                                     backend: .auhal, broker: CaptureLeaseBroker(), route: Self.route)
+        let failures = Lines()
+        recorder.onCaptureFailure = { failures.add($0.note) }
+        let t0 = ProcessInfo.processInfo.systemUptime
+        headset.startReturnsAt = t0 + 1.2
+        let start = Task { try await recorder.startAsync(device: .default) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        recorder.resetCapture()
+        try await waitFor("media_2_5s", seconds: 30) { ProcessInfo.processInfo.systemUptime - t0 >= 2.5 || !failures.snapshot.isEmpty }
+        _ = try? await start.value
+        _ = recorder.stop()
+        print("B1 LITERAL rule3 units_made=\(units.snapshot.count) fail=\(failures.snapshot.first ?? "none") carrier=\(recorder.stats.carrier)")
+        #expect(units.snapshot.count == 2)                                   // the initial unit + exactly one rebuild
+        #expect(failures.snapshot.isEmpty)
+        #expect(recorder.stats.carrier.contains("headset:"))
         _ = await recorder.awaitRelease()
     }
 }

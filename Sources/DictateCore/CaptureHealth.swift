@@ -23,6 +23,10 @@ public struct CaptureHealth: Sendable {
     /// Nothing useful arriving: the dictation ends this long after the last useful delivery
     /// (or the recording boundary). Absolute: a recovery attempt never moves it.
     public static let failAfter: TimeInterval = 2.0
+    /// v1.27 (B1): with a Bluetooth input, `failAfter` does not elapse while the headset's start or
+    /// re-attach is in flight, and nothing delivered yet waits for the headset up to this cap from the
+    /// session start (`mic_dead` still fires here). A non-Bluetooth input keeps `failAfter`.
+    public static let bluetoothNoInputCap: TimeInterval = 4.0
     public static let silencePeak: Float = CaptureBridge.silencePeak
     private static let rate = 24_000.0
 
@@ -65,8 +69,37 @@ public struct CaptureHealth: Sendable {
     public private(set) var warned: Reason?
     public private(set) var failed: Reason?
     private var builtinReported = false
+    /// v1.27 (B1): the dictation's default input is a Bluetooth headset.
+    public var bluetooth = false
+    /// v1.27 (B1): the headset's start or re-attach has been called and has not returned.
+    public private(set) var headsetInFlight = false
 
     public init() {}
+
+    /// v1.27 (B1): the recorder calls the headset client's start/re-attach (true) and it returned (false).
+    public mutating func headsetStart(inFlight: Bool) { headsetInFlight = inFlight }
+
+    /// v1.27 (B1): the headset cannot carry yet — its start is in flight, or it is inside its startup
+    /// grace without a first buffer.
+    public func headsetStarting(at now: TimeInterval) -> Bool {
+        let s = headset
+        guard s.active || headsetInFlight, s.lastAt == nil else { return false }
+        return headsetInFlight || status(.headset, at: now) == .starting
+    }
+
+    /// v1.27 (B1): a dead built-in is being replaced by a new unit: it is out of the dictation until the
+    /// new unit's start returns (`sourceStarted`), so the old one's problem or staleness never counts.
+    public mutating func sourceRestarting(_ source: Source) { update(source) { $0 = SourceState() } }
+
+    /// The `mic_dead` deadline for `base` (v1.8: the last useful delivery or the boundary + `failAfter`).
+    /// v1.27 (B1): a Bluetooth dictation waits for the headset — while its start/re-attach is in flight, or
+    /// while no source has delivered a single buffer — up to `bluetoothNoInputCap` from the session start.
+    /// A source that delivers only digital zeros (a dead link) keeps v1.8's deadline.
+    private func deadline(_ base: TimeInterval) -> TimeInterval {
+        let nothingDelivered = builtin.firstAt == nil && headset.firstAt == nil
+        guard bluetooth, let boundary, headsetInFlight || nothingDelivered else { return base }
+        return max(base, boundary + Self.bluetoothNoInputCap)
+    }
 
     private func state(_ source: Source) -> SourceState { source == .builtin ? builtin : headset }
     private mutating func update(_ source: Source, _ change: (inout SourceState) -> Void) {
@@ -194,7 +227,7 @@ public struct CaptureHealth: Sendable {
             // No source configured yet (start still in flight): the never-first-buffer deadline runs anyway.
             guard lastUseful == nil else { return actions }
             if warned == nil, now - firstInputSince > Self.builtinGrace { warned = .noInput; actions.append(.warn(.noInput)) }
-            if now >= firstInputSince + Self.failAfter { failed = .noInput; actions.append(.fail(.noInput)) }
+            if now >= deadline(firstInputSince + Self.failAfter) { failed = .noInput; actions.append(.fail(.noInput)) }
             return actions
         }
         let other: Source = carrying == .builtin ? .headset : .builtin
@@ -222,13 +255,13 @@ public struct CaptureHealth: Sendable {
         let usefulNow = reason == nil && lastUseful.map { now - $0 <= Self.staleAfter } == true
         if usefulNow { warned = nil; return actions }
         // Nothing useful is arriving (dead/silent carrier, or still waiting for a first buffer).
-        let deadline = (lastUseful ?? firstInputSince) + Self.failAfter
+        let due = deadline((lastUseful ?? firstInputSince) + Self.failAfter)
         let shown = reason ?? (lastUseful == nil && now - firstInputSince > Self.builtinGrace ? .noInput : nil)
         if let shown, warned == nil {
             warned = shown
             actions.append(.warn(shown))
         }
-        if now >= deadline {
+        if now >= due {
             // The first problem shown is the cause (21:33: the built-in died, then only zeros were left).
             let final = warned ?? reason ?? .noInput
             failed = final

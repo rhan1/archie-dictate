@@ -61,6 +61,7 @@ struct V61CaptureLifetimeTests {
         }
 
         var isDelivering: Bool { true }
+        var started: Bool { lock.withLock { running != nil } }
         var currentDeviceID: UInt32? { 81 }
         var expectedDeviceID: UInt32? { 81 }
         var lastBufferTime: TimeInterval? { nil }

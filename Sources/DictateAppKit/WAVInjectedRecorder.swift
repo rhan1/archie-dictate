@@ -140,6 +140,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
     /// `builtin_start_slow`: the injected built-in unit whose read-back the model checks every tick.
     private let slowUnit = InjectedBuiltinUnit()
     private var slowDriftNoted = false
+    private var slowRebuilt = false
+    private var slowUnreadable = false
+    private var slowStartAt = WAVInjectedRecorder.slowBuiltinStartReturnsAt
     /// Built-in frames stop after this much media time in the dying scenarios.
     public static let builtinLifetime: TimeInterval = 0.5
     /// `sco_torn_down_250ms` timing (s after the headset start; R1 01:53:08.300 + …).
@@ -361,8 +364,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
         pendingPCM.removeAll()
         mediaTime = 1_000
         feed.start(defaultInput: scenario.hasHeadset ? .bluetooth : .other, hasBuiltin: scenario.hasHeadset)
-        if scenario.hasHeadset { feed.sourceStarted(.builtin, at: mediaTime) }
+        // v1.27 (B1): the built-in joins the health clock when its start returns (the recorder's `startBuiltin`).
+        if scenario.hasHeadset, scenario != .builtinStartSlow { feed.sourceStarted(.builtin, at: mediaTime) }
         feed.sourceStarted(.headset, at: mediaTime)
+        if scenario == .builtinStartSlow { feed.headsetStart(inFlight: true) }
         boundaryAt(mediaTime)
         if manualPacing {
             manualRunning = true
@@ -400,6 +405,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
         ioRestartAt = nil
         scoKept = false
         slowDriftNoted = false
+        slowRebuilt = false
+        slowUnreadable = false
+        slowStartAt = Self.slowBuiltinStartReturnsAt
         slowUnit.reset()
         if scenario == .warmHFP {
             warmRunning = true
@@ -726,16 +734,36 @@ public final class WAVInjectedRecorder: EngineRecorder {
             pendingWarmFrames = []
         } else if scenario == .builtinStartSlow {
             let offset = time - boundary
-            if offset + 1e-9 >= Self.slowBuiltinStartReturnsAt { slowUnit.startReturned() }
-            // The recorder's health tick: the device read-back of the active built-in, every 100 ms (v1.8 L1).
-            if !builtinStopped, let check = slowUnit.deviceCheck(), check != .ok, !slowDriftNoted {
-                slowDriftNoted = true
-                feed.deviceProblem(.builtin, .drift)
-                notes.append(check.note)
+            if offset + 1e-9 >= slowStartAt, !slowUnit.isStarted, !builtinStopped {
+                slowUnit.startReturned()
+                feed.sourceStarted(.builtin, at: time)
+            }
+            // The recorder's health tick: the device read-back of the active built-in, every 100 ms (v1.8 L1),
+            // judged by the production policy (v1.27 B1: never before the start returned; unreadable re-read).
+            if !builtinStopped, !slowDriftNoted, let check = slowUnit.deviceCheck() {
+                switch BuiltinWatch.judge(check, headsetStarting: feed.health.headsetStarting(at: time), rebuilt: slowRebuilt) {
+                case .none: slowUnreadable = false
+                case .recheck:
+                    if !slowUnreadable { notes.append(check.note) }
+                    slowUnreadable = true
+                case .rebuild(let problem):
+                    notes += [check.note, "builtin_rebuilt=1 reason=\(problem.rawValue)"]
+                    slowRebuilt = true
+                    feed.builtinRestarting()
+                    slowUnit.reset()
+                    slowStartAt = offset + 0.1
+                case .dead(let problem):
+                    slowDriftNoted = true
+                    feed.deviceProblem(.builtin, problem)
+                    notes.append(check.note)
+                }
             }
             var outs: [CaptureFeed.Output] = []
             if slowUnit.isStarted, !builtinStopped { outs.append(feed.accept(wav, source: .builtin, at: time)) }
-            if offset + 1e-9 >= Self.slowHeadsetStartReturnsAt { outs.append(feed.accept(wav, source: .headset, at: time)) }
+            if offset + 1e-9 >= Self.slowHeadsetStartReturnsAt {
+                if feed.health.headsetInFlight { feed.headsetStart(inFlight: false) }
+                outs.append(feed.accept(wav, source: .headset, at: time))
+            }
             for out in outs {
                 notes += out.notes
                 kept += out.frames
@@ -746,8 +774,14 @@ public final class WAVInjectedRecorder: EngineRecorder {
             if dying, !builtinStopped, time - boundary >= Self.builtinLifetime {
                 builtinStopped = true
                 if scenario == .builtinDrifts {
-                    feed.deviceProblem(.builtin, .drift)
-                    notes.append(BuiltinPin.Check.drift(from: 154).note)
+                    // v1.27 (B1): through the recorder's policy — the headset is already delivering (zeros), so a
+                    // genuine drift is dead exactly as in v1.8 (never rebuilt).
+                    let check = BuiltinPin.Check.drift(from: 154)
+                    notes.append(check.note)
+                    switch BuiltinWatch.judge(check, headsetStarting: feed.health.headsetStarting(at: time), rebuilt: false) {
+                    case .dead(let problem): feed.deviceProblem(.builtin, problem)
+                    default: notes.append("builtin_rebuilt=1 reason=drift")
+                    }
                 }
             }
             var outs: [CaptureFeed.Output] = []
@@ -903,6 +937,7 @@ final class InjectedBuiltinUnit: BuiltinCapture {
     var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
     var onDeviceLost: ((CaptureEpoch) -> Void)?
     private(set) var isStarted = false
+    var started: Bool { isStarted }
     func reset() { isStarted = false }
     func startReturned() { isStarted = true }
     func start(epoch: CaptureEpoch) throws { isStarted = true }
