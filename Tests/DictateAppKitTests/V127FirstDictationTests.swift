@@ -128,8 +128,11 @@ struct V127FirstDictationTests {
         try await waitFor("media_or_end") {
             notes.snapshot.contains { $0.contains("event=end") } || recorder.mediaMs >= mediaTicks * 100
         }
-        engine.finish()
-        try await waitFor("end") { notes.snapshot.contains { $0.contains("event=end") } }
+        // C MISSING-EVENT (gate self-test): V127_MISSING_EVENT=b1 withholds the finish, so `event=end` never comes;
+        // the gate must fail with its literal message within its bound, never hang.
+        let withheld = ProcessInfo.processInfo.environment["V127_MISSING_EVENT"] == "b1"
+        if !withheld { engine.finish() }
+        try await waitFor("end", seconds: withheld ? 10 : 20) { notes.snapshot.contains { $0.contains("event=end") } }
         return (notes.snapshot.first { $0.contains("event=end") } ?? "", notes.snapshot)
     }
 

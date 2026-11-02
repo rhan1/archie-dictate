@@ -66,6 +66,10 @@ public final class AppController {
     private var chunkedEnabled: Bool { (sttEngine == "groq-chunked" || sessionPolicy.mode == .captureOnly) && sessionPolicy.usesGroqSTT }
     private var chunked: EngineChunkSession?
     private var incrementalCleaner: IncrementalCleaner?
+    /// v1.27 (B3): this session's opt-in local transcript trace (nil — the default — writes and formats nothing).
+    private var transcriptTrace: TranscriptTrace?
+    /// v1.27 (B3): a host's pass-through of the `DictateTranscriptTrace` preference (nil: the Dictate domain).
+    var transcriptTraceDefaults: UserDefaults?
     /// Bluetooth warm-up: engine pre-started on the first ⌥ tap, WARMING pill
     /// until the first buffer (G8).
     private lazy var capture = CaptureLifecycle(engine: recorder, scheduler: captureScheduler)
@@ -703,6 +707,10 @@ public final class AppController {
         let session = String(UUID().uuidString.prefix(8)).lowercased()
         openSession = (session, nil)
         sessionNote("session=\(session) event=start")
+        // v1.27 (B3): read at session start; off by default (then no trace object exists at all).
+        transcriptTrace = TranscriptTrace.enabled(transcriptTraceDefaults)
+            ? TranscriptTrace(directory: TranscriptTrace.directory(logURL: paths.logURL), sessionID: session) : nil
+        if transcriptTrace != nil { sessionNote("transcript_trace=on") }
         btStart = BluetoothProfile.sample()
         btEndNotePending = true
         recordingStarted = Date()
@@ -751,6 +759,7 @@ public final class AppController {
                 let keys = keyStore
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
+                if let trace = transcriptTrace { incremental?.onCleaned = { trace.cleaned($0) } }
                 incrementalCleaner = incremental
                 let stopPhrase = StreamingStopPhrase()
                 let observer = onStreamingSegment
@@ -777,6 +786,8 @@ public final class AppController {
                 let keys = keyStore
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
+                let trace = transcriptTrace
+                if let trace { incremental?.onCleaned = { trace.cleaned($0) } }
                 incrementalCleaner = incremental
                 let streaming = GroqChunkedTranscriber(transport: sttTransport, apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
@@ -792,6 +803,9 @@ public final class AppController {
                        incremental?.append(index: index, text: text)
                        if voiceStopEnabled, TrailingStopPhrase.endsDictation(text) { self?.voiceStopHeard(token: token) }
                    },
+                   onChunkTrace: trace.map { trace in { index, final, prompt, raw in
+                       trace.chunk(index: index, final: final, prompt: prompt, raw: raw)
+                   } },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
                 recorder.onPCMChunk = { [pcmTap] pcm in
@@ -880,6 +894,7 @@ public final class AppController {
         let policy = sessionPolicy
         let shadowEnabled = self.shadowEnabled && policy.usesGroqSTT
         let vocabularyPrompt = self.prompt
+        let trace = transcriptTrace
         var timeline = Timeline(media: mediaEvents, warmMs: warmMs, capture: recorder.stats, micFallback: capture.usedBuiltIn, btStart: btStart,
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
@@ -963,6 +978,7 @@ public final class AppController {
                         incremental = await incrementalSession.finish(totalChunks: pipeline.chunks ?? 0, rawText: raw,
                             single: { fullRaw in
                                 let outcome = await policy.clean(fullRaw, groq: groqCleaner, local: localCleaner)
+                                trace?.cleaned(outcome.text)
                                 return .init(text: outcome.text, label: outcome.label, model: outcome.model,
                                              stats: outcome.stats, calls: outcome.calls)
                             })
@@ -986,6 +1002,7 @@ public final class AppController {
                         }
                     } else {
                         let outcome = await policy.clean(raw, groq: groqCleaner, local: localCleaner)
+                        trace?.cleaned(outcome.text)
                         pipeline.text = outcome.text
                         pipeline.cleanup = outcome.label
                         pipeline.cleanupModel = outcome.model
@@ -1061,6 +1078,7 @@ public final class AppController {
                     let publicTimeline = DictationTimeline(latency_ms: latency, stt_ms: report.sttMs,
                         cleanup_ms: report.cleanupMs, chunks: report.chunks, path: report.path,
                         cleanup_mode: policy.usesCleanup ? report.cleanupMode : "none", fallback: policy.fallbackLabel)
+                    trace?.pasted(text)
                     policy.deliver(text, transcript: { self.engineOnTranscript?($0, publicTimeline) }, paste: { text in
                         // v1.14: under the rig the paste goes to the row's file, never to the frontmost app.
                         if let rig = self.rig {
