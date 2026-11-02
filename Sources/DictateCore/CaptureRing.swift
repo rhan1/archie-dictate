@@ -174,6 +174,7 @@ public struct CaptureFeed {
         alignNote = nil
         extraNotes = []
         health = CaptureHealth()
+        health.bluetooth = defaultInput == .bluetooth
         evidence = CaptureEvidence()
         timeline = SourceTimeline()
         timeline.headsetLabel = defaultInput == .bluetooth ? "headset" : "default_input"
@@ -186,6 +187,10 @@ public struct CaptureFeed {
     /// A silent VP graph was discarded. Give plain input its own first-buffer window,
     /// preserving the recording boundary, bridge, evidence, timeline and captured frames.
     public mutating func restartInputHealth(at time: TimeInterval) { health.restartInput(at: time) }
+    /// v1.27 (B1): the headset client's start or re-attach was called (true) / returned (false).
+    public mutating func headsetStart(inFlight: Bool) { health.headsetStart(inFlight: inFlight) }
+    /// v1.27 (B1): a new built-in unit replaces a lost one (its start returns → `sourceStarted`).
+    public mutating func builtinRestarting() { health.sourceRestarting(.builtin) }
     /// The device read-back or listener found a problem with a source.
     public mutating func deviceProblem(_ source: CaptureBridge.Source, _ problem: CaptureHealth.Problem) {
         health.deviceProblem(source, problem)

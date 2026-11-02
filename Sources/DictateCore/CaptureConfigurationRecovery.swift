@@ -96,18 +96,24 @@ public enum BuiltinPin {
         case ok
         case corrected(from: UInt32)
         case drift(from: UInt32)
+        /// v1.27 (B1): the unit's device property could not be read (not initialised yet, or a
+        /// transient error). Never a drift: the recorder logs it and reads again on the next tick.
+        case unreadable
         public var note: String {
             switch self {
             case .ok: return "bridge_device_check=ok"
             case .corrected(let from): return "bridge_device_check=drift from=\(from) fixed=1"
             case .drift(let from): return "bridge_device_check=drift from=\(from) fixed=0"
+            case .unreadable: return "bridge_device_check=unreadable"
             }
         }
     }
     /// Reads the AUHAL's current device; on drift writes the built-in once and reads back.
+    /// v1.27 (B1): an unreadable property is `.unreadable`; `.drift` only for a readable mismatch
+    /// the write could not correct.
     public static func enforce(expected: UInt32, read: () throws -> UInt32,
                                write: (UInt32) throws -> Void) -> Check {
-        guard let current = try? read() else { return .drift(from: 0) }
+        guard let current = try? read() else { return .unreadable }
         if current == expected { return .ok }
         guard (try? write(expected)) != nil, let after = try? read(), after == expected else {
             return .drift(from: current)

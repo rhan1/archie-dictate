@@ -35,6 +35,7 @@ struct CaptureLeaseRecorderTests {
         }
         func stop(epoch: CaptureEpoch) { if lock.withLock({ running === epoch }) { stop() } }
         var isDelivering: Bool { true }
+        var started: Bool { lock.withLock { running != nil } }
         var currentDeviceID: UInt32? { 81 }
         var expectedDeviceID: UInt32? { 81 }
         var lastBufferTime: TimeInterval? { nil }

@@ -35,6 +35,9 @@ final class BuiltinCaptureUnit: BuiltinCapture {
     private var lastArrival: TimeInterval?
     private var retained: [BuiltinRenderContext] = []
     private(set) var deviceUID: String?
+    /// v1.27 (B1): set on the unit's queue when `start(epoch:)` returned; cleared by `stop()`.
+    private var isStarted = false
+    var started: Bool { lock.withLock { isStarted } }
     private let targetFormat = try? NativePCM.format(.pcmFormatFloat32, rate: AudioRecorder.sampleRate,
                                              channels: 1, interleaved: false)
     /// Notes for the recorder's timeline (start step errors, teardown errors, render errors).
@@ -119,6 +122,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         }
         listen(device: id, epoch: token)
         startWorker()
+        lock.withLock { isStarted = true }
     }
 
     func stop(epoch token: CaptureEpoch) {
@@ -132,6 +136,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         defer { unitLock.unlock() }
         let (unit, timer, listeners) = lock.withLock { () -> (AudioUnit?, DispatchSourceTimer?, [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)]) in
             epoch = nil
+            isStarted = false
             let taken = (self.unit, self.timer, self.listeners)
             self.timer = nil
             self.listeners = []
