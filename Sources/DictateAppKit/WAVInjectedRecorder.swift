@@ -593,7 +593,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 switch warmIO.configurationChanged(at: at, engineRunning: running) {
                 case .leaveRunning: notes.append("bt_recovery=hands_off path=configuration engine_running=1")
                 case .reattach: notes += warmReattach(at: at, notified: true)
-                case .escalate: notes += warmRequestRestart(at: at)
+                case .escalate: notes += warmRequestRestart(at: at, escalation: true)
                 case .pending, .none, .exhausted, .episode:
                     notes.append("bt_recovery=obligation path=configuration engine_running=\(running ? 1 : 0) in_flight=1")
                 }
@@ -620,6 +620,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 let outcome = BluetoothRecoveryEpisode.verdict(since: check.since, firstFrame: check.firstFrame,
                                                                firstSignal: check.firstSignal)
                 warmEpisode.settled(outcome)
+                warmIO.attemptSettled()                        // v1.28 FR1-A: the recorder's `settledLocked`
                 notes.append("bt_recovery=settled result=\(outcome.rawValue)")
             }
         }
@@ -671,7 +672,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         guard scenario.hfpModel, arm == .engine, !warmRestarting else { return [] }
         switch warmIO.observe(at: now, engineRunning: warmRunning) {
         case .reattach: return warmReattach(at: now, notified: false)
-        case .escalate: return ["bt_recovery=escalate path=obligation"] + warmRequestRestart(at: now)
+        case .escalate: return ["bt_recovery=escalate path=obligation"] + warmRequestRestart(at: now, escalation: true)
         default: return []
         }
     }
@@ -699,12 +700,24 @@ public final class WAVInjectedRecorder: EngineRecorder {
     }
 
     /// `requestHeadsetRestart`: admitted by the episode, run when due.
-    private func warmRequestRestart(at now: TimeInterval) -> [String] {
+    /// `escalation` (v1.28 FR1-A): the guard's escalation — the episode's answer goes back to the guard.
+    private func warmRequestRestart(at now: TimeInterval, escalation: Bool = false) -> [String] {
         switch warmEpisode.request(.restart, at: now) {
-        case .now: warmEvents.append((now, .restart)); return []
-        case .after(let wait): warmEvents.append((now + wait, .restart)); return ["bt_recovery=queued path=restart wait_ms=\(Int((wait * 1000).rounded()))"]
-        case .coalesced: return []
-        case .exhausted: return ["bt_recovery=exhausted path=restart"]
+        case .now:
+            if escalation { warmIO.restartRequested(.queued) }
+            warmEvents.append((now, .restart)); return []
+        case .after(let wait):
+            if escalation { warmIO.restartRequested(.queued) }
+            warmEvents.append((now + wait, .restart)); return ["bt_recovery=queued path=restart wait_ms=\(Int((wait * 1000).rounded()))"]
+        case .coalesced:
+            if escalation {
+                let restartOwns = warmEpisode.pendingDue != nil || warmRestarting
+                warmIO.restartRequested(restartOwns ? .queued : .coalesced)
+            }
+            return []
+        case .exhausted:
+            if escalation { warmIO.restartRequested(.refused) }
+            return ["bt_recovery=exhausted path=restart"]
         }
     }
 

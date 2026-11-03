@@ -13,7 +13,7 @@ import Testing
 struct EscalationRig {
     enum Order: String { case observationFirst = "observation_first", verdictFirst = "verdict_first" }
     enum Kind { case tick, admit, settle(Int), restartDue, restartEntry, restartReturn, freshStop, ioBack, notify(Bool) }
-    struct Verification { let token: Int; let since: Double; var firstFrame: Double?; var signal = SustainedSignal(); var firstSignal: Double? }
+    struct Verification { let token: Int; let since: Double; var isRestart = false; var firstFrame: Double?; var signal = SustainedSignal(); var firstSignal: Double? }
 
     let order: Order
     /// Executor latency between the guard's reservation and the episode's admission + verification arm.
@@ -58,7 +58,7 @@ struct EscalationRig {
             case .restartDue: restartDue(t)
             case .restartEntry:
                 tokens += 1
-                verification = Verification(token: tokens, since: t)          // armed before the start (verifyFrames)
+                verification = Verification(token: tokens, since: t, isRestart: true)   // armed before the start (verifyFrames)
                 schedule(t + BluetoothRecoveryEpisode.successWithin, .settle(tokens))
             case .restartReturn:
                 restarting = false
@@ -99,7 +99,7 @@ struct EscalationRig {
         case .reattach: schedule(t + admitDelay, .admit)
         case .escalate:
             log.append("\(ms(t)):escalate(\(source))")
-            requestRestart(t)
+            requestRestart(t, escalation: true)
         default: break
         }
     }
@@ -125,15 +125,29 @@ struct EscalationRig {
         guard episode.isRunning else { return }
         let outcome = BluetoothRecoveryEpisode.verdict(since: check.since, firstFrame: check.firstFrame, firstSignal: check.firstSignal)
         episode.settled(outcome)
+        io.attemptSettled()                                    // FR1-A: AudioRecorder.settledLocked
         log.append("\(ms(t)):settled=\(outcome.rawValue)")
     }
 
-    mutating func requestRestart(_ t: Double) {
+    /// `requestHeadsetRestart(…, escalation:)`: FR1-A hands the episode's answer back to the guard.
+    mutating func requestRestart(_ t: Double, escalation: Bool) {
         switch episode.request(.restart, at: t) {
-        case .now: schedule(t, .restartDue)
-        case .after(let wait): schedule(t + wait, .restartDue); log.append("\(ms(t)):queued")
-        case .coalesced: log.append("\(ms(t)):coalesced")
-        case .exhausted: log.append("\(ms(t)):exhausted")
+        case .now:
+            if escalation { io.restartRequested(.queued) }
+            schedule(t, .restartDue)
+        case .after(let wait):
+            if escalation { io.restartRequested(.queued) }
+            schedule(t + wait, .restartDue); log.append("\(ms(t)):queued")
+        case .coalesced:
+            if escalation {
+                if episode.pendingDue != nil { io.restartRequested(.queued) }
+                else if restarting || verification?.isRestart == true { io.restartRequested(.started) }
+                else { io.restartRequested(.coalesced) }
+            }
+            log.append("\(ms(t)):coalesced")
+        case .exhausted:
+            if escalation { io.restartRequested(.refused) }
+            log.append("\(ms(t)):exhausted")
         }
     }
 
