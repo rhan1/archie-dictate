@@ -102,6 +102,8 @@ public final class AudioRecorder: CaptureEngine {
         /// v1.28 (B1): the start found HFP up less than `HeadsetIOGuard.warmAfter` (cold-on-HFP; the timeline's
         /// `warm=0 reason=transient`).
         public var transientHFP = false
+        /// v1.28 FR3-D: `bt_route=<cold|warm|transient> since_release_ms=<n|none>` for a Bluetooth capture (timeline).
+        public var btRoute: String?
         public init() {}
 
         /// The capture part of the session-end line (counts only), shared by Dictate and hosts:
@@ -242,6 +244,8 @@ public final class AudioRecorder: CaptureEngine {
     /// v1.28 FR1-B (diagnostics/tests): the last start's classification, `warm=<0|1> route=<…> since_release_ms=<n|->`.
     private var lastClassification = "none"
     var classificationNote: String { lock.withLock { lastClassification } }
+    /// v1.28 FR3-D: this capture's `bt_route=<cold|warm|transient> since_release_ms=<n|none>` (nil: not Bluetooth).
+    private var startRouteNote: String?
     // v1.12 (L3): the headset client arm, and the A/B instrumentation (state under `lock`).
     public let headsetBackend: HeadsetBackend
     private let makeHeadset: () -> HeadsetCapture
@@ -291,14 +295,17 @@ public final class AudioRecorder: CaptureEngine {
         // previous Bluetooth capture's release is that capture's link collapsing back to A2DP (cold-on-HFP).
         let hfp = bluetooth && route.hfpAlready()
         let sinceRelease = lock.withLock { lastBluetoothReleaseAt }.map { ProcessInfo.processInfo.systemUptime - $0 }
-        let startRoute = HeadsetIOGuard.startRoute(hfp: hfp, sinceRelease: sinceRelease)
+        let startRoute: HeadsetIOGuard.StartRoute = bluetooth ? HeadsetIOGuard.startRoute(hfp: hfp, sinceRelease: sinceRelease) : .cold
         let warmRoute = startRoute == .warm
         lock.withLock {
+            // v1.28 FR3-D: every Bluetooth start's criterion goes on the timeline (`bt_route=… since_release_ms=…`).
+            startRouteNote = bluetooth ? "bt_route=\(startRoute.rawValue) since_release_ms="
+                + (sinceRelease.map { String(Int(($0 * 1000).rounded())) } ?? "none") : nil
             lastClassification = "warm=\(warmRoute ? 1 : 0) route=\(startRoute.rawValue) since_release_ms="
                 + (sinceRelease.map { String(Int(($0 * 1000).rounded())) } ?? "-")
         }
         if startRoute == .transient {
-            AppController.note("bt_start=hfp warm=0 reason=transient since_release_ms=\(Int(((sinceRelease ?? 0) * 1000).rounded()))")
+            AppController.note("bt_start=\(hfp ? "hfp" : "not_hfp") warm=0 reason=transient since_release_ms=\(Int(((sinceRelease ?? 0) * 1000).rounded()))")
         }
         var abandonedMs: Int?
         let unit: BuiltinCapture? = lock.withLock {
@@ -2006,6 +2013,7 @@ public final class AudioRecorder: CaptureEngine {
             stats.carrierFrames = feed.timeline.framesNote
             stats.instrumentation = instrumentation.note(boundary: captureBoundary)
             stats.transientHFP = ioGuard.transientRoute
+            stats.btRoute = startRouteNote
         }
         stats.lease = lease?.grantNote ?? stats.lease
         // v1.12 (L1): the lease is released below; it completes when every part acknowledged.
