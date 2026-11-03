@@ -24,6 +24,27 @@ struct V128TailRestoreTests {
         #expect(!TranscriptCleaner.restoreShortTail(raw: "Yes.", cleaned: "").restored)
     }
 
+    /// v1.28 FR4-B (FR3 stop-rule review): the restore is only for a closed answer phrase. RED on 0051609: a filler
+    /// ("You know.") is put back, and a correction's tail ("No, Wednesday.") is re-appended after the cleaner applied it.
+    @Test func onlyClosedAnswersAreRestored() {
+        let filler = TranscriptCleaner.restoreShortTail(raw: "Send the draft today. You know.", cleaned: "Send the draft today.")
+        let correction = TranscriptCleaner.restoreShortTail(raw: "Send it Tuesday. Then call Maria. No, Wednesday.",
+                                                            cleaned: "Send it Wednesday. Then call Maria.")
+        let cue = TranscriptCleaner.restoreShortTail(raw: "Send it Tuesday. Sorry, make that Wednesday. Okay.",
+                                                     cleaned: "Send it Wednesday.")
+        let yes = TranscriptCleaner.restoreShortTail(raw: "Send the invoice to Limpar today. Yes.", cleaned: "Send the invoice to Limpar today.")
+        let goAhead = TranscriptCleaner.restoreShortTail(raw: "Deploy the build tonight. Go ahead.", cleaned: "Deploy the build tonight.")
+        print("FR4-B LITERAL you_know restored=\(filler.restored) text=\"\(filler.text)\" | correction restored=\(correction.restored) text=\"\(correction.text)\" | cue restored=\(cue.restored) | yes restored=\(yes.restored) text=\"\(yes.text)\" | go_ahead restored=\(goAhead.restored)")
+        #expect(!filler.restored && filler.text == "Send the draft today.")
+        #expect(!correction.restored && correction.text == "Send it Wednesday. Then call Maria.")
+        #expect(!cue.restored && cue.text == "Send it Wednesday.")
+        #expect(yes.restored && yes.text == "Send the invoice to Limpar today. Yes.")
+        #expect(goAhead.restored && goAhead.text == "Deploy the build tonight. Go ahead.")
+        for filler in ["I mean.", "Uh-huh.", "Um.", "You know what."] {
+            #expect(!TranscriptCleaner.restoreShortTail(raw: "Send the draft today. \(filler)", cleaned: "Send the draft today.").restored)
+        }
+    }
+
     @Test func promptKeepsSentenceFinalAnswers() {
         let prompts = [TranscriptCleaner.instructions, TranscriptCleaner.midInstructions]
         print("FR3-C LITERAL prompt_rule=\(prompts.map { $0.contains("Yes.") })")
