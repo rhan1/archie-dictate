@@ -234,6 +234,9 @@ public final class AudioRecorder: CaptureEngine {
     /// v1.28 (B1): uptime at which this recorder last released a Bluetooth capture (the HFP link it held then
     /// drops back to A2DP over the next ~1 s). The route probe cannot tell since when HFP is up; this is the criterion.
     private var lastBluetoothReleaseAt: TimeInterval?
+    /// v1.28 FR1-B (diagnostics/tests): the last start's classification, `warm=<0|1> route=<…> since_release_ms=<n|->`.
+    private var lastClassification = "none"
+    var classificationNote: String { lock.withLock { lastClassification } }
     // v1.12 (L3): the headset client arm, and the A/B instrumentation (state under `lock`).
     public let headsetBackend: HeadsetBackend
     private let makeHeadset: () -> HeadsetCapture
@@ -285,6 +288,10 @@ public final class AudioRecorder: CaptureEngine {
         let sinceRelease = lock.withLock { lastBluetoothReleaseAt }.map { ProcessInfo.processInfo.systemUptime - $0 }
         let startRoute = HeadsetIOGuard.startRoute(hfp: hfp, sinceRelease: sinceRelease)
         let warmRoute = startRoute == .warm
+        lock.withLock {
+            lastClassification = "warm=\(warmRoute ? 1 : 0) route=\(startRoute.rawValue) since_release_ms="
+                + (sinceRelease.map { String(Int(($0 * 1000).rounded())) } ?? "-")
+        }
         if startRoute == .transient {
             AppController.note("bt_start=hfp warm=0 reason=transient since_release_ms=\(Int(((sinceRelease ?? 0) * 1000).rounded()))")
         }
