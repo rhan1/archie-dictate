@@ -132,6 +132,8 @@ public final class AppController {
     private(set) var rig: RigWatcher?
     /// Tests: this controller's session/failure notes (the process-wide note sink is shared).
     var onSessionNote: ((String) -> Void)?
+    /// v1.28 FR2 (diagnostics/tests): the last dictation's timeline line, as written to stderr.
+    private(set) var lastTimelineLine: String?
     private func sessionNote(_ line: String) {
         Self.note(line)
         onSessionNote?(line)
@@ -1162,9 +1164,11 @@ public final class AppController {
                     }
                 }
                 if fake == nil {
-                    AppController.note(finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path,
-                                                          chunkFallback: report.chunkFallback,
-                                                          keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok") + (policy.fallbackFields.map { " fallback=\($0)" } ?? ""))
+                    let line = finalTimeline.line(sttMs: report.sttMs, cleanupMs: report.cleanupMs, path: report.path,
+                                                  chunkFallback: report.chunkFallback,
+                                                  keyState: self.keyStore.missing(for: "groq-api")?.rawValue ?? "ok") + (policy.fallbackFields.map { " fallback=\($0)" } ?? "")
+                    self.lastTimelineLine = line              // v1.28 FR2 (diagnostics/tests): the last timeline line
+                    AppController.note(line)
                 }
             }
         }
