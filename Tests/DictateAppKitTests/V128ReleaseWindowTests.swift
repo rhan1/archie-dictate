@@ -48,10 +48,10 @@ struct V128ReleaseWindowTests {
         let backend = "auhal"
     }
 
-    private func session(_ recorder: AudioRecorder) async throws -> Bool {
+    private func session(_ recorder: AudioRecorder, seconds: Double = 0.3) async throws -> Bool {
         try await recorder.startAsync(device: .default)
         recorder.resetCapture()
-        try await Task.sleep(nanoseconds: 300_000_000)
+        try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
         _ = recorder.stop()
         return recorder.stats.transientHFP
     }
@@ -84,5 +84,42 @@ struct V128ReleaseWindowTests {
         #expect(!first)
         #expect(delayed)
         #expect(!control)
+    }
+
+    final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Bool
+        init(_ value: Bool) { self.value = value }
+        var get: Bool { lock.withLock { value } }
+        func set(_ v: Bool) { lock.withLock { value = v } }
+    }
+
+    /// v1.28 FR3-D (Raza's step 7, d7a55886 → d0181047, 02:25): A on HFP, its headset never delivers (zeros; restart
+    /// still_silent); B's bridge configured 0.87 s after A's release, when the output already read A2DP (mid-flip) —
+    /// `route.hfpAlready()` false → classed COLD, no transient note. RED on 0faa887: `route=cold`; GREEN: transient.
+    /// Control: a start 2.5 s after the release on A2DP stays cold.
+    @Test func startRightAfterOurReleaseIsTransientEvenWhenTheProfileReadsA2DP() async throws {
+        let hfp = Flag(true)
+        var route = V127FirstDictationTests.route
+        route.hfpAlready = { hfp.get }
+        let headset = V127FirstDictationTests.SlowHeadset()
+        headset.level = 0                                       // A's link never carries (digital zeros)
+        let recorder = AudioRecorder(builtin: { V127FirstDictationTests.SlowBuiltin(startBlocks: 0) },
+                                     headset: { headset }, backend: .auhal, broker: CaptureLeaseBroker(), route: route)
+        _ = try await session(recorder, seconds: 1.5)          // A: the bridge's zero-run restart runs inside it
+        _ = await recorder.awaitRelease()
+        let releasedAt = ProcessInfo.processInfo.systemUptime
+        hfp.set(false)                                          // the link is mid-flip: the output reads A2DP
+        try await sleep(until: releasedAt + 1.0)
+        let b = try await session(recorder)
+        let bNote = recorder.classificationNote
+        _ = await recorder.awaitRelease()
+        try await sleep(until: ProcessInfo.processInfo.systemUptime + 2.5)
+        let c = try await session(recorder)
+        let cNote = recorder.classificationNote
+        _ = await recorder.awaitRelease()
+        print("FR3-D LITERAL B_1s_after_release transient=\(b) \(bNote) | control C_2_5s_after transient=\(c) \(cNote)")
+        #expect(b)
+        #expect(!c && cNote.contains("route=cold"))
     }
 }
