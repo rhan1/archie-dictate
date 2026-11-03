@@ -109,6 +109,13 @@ public final class IncrementalCleaner: @unchecked Sendable {
             return
         }
         let text = raw(from: covered, to: end)
+        // v1.28 FR3-B (f049157e): chunks emptied as silent (or wholly dropped) are never offered to the cleaner — an
+        // empty mid came back as a stray token, was rejected for its ratio, and disabled the incremental path.
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            covered = end
+            schedule()
+            return
+        }
         let context = prefix
         calls += 1
         pendingEnd = end
