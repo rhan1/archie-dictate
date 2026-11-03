@@ -67,6 +67,10 @@ import DictateCore
 ///   `TransientModel.restartTakes` after it begins, delivers nothing and is stopped by a notification
 ///   `TransientModel.restartStopsAfter` later. A re-attach after that brings IO with real signal (the WAV) from
 ///   `TransientModel.signalFrom`. The production guard, episode and feed decide every step, as the recorder does.
+/// - `silent_headset_roomnoise` (v1.28 FR2-C): 2026-11-04 00:43 (19f69203, Archie 62.4.1), Raza silent for 22 s on
+///   HFP. The Bluetooth headset delivers near-zeros (≈ −90 dBFS, never reaching `CaptureBridge.silencePeak`, as
+///   after the 16 k → 24 k conversion: `rms_dbfs=headset:-88.9`), so the built-in carries; the WAV is the built-in's
+///   room noise (the test writes it).
 ///   v1.28 FR1-C: a FITTED failure model of f243a0c8 (run1-stderr.txt lines 348–366), not an exact replay. Modelled
 ///   as logged: the re-attach (+988 → +1000), `builtin_fallback` (+1906 → +1900), `settled silent_frames` →
 ///   `escalate` → `queued wait_ms=484` (→ 500), the fresh engine's start returning (+3402 → +3400) and its stopped
@@ -91,6 +95,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case warmHFP = "warm_hfp", spliceLag = "splice_lag"
         case builtinStartSlow = "builtin_start_slow"
         case transientHFP = "transient_hfp"
+        case silentHeadsetRoomnoise = "silent_headset_roomnoise"
         var hasHeadset: Bool { self != .plain }
         /// v1.13: the headset and the built-in each play their own track.
         public var usesTracks: Bool {
@@ -580,6 +585,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     /// The headset's buffer for the chunk at `offset` s after the boundary (nil: its engine is stopped).
     private func headsetChunk(offset: TimeInterval, wav: [Float]) -> [Float]? {
+        if scenario == .silentHeadsetRoomnoise { return wav.indices.map { Self.floorSample($0) * 0.05 } }   // ≈ −90 dBFS
         if scenario == .headsetTakeover { return offset + 1e-9 >= Self.takeoverAt ? wav : [Float](repeating: 0, count: wav.count) }
         guard scenario == .scoTornDown250ms, let io = scoIOAt else { return [Float](repeating: 0, count: wav.count) }
         guard offset + 0.1 > io else { return nil }
