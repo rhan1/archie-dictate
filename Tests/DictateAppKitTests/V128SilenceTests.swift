@@ -59,7 +59,7 @@ private actor FR2HTTP: HTTPTransport {
 /// 5 chunks of prompt echoes, cleaner `mid_rejected_ratio` → the raw echoes were pasted. No hardware, no network.
 @Suite("V128Silence", .serialized)
 struct V128SilenceTests {
-    struct Run { var end: String; var pasted: String?; var pill: String; var timeline: String; var log: String }
+    struct Run { var end: String; var pasted: String?; var pill: String; var timeline: String; var log: String; var trace = "" }
 
     static let echoes = ["Dives by T. Dictate.", "Dives by T T T. Dictate.", "Dives by T T T.", "Thank you.",
                          "The floor. Thank you.", "Thank you.", "Dictate."]
@@ -105,7 +105,8 @@ struct V128SilenceTests {
     }
 
     @MainActor private func dictate(samples: [Int16], scenario: WAVInjectedRecorder.Scenario, mediaSeconds: Double,
-                                    stt: @escaping @Sendable (Int, Int) -> String, cleanup: FR2HTTP.Cleanup) async throws -> Run {
+                                    stt: @escaping @Sendable (Int, Int) -> String, cleanup: FR2HTTP.Cleanup,
+                                    trace: Bool = false) async throws -> Run {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-v128-fr2-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -137,6 +138,12 @@ struct V128SilenceTests {
         let notes = Box<[String]>([])
         controller.onSessionNote = { line in notes.update { $0.append(line) } }
         let engine = DictationEngine(controller: controller)
+        if trace {
+            let suite = "dictate-v128-fr3c-\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defaults.set(true, forKey: TranscriptTrace.key)
+            engine.transcriptTrace(defaults: defaults)
+        }
         let pill = Box<String>("none")
         engine.onState = { state in
             switch state {
@@ -153,8 +160,11 @@ struct V128SilenceTests {
         try await waitFor("timeline") { controller.lastTimelineLine != nil }
         try? await Task.sleep(nanoseconds: 100_000_000)       // the pill's outcome lands on the main queue
         let log = (try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? ""
+        let traceDir = TranscriptTrace.directory(logURL: paths.logURL)
+        let traceText = ((try? FileManager.default.contentsOfDirectory(at: traceDir, includingPropertiesForKeys: nil)) ?? [])
+            .compactMap { try? String(contentsOf: $0, encoding: .utf8) }.joined(separator: "\n")
         return Run(end: notes.get.first { $0.contains("event=end") } ?? "", pasted: pasted.get, pill: pill.get,
-                   timeline: controller.lastTimelineLine ?? "", log: log)
+                   timeline: controller.lastTimelineLine ?? "", log: log, trace: traceText)
     }
 
     static func field(_ name: String, _ line: String) -> String {
@@ -207,5 +217,18 @@ struct V128SilenceTests {
         #expect(Self.field("outcome", r.end) == "ok")
         #expect(r.pasted == "please send the report to archie today")
         #expect(r.pill == "word=raw")
+    }
+
+    /// v1.28 FR3-C (Raza's step 4, 02:23:23, trace 73757a51.txt): raw `Send the invoice to Limpar today.` + final chunk
+    /// `Yes.` → `cleaned=Send the invoice to Limpar today.` → "Yes." lost. The stub cleaner drops it the same way.
+    /// RED on 0faa887: pasted without "Yes.", no `cleaner_in=` in the trace. GREEN: "Yes." restored, `cleaner_in=` traced.
+    @MainActor @Test func sentenceFinalAnswerIsNeverDropped() async throws {
+        let r = try await dictate(samples: Self.toneDictation(peak: 0.25), scenario: .plain, mediaSeconds: 4.2,
+                                  stt: { _, bytes in bytes > 40_000 ? "Send the invoice to Limpar today. Yes." : "" },
+                                  cleanup: .clean("Send the invoice to Limpar today."), trace: true)
+        let cleanerIn = r.trace.split(separator: "\n").filter { $0.hasPrefix("cleaner_in=") }.map(String.init)
+        print("FR3-C LITERAL outcome=\(Self.field("outcome", r.end)) pasted=\"\(r.pasted ?? "")\" trace_cleaner_in=\(cleanerIn)")
+        #expect(r.pasted == "Send the invoice to Limpar today. Yes.")
+        #expect(cleanerIn.contains("cleaner_in=Send the invoice to Limpar today. Yes."))
     }
 }
