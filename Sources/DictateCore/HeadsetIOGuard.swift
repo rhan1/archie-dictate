@@ -68,10 +68,13 @@ public struct HeadsetIOGuard: Sendable {
     }
     /// v1.28 (B1): `hfp` = the route probe found HFP; `sinceRelease` = seconds since this recorder's previous
     /// Bluetooth capture released (nil: none this launch).
+    /// v1.28 FR3-D: a start within `warmAfter` of our own Bluetooth release is transient WHATEVER the profile sample
+    /// says — the link is ours and in flux. Live (2026-11-04 02:25, d0181047): the bridge configured 0.87 s after the
+    /// previous release, when the output already read A2DP (mid-flip), so the start was classed cold and the transient
+    /// rule never applied; our own engine then re-requested HFP.
     public static func startRoute(hfp: Bool, sinceRelease: TimeInterval?) -> StartRoute {
-        guard hfp else { return .cold }
         if let since = sinceRelease, since < warmAfter { return .transient }
-        return .warm
+        return hfp ? .warm : .cold
     }
 
     public enum Reaction: Equatable, Sendable {

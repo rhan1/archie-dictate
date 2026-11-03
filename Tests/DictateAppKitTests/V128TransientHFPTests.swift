@@ -105,6 +105,7 @@ struct V128TransientHFPTests {
     @Test func timelineNamesTheTransientStart() {
         var capture = AudioRecorder.CaptureStats()
         capture.transientHFP = true
+        capture.btRoute = "bt_route=transient since_release_ms=600"     // v1.28 FR3-D
         let transient = AppController.Timeline(media: "none", warmMs: 494, capture: capture, btStart: "hfp",
                                                capturedSeconds: 1, peakDBFS: -20)
             .line(sttMs: 1, cleanupMs: 1, path: "groq-chunked", chunkFallback: nil, keyState: "ok")
@@ -115,6 +116,8 @@ struct V128TransientHFPTests {
         print("B1 LITERAL timeline \(transient.split(separator: " ").prefix(7).joined(separator: " "))")
         #expect(transient.contains(" bt_start=hfp ") && transient.contains(" warm_ms=494 warm=0 reason=transient media=none "))
         #expect(!warm.contains("reason=transient") && warm.contains(" warm_ms=494 media=none "))
+        #expect(transient.contains(" bt_route=transient since_release_ms=600"))
+        #expect(warm.contains(" bt_route=transient since_release_ms=600"))      // FR3-D: logged on every Bluetooth start
     }
 
     // MARK: controls — each literal is pasted from 3a48d95 and from 1.28

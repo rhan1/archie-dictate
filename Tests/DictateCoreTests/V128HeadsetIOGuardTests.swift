@@ -9,7 +9,8 @@ struct V128HeadsetIOGuardTests {
 
     @Test func startRouteClassification() {
         #expect(HeadsetIOGuard.warmAfter == 2.0)
-        #expect(HeadsetIOGuard.startRoute(hfp: false, sinceRelease: 0.1) == .cold)
+        #expect(HeadsetIOGuard.startRoute(hfp: false, sinceRelease: 0.1) == .transient)   // FR3-D: mid-flip link reads A2DP
+        #expect(HeadsetIOGuard.startRoute(hfp: false, sinceRelease: 2.0) == .cold)
         #expect(HeadsetIOGuard.startRoute(hfp: false, sinceRelease: nil) == .cold)
         #expect(HeadsetIOGuard.startRoute(hfp: true, sinceRelease: 0.1) == .transient)       // f243a0c8
         #expect(HeadsetIOGuard.startRoute(hfp: true, sinceRelease: 1.999) == .transient)
