@@ -58,6 +58,15 @@ import DictateCore
 ///   is in flight until `slowHeadsetStartReturnsAt`, then it hears the WAV and takes over. The model runs
 ///   the recorder's per-tick device check (`BuiltinCapture.deviceCheck()` on an injected unit) and its
 ///   handling, then the production health clock.
+/// - `transient_hfp` (v1.28 B1): 2026-11-03 f243a0c8 (`bt_start=hfp warm_ms=494`), a dictation started 100 ms
+///   after the previous one released (`releaseGap`), on an HFP link that is collapsing back to A2DP. The engine
+///   arm's tap delivers digital zeros from `TransientModel.zerosFrom`; the engine stops (no notification) at
+///   `TransientModel.stopsAt` — the health clock sees it stopped; a re-attach (retap) brings IO back, still zeros
+///   (the link is gone), and the link's flip draws a running configuration notification at
+///   `TransientModel.collapseNotifyAt`. A restart re-requests HFP: its fresh engine starts
+///   `TransientModel.restartTakes` after it begins, delivers nothing and is stopped by a notification
+///   `TransientModel.restartStopsAfter` later. A re-attach after that brings IO with real signal (the WAV) from
+///   `TransientModel.signalFrom`. The production guard, episode and feed decide every step, as the recorder does.
 public final class WAVInjectedRecorder: EngineRecorder {
     /// Which re-attach the `sco_torn_down_250ms` IO model runs.
     public enum IOPolicy: Sendable { case v19, v110 }
@@ -68,11 +77,15 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case pauseZeros = "pause_zeros", headsetDrops = "headset_drops", livePause = "live_pause"
         case warmHFP = "warm_hfp", spliceLag = "splice_lag"
         case builtinStartSlow = "builtin_start_slow"
+        case transientHFP = "transient_hfp"
         var hasHeadset: Bool { self != .plain }
         /// v1.13: the headset and the built-in each play their own track.
         public var usesTracks: Bool {
             self == .pauseZeros || self == .headsetDrops || self == .livePause || self == .warmHFP || self == .spliceLag
+                || self == .transientHFP
         }
+        /// The warm/transient HFP IO model (the recorder's policy on the production guard and episode).
+        var hfpModel: Bool { self == .warmHFP || self == .transientHFP }
     }
     /// v1.13: the headset client modeled — only the size of the headset's deliveries differs (10-13 A/B
     /// session lines: engine `io_callbacks=…headset:149 frames=…headset:357552` = 2400 frames per
@@ -116,7 +129,37 @@ public final class WAVInjectedRecorder: EngineRecorder {
         /// `obligation path=configuration engine_running=0`) and delivers no frames (`result=no_frames`).
         public static let restartStopsAfter: TimeInterval = 0.128
     }
-    private enum WarmEvent { case notify(running: Bool), ioBack, restartStart, restart, settle(CaptureEpoch) }
+    /// `transient_hfp` IO model, from f243a0c8 (standalone 1.25, 2026-11-03; v1.26 report lines 18–21).
+    public enum TransientModel {
+        /// The previous dictation (58ca434f, 170 ms) released 100 ms before this start.
+        public static let releasedBefore: TimeInterval = 0.1
+        /// The engine's first buffers (digital zeros on the collapsing link): `builtin_fallback` at +1906 = first
+        /// headset buffer + `CaptureBridge.fallbackAfter`.
+        public static let zerosFrom: TimeInterval = 0.4
+        /// The engine stops without a notification; the health clock sees it (`reattach path=obligation
+        /// reason=engine_stopped` +988).
+        public static let stopsAt: TimeInterval = 0.95
+        /// The link's flip back to A2DP (`bt_after3s=a2dp` ~+1.0) reaches the running engine while its re-attach is
+        /// in flight, before that re-attach's IO (f243a0c8 shows ONE re-attach, then `escalate` right after its verdict).
+        public static let collapseNotifyAt: TimeInterval = 1.05
+        /// `queued path=restart wait_ms=484` → `headset_restart=1 path=restart idle=1 waited_ms=300` +3402: the
+        /// restart's teardown, idle wait and fresh start took ≈ 0.9 s.
+        public static let restartTakes: TimeInterval = 0.9
+        /// `obligation path=configuration engine_running=0` +3654: the fresh engine stopped 252 ms after its start.
+        public static let restartStopsAfter: TimeInterval = 0.25
+        /// The restart re-requested HFP; a re-attached client hears the speaker from here.
+        public static let signalFrom: TimeInterval = 4.5
+    }
+    /// `transient_hfp`: seconds between the previous capture's release and this start (nil: none this launch).
+    public var releaseGap: TimeInterval?
+    /// `transient_hfp`: the HFP link is usable (false while it collapses; the restart re-requests it).
+    private var transientLinkUp = false
+    /// The model's restart is between its teardown and its fresh start (the recorder's `restarting`).
+    private var warmRestarting = false
+    private var warmRestartBegun = false
+    /// Test harness (v1.28 C MISSING-EVENT): every re-attach after the restart began is declined.
+    public var reattachesWithheldAfterRestart = false
+    private enum WarmEvent { case notify(running: Bool), ioBack, restartStart, restart, settle(CaptureEpoch), silentStop }
     private var warmEvents: [(at: TimeInterval, event: WarmEvent)] = []
     private var warmRunning = true
     private var warmTapOK = true
@@ -212,6 +255,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         s.startFormat = "24000Hz/1ch"
         s.bridgeSource = "inject"
         self.stats = s
+        if scenario == .transientHFP { releaseGap = TransientModel.releasedBefore }
     }
 
     /// The scenario named by `DICTATE_INJECT_SCENARIO`; plain when unset or unknown.
@@ -313,7 +357,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
         case .livePause:
             let speech = inserted(wav)
             return (gated(speech), distant(speech))
-        case .warmHFP:
+        case .warmHFP, .transientHFP:
             return (wav, distant(wav))
         case .spliceLag:
             let lag = Int((headsetLag * rate).rounded())
@@ -409,14 +453,23 @@ public final class WAVInjectedRecorder: EngineRecorder {
         slowUnreadable = false
         slowStartAt = Self.slowBuiltinStartReturnsAt
         slowUnit.reset()
-        if scenario == .warmHFP {
+        if scenario.hfpModel {
             warmRunning = true
             warmTapOK = true
             warmNoFrames = false
+            warmRestarting = false
+            warmRestartBegun = false
+            transientLinkUp = false
+            // The 3a48d95 recorder: HFP at the start is a warm route (`route.hfpAlready()`), however long it has been up.
             warmIO = HeadsetIOGuard(bluetooth: true, warmRoute: warmRoute)
             warmEpisode = BluetoothRecoveryEpisode(bluetooth: true)
             warmVerify = nil
-            warmEvents = arm == .engine ? [(time + WarmModel.notifyAt, .notify(running: true))] : []
+            if scenario == .transientHFP {
+                warmEvents = [(time + TransientModel.stopsAt, .silentStop),
+                              (time + TransientModel.collapseNotifyAt, .notify(running: true))]
+            } else {
+                warmEvents = arm == .engine ? [(time + WarmModel.notifyAt, .notify(running: true))] : []
+            }
             if warmRoute { feed.setWarmRoute() }
         }
         if scenario == .scoTornDown250ms {
@@ -542,6 +595,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 case .pending, .none, .exhausted, .episode:
                     notes.append("bt_recovery=obligation path=configuration engine_running=\(running ? 1 : 0) in_flight=1")
                 }
+            case .silentStop:
+                warmRunning = false
             case .ioBack:
                 warmRunning = true
                 warmTapOK = true
@@ -549,9 +604,12 @@ public final class WAVInjectedRecorder: EngineRecorder {
             case .restart:
                 notes += warmRestart(at: at)
             case .restartStart:
+                warmRestarting = false
                 warmRunning = true
                 warmNoFrames = true                            // no frames from the restarted engine …
-                warmEvents.append((at + WarmModel.restartStopsAfter, .notify(running: false)))   // … then it stops
+                if scenario == .transientHFP { transientLinkUp = true }    // its idle wait re-requested HFP
+                let stopsAfter = scenario == .transientHFP ? TransientModel.restartStopsAfter : WarmModel.restartStopsAfter
+                warmEvents.append((at + stopsAfter, .notify(running: false)))   // … then it stops
             case .settle(let token):
                 guard let check = warmVerify, check.token === token else { break }
                 warmVerify = nil
@@ -569,6 +627,15 @@ public final class WAVInjectedRecorder: EngineRecorder {
     /// The engine's buffer for the window starting at `from`: digital zeros while the tap is broken,
     /// nothing at all while the engine is stopped, zeros before the device's first frames.
     private func warmHeadset(_ window: [Float], from: TimeInterval) -> ([Float], Bool) {
+        if scenario == .transientHFP {
+            // Nothing before the engine's first buffers or while it is stopped; zeros until the link is back,
+            // a re-attached tap is running and the speaker is heard.
+            guard from - boundary >= TransientModel.zerosFrom - 1e-9, warmRunning, !warmNoFrames else { return (window, false) }
+            return (window.enumerated().map { index, sample in
+                let t = from + Double(index) / AudioRecorder.sampleRate - boundary
+                return transientLinkUp && warmTapOK && t >= TransientModel.signalFrom - 1e-9 ? sample : 0
+            }, true)
+        }
         guard arm == .engine else {
             return (window.enumerated().map { from + Double($0.offset) / AudioRecorder.sampleRate - boundary < WarmModel.framesFrom ? 0 : $0.element }, true)
         }
@@ -598,7 +665,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     /// The health clock's observation of the engine (the recorder's `ioGuard.observe`).
     private func warmObserve(at now: TimeInterval) -> [String] {
-        guard scenario == .warmHFP, arm == .engine else { return [] }
+        guard scenario.hfpModel, arm == .engine, !warmRestarting else { return [] }
         switch warmIO.observe(at: now, engineRunning: warmRunning) {
         case .reattach: return warmReattach(at: now, notified: false)
         case .escalate: return ["bt_recovery=escalate path=obligation"] + warmRequestRestart(at: now)
@@ -608,6 +675,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
 
     /// The obligation's one re-attach (a retap), admitted by the episode like the recorder's.
     private func warmReattach(at now: TimeInterval, notified: Bool) -> [String] {
+        if reattachesWithheldAfterRestart, warmRestartBegun { warmIO.reattachDeclined(); return [] }
         guard warmEpisode.admitReattach(at: now) else {
             if warmEpisode.budgetSpent { warmIO.reattachUnavailable() } else { warmIO.reattachDeclined() }
             return notified ? ["bt_recovery=obligation path=configuration engine_running=\(warmRunning ? 1 : 0) in_flight=1"] : []
@@ -648,7 +716,9 @@ public final class WAVInjectedRecorder: EngineRecorder {
         }
         warmIO.record(.stop); warmIO.finished(.stop, ok: true)
         warmRunning = false
-        let start = now + WarmModel.restartIdleWait
+        warmRestarting = true
+        warmRestartBegun = true
+        let start = now + (scenario == .transientHFP ? TransientModel.restartTakes : WarmModel.restartIdleWait)
         warmIO.record(.start); warmIO.finished(.start, ok: true)
         feed.headsetRestarted()
         warmArmVerify(since: start)
@@ -701,7 +771,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             trackCursor += n
             var headset = (0..<n).map { base + $0 < headsetTrack.count ? headsetTrack[base + $0] : 0 }
             var headsetDelivers = true
-            if scenario == .warmHFP {
+            if scenario.hfpModel {
                 notes += warmAdvance(to: time + Double(n) / AudioRecorder.sampleRate)
                 (headset, headsetDelivers) = warmHeadset(headset, from: time)
             }
@@ -720,7 +790,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 let arrived = time + Double(delivery.end) / AudioRecorder.sampleRate
                 let out = feed.accept(frames, source: delivery.source, at: at, arrivedAt: arrived)
                 var lines: [String] = []
-                if scenario == .warmHFP, delivery.source == .headset {
+                if scenario.hfpModel, delivery.source == .headset {
                     lines += warmHeadsetFrames(frames, arrived: arrived, restart: out.restartHeadset)
                 }
                 if out.event == .fallback { lines.append("bridge_src=builtin_fallback reason=headset_digital_silence") }
@@ -824,7 +894,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
             kept += health.frames
             notes += health.notes
             if scenario == .builtinStartSlow, health.stopBuiltin { builtinStopped = true }
-            if scenario == .warmHFP { notes += warmObserve(at: mediaTime) }
+            // transient_hfp: what is due at this instant (a verification's verdict) lands before the observation,
+            // as in f243a0c8 (`settled … silent_frames` → `escalate`).
+            if scenario == .transientHFP { notes += warmAdvance(to: mediaTime + 1e-6) }
+            if scenario.hfpModel { notes += warmObserve(at: mediaTime) }
             // Plain injection delivers a frame on every tick by construction, so exact zeros (leading, between
             // words, EOF tail) are the fixture's silence, not a dead mic. Only the dead-stream scenarios judge it.
             if let found = health.failure, scenario != .plain { failed = true; failure = found; notes.append(found.note) }
@@ -894,8 +967,8 @@ public final class WAVInjectedRecorder: EngineRecorder {
                 advanceIO(to: mediaTime - boundary)
                 ioGuard.record(.stop)                   // the end-of-dictation teardown
             }
-            stats.ioOps = ioGuard.note
-            stats.ioHeld = ioGuard.heldNote
+            stats.ioOps = scenario == .transientHFP ? warmIO.note : ioGuard.note
+            stats.ioHeld = scenario == .transientHFP ? warmIO.heldNote : ioGuard.heldNote
             stats.carrier = feed.timeline.carrierIntervals(endMs: stats.recordingMs)
             stats.headsetCarriedMs = feed.timeline.headsetIntervalMs(endMs: stats.recordingMs)
             stats.captureIntervalsTruncated = feed.evidence.truncated
