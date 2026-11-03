@@ -23,8 +23,17 @@ struct V128PossibleSpeechFloorTests {
     @Test func roomNoiseChunkIsSilentWhatTheNearZerosDoNotDecide() {
         let silent = EdgeSentenceGuard.isSilent(Self.steadyRoom, reference: Self.reference)
         let possible = CaptureEvidence.possibleSpeechWindows(Self.steadyRoom, reference: Self.reference).filter { $0 }.count
-        print("FR2-A LITERAL room_chunk silent=\(silent) possible_windows=\(possible)/\(Self.steadyRoom.count)")
+        let floor = 20 * log10(Double(CaptureEvidence.possibleSpeechFloor(reference: Self.reference)))
+        print("FR2-A LITERAL floor=\(String(format: "%.1f", floor)) room_chunk silent=\(silent) possible_windows=\(possible)/\(Self.steadyRoom.count)")
         #expect(silent)
+    }
+
+    /// Floor clamps: no audible window → −60 dBFS; a quiet room at −75 dBFS (below the −70 line) → −60 dBFS.
+    @Test func floorNeverBelowMinus60() {
+        #expect(CaptureEvidence.possibleSpeechFloor(reference: []) == CaptureEvidence.possibleFloorMinimumRMS)
+        #expect(CaptureEvidence.possibleSpeechFloor(reference: [Float](repeating: Self.db(-75), count: 50)) == CaptureEvidence.possibleFloorMinimumRMS)
+        #expect(CaptureEvidence.possibleSpeechWindows([Self.db(-52)], reference: [Float](repeating: Self.db(-75), count: 50)) == [false])   // < −50
+        #expect(CaptureEvidence.possibleSpeechWindows([Self.db(-48)], reference: [Float](repeating: Self.db(-75), count: 50)) == [true])    // ≥ −50, ≥ floor+6
     }
 
     /// Controls: a soft word at −38 dBFS (over the −40 always-speech line) keeps its chunk on both trees.
