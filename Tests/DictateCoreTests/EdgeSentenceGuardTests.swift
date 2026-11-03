@@ -35,6 +35,22 @@ private actor ScriptedTransport: HTTPTransport {
     }
 }
 
+/// v1.28 FR4-A: records each chunk request's `response_format` (keyed by WAV data size) and answers text only.
+private actor FormatTransport: HTTPTransport {
+    private(set) var formats: [Int: String] = [:]
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let body = request.httpBody!
+        let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
+        let size = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }
+        let text = String(decoding: body[..<riff], as: UTF8.self)
+        if let range = text.range(of: "name=\"response_format\"\r\n\r\n") {
+            formats[size] = String(text[range.upperBound...]).components(separatedBy: "\r\n").first ?? ""
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["text": "Send the report."])
+        return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
 private final class Stream: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [(Int, String)] = []
@@ -184,6 +200,21 @@ struct EdgeSentenceGuardTests {
         #expect(result.text == "Cold start one. This should begin on the first tap.")
     }
 
+    /// Chunk 0 never follows a lead-in and keeps `json`; every later chunk asks Groq for `verbose_json` (segments).
+    @Test func laterChunksAskForSegments() async {
+        let transport = FormatTransport()
+        let stt = GroqChunkedTranscriber(transport: transport, apiKey: { "test-key" }, prompt: "Politrace",
+                                         fillerLeadIn: false, hedgeAfterMs: 60_000)
+        let chunks = [tone(1.0), tone(1.2), tone(1.4)]
+        for (index, samples) in chunks.enumerated() {
+            await stt.submit(.init(index: index, samples: samples), isFinal: index == chunks.count - 1)?.value
+        }
+        _ = await stt.finish()
+        let formats = await chunks.map { ScriptedTransport.key($0) }.asyncMap { await transport.formats[$0] ?? "none" }
+        print("FR4-A LITERAL response_format=\(formats)")
+        #expect(formats == ["json", "verbose_json", "verbose_json"])
+    }
+
     /// No segments (Apple, Scribe, a stub) after a silent lead-in: a general sentence is never dropped by letters.
     /// RED on 0051609: "Okay so." (letters inside the 2.0 s lead) dropped. GREEN: kept.
     @Test func noSegmentsAfterSilentLeadInKeepsGeneralSentence() async {
@@ -298,5 +329,13 @@ struct EdgeSentenceGuardTests {
     @Test func edgeGuardSwitchDefaultsToEnabled() {
         #expect(GroqChunkedTranscriber.edgeGuardEnabled(environment: [:])) // v1.11-api
         #expect(!GroqChunkedTranscriber.edgeGuardEnabled(environment: ["DICTATE_EDGE_GUARD": "0"])) // v1.11-api
+    }
+}
+
+private extension Array {
+    func asyncMap<T>(_ transform: (Element) async -> T) async -> [T] {
+        var result: [T] = []
+        for element in self { result.append(await transform(element)) }
+        return result
     }
 }
