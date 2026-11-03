@@ -18,12 +18,27 @@ private final class Apple: EngineAppleSession, @unchecked Sendable {
     func finish() async throws -> String { "please send the report" }
     func cancel() {}
 }
+/// In-memory responses only; an unexpected provider/endpoint fails the test even if its caller
+/// swallows transport errors. Never delegate to URLSession, including for warm-up or cleanup.
 private actor HTTP: HTTPTransport {
+    private struct UnexpectedRequest: Error {}
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let payload: [String: Any] = request.url!.path.contains("transcriptions") ? ["text": "please send the report"] :
-            ["choices": [["finish_reason": "stop", "message": ["content": ""]]]]
+        let url = try #require(request.url)
+        let payload: [String: Any]
+        switch (request.httpMethod, url.host, url.path) {
+        case ("POST", "api.groq.com", "/openai/v1/audio/transcriptions"):
+            payload = ["text": "please send the report"]
+        case ("GET", "api.groq.com", "/openai/v1/models"):
+            payload = ["data": []]
+        case ("POST", "api.groq.com", "/openai/v1/chat/completions"),
+             ("POST", "127.0.0.1", "/v1/chat/completions"):
+            payload = ["choices": [["finish_reason": "stop", "message": ["content": ""]]]]
+        default:
+            Issue.record("unexpected offline fixture request: \(request.httpMethod ?? "nil") \(url)")
+            throw UnexpectedRequest()
+        }
         return (try JSONSerialization.data(withJSONObject: payload),
-                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [:])!)
+                HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: [:])!)
     }
 }
 private final class Lines: @unchecked Sendable {
@@ -40,6 +55,8 @@ private final class Lines: @unchecked Sendable {
 /// No hardware, no network.
 @Suite("V127FirstDictation", .serialized)
 struct V127FirstDictationTests {
+    private struct MissingEvent: Error { let event: String }
+
     private static func tone(seconds: Double) -> [Int16] {
         (0..<Int(seconds * 24_000)).map { Int16(8_000 * sin(Double($0) * 2 * .pi * 220 / 24_000)) }
     }
@@ -58,7 +75,7 @@ struct V127FirstDictationTests {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         Issue.record("missing event=\(event) after \(seconds)s")
-        throw URLError(.timedOut)
+        throw MissingEvent(event: event)
     }
     private static func field(_ name: String, in line: String) -> String {
         line.components(separatedBy: " \(name)=").dropFirst().first?.components(separatedBy: " ").first ?? "none"
@@ -104,7 +121,8 @@ struct V127FirstDictationTests {
         let (dir, url) = try wav(seconds: 7)
         defer { try? FileManager.default.removeItem(at: dir) }
         let paths = AppPaths(home: dir.appendingPathComponent("home"))
-        let keys = KeyStore(reader: { _ in "fixture" })
+        // Only the fake Groq lane has a key; provider fallbacks cannot use the host's keychain.
+        let keys = KeyStore(reader: { $0 == "groq-api" ? "fixture" : "" })
         keys.prefetch(services: ["groq-api"])
         try await waitFor("key") { keys.key(for: "groq-api") != nil }
         let clipboard = NSPasteboard(name: .init("dictate-v127-\(UUID().uuidString)"))
@@ -119,7 +137,8 @@ struct V127FirstDictationTests {
             panelFactory: { Panel() }, requestMicrophoneAccess: { $0(true) },
             frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
         let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .captureOnly,
-                                       dependencies: dependencies)
+                                       dependencies: dependencies, stt: .groqChunked)
+        #expect(!controller.keepWarmScheduled)
         controller.onSessionNote = { notes.add($0) }
         let engine = DictationEngine(controller: controller)
         engine.start()
@@ -207,12 +226,14 @@ struct V127FirstDictationTests {
         var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
         var onEvent: ((HeadsetCaptureEvent, CaptureEpoch) -> Void)?
         var startReturnsAt: TimeInterval = 0
+        var startGate: DispatchSemaphore?
         /// The level the headset delivers once started (0: digital zeros — a link that never carries).
         var level: Float = 0.2
         private let lock = NSLock()
         private var epoch: CaptureEpoch?
         private var timer: DispatchSourceTimer?
         func start(deviceUID: String, epoch: CaptureEpoch) throws {
+            startGate?.wait()
             let wait = startReturnsAt - ProcessInfo.processInfo.systemUptime
             if wait > 0 { Thread.sleep(forTimeInterval: wait) }
             let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "v127.fake.headset"))
@@ -290,10 +311,16 @@ struct V127FirstDictationTests {
         let failures = Lines()
         recorder.onCaptureFailure = { failures.add($0.note) }
         let t0 = ProcessInfo.processInfo.systemUptime
-        headset.startReturnsAt = t0 + 1.2
+        // Keep startup in flight until rule 3 actually rebuilds the built-in. A fixed 1.2 s
+        // sleep left too little time for headset takeover before the 2 s health deadline under load.
+        let gate = DispatchSemaphore(value: 0)
+        headset.startGate = gate
+        defer { gate.signal() }
         let start = Task { try await recorder.startAsync(device: .default) }
         try await Task.sleep(nanoseconds: 50_000_000)
         recorder.resetCapture()
+        try await waitFor("builtin_rebuilt") { units.snapshot.count == 2 }
+        gate.signal()
         try await waitFor("media_2_5s", seconds: 30) { ProcessInfo.processInfo.systemUptime - t0 >= 2.5 || !failures.snapshot.isEmpty }
         _ = try? await start.value
         _ = recorder.stop()

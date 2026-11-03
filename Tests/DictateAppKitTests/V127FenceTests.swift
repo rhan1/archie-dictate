@@ -10,6 +10,9 @@ import DictateCore
 /// so B1 rule 3 replaces it with B once.
 @Suite("V127Fence", .serialized)
 struct V127FenceTests {
+    // A missing recorder event is a fixture timeout, not a URLSession failure (-1001).
+    private struct MissingEvent: Error { let event: String }
+
     final class Box<T>: @unchecked Sendable {
         private let lock = NSLock()
         private var value: T
@@ -79,7 +82,7 @@ struct V127FenceTests {
         }
         if condition() { return }
         Issue.record("missing event=\(event) after \(Int(seconds))s")
-        throw URLError(.timedOut)
+        throw MissingEvent(event: event)
     }
 
     struct Rig {
