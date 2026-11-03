@@ -319,11 +319,17 @@ public struct TranscriptCleaner: Sendable {
 extension TranscriptCleaner {
     /// Whisper's near-silence artifacts (EdgeSentenceGuard's labelled list) are never put back.
     static let tailArtifacts: Set<String> = ["thank you", "thank you so much", "thanks for watching", "dictate", "bye"]
-    static let tailFillers: Set<String> = ["um", "uh", "er", "ah", "hmm", "like", "so"]
+    /// v1.28 FR4-B: the only sentence-final phrases the post-check restores ("thank you" stays excluded: it is
+    /// Whisper's commonest invented ending, `tailArtifacts`).
+    static let closedAnswers: Set<String> = ["yes", "no", "okay", "ok", "done", "thanks", "thank you", "sure", "correct",
+                                             "right", "stop", "go ahead", "cancel"]
+    /// v1.28 FR4-B: correction cues ("no," before an item, "actually", "I mean", "make that", "sorry"), lowercased.
+    static let correctionCues = [#"\bno,\s*[a-z0-9]"#, #"\bactually\b"#, #"\bi mean\b"#, #"\bmake that\b"#, #"\bsorry\b"#]
 
     /// When the raw transcript's last sentence is at most 3 words and the cleaned text does not end with it — and none
     /// of its words survive in the cleaned text's last sentence (a correction such as "Tuesday. No, Wednesday." merged
     /// into "Wednesday." is left alone) — the sentence is appended back. Fillers and artifacts are never restored.
+    /// v1.28 FR4-B: narrowed to a `closedAnswers` phrase of ≤ 2 words with no `correctionCues` in the last 2 sentences.
     public static func restoreShortTail(raw: String, cleaned: String) -> (text: String, restored: Bool) {
         func words(_ s: Substring) -> [String] { s.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init) }
         let terminators: Set<Character> = [".", "!", "?"]
@@ -339,8 +345,12 @@ extension TranscriptCleaner {
         if start < trimmed.endIndex, !words(trimmed[start...]).isEmpty { sentences.append(trimmed[start...]) }
         guard sentences.count >= 2, let last = sentences.last else { return (cleaned, false) }
         let tail = words(last)
-        guard (1...3).contains(tail.count), !tail.allSatisfy({ tailFillers.contains($0) }),
+        // v1.28 FR4-B: only a closed answer phrase (≤ 2 words) is ever put back, and never after a correction cue in
+        // the raw's last 2 sentences (the cleaner applied the correction; re-appending its tail undoes it).
+        guard (1...2).contains(tail.count), closedAnswers.contains(tail.joined(separator: " ")),
               !tailArtifacts.contains(tail.joined(separator: " ")) else { return (cleaned, false) }
+        let recent = sentences.suffix(2).map { $0.lowercased() }.joined(separator: " ")
+        guard !correctionCues.contains(where: { recent.range(of: $0, options: .regularExpression) != nil }) else { return (cleaned, false) }
         let out = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedWords = words(out[...])
         if cleanedWords.suffix(tail.count) == tail[...] { return (cleaned, false) }
