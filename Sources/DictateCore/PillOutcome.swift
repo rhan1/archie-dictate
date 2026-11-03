@@ -23,7 +23,7 @@ public struct PillOutcome: Equatable, Sendable {
         switch kind {
         case .held(let reason):
             if reason == "paste_timeout" { return "paste unconfirmed · tap to retry" }
-            return reason == "no_stt" ? "no speech" : "held"
+            return reason == "no_stt" || reason == "no_speech" ? "no speech" : "held"   // v1.28 FR2-B: no_speech
         case .error(let reason):
             let reason = reason.lowercased()
             if reason.contains("mic_dead") { return "no mic signal" }

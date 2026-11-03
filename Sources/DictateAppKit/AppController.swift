@@ -1069,7 +1069,20 @@ public final class AppController {
                 if case .success(let raw) = finalResult, !raw.isEmpty {
                     delivered = Self.deliveredText(report.text ?? raw, usesPaste: policy.usesPaste)
                 }
+                // v1.28 FR2-B: a cleaner rejection on weak audio evidence never pastes the raw transcript.
+                var noSpeechHold = false
+                if case .success(let raw) = finalResult, !raw.isEmpty, policy.usesCleanup,
+                   NoSpeechGuard.garbageRejected(cleanupLabel: report.cleanup, fallbackReason: finalTimeline.cleanupFallbackReason) {
+                    let evidence = NoSpeechGuard.evidence(samples: samples, text: raw, vocabulary: vocabularyPrompt)
+                    Self.note(evidence.note)
+                    noSpeechHold = evidence.weak
+                }
                 switch finalResult {
+                case .success(let raw) where !raw.isEmpty && noSpeechHold:
+                    // Nothing pasted; the text stays available to "Paste last dictation" only (no pill paste button).
+                    self.rememberHeldDictation(delivered ?? raw)
+                    self.showOutcome(.held("no_speech"))
+                    self.appendLog(entry(0, AppController.frontmostBundleID(), .held("no_speech")), fallback: policy.fallbackFields, session: self.consumeFinishing(myGeneration))
                 case .success(let raw) where !raw.isEmpty && delivered?.isEmpty == true:
                     // v1.18: the whole dictation was the spoken stop phrase -- nothing to paste.
                     self.showOutcome(.held("no_stt"))
