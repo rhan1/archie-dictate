@@ -1273,6 +1273,8 @@ public final class AppController {
                 "completion_tokens=\(cleanup?.completionTokens.map(String.init) ?? "-")",
                 "cleanup_mode=\(cleanupMode)", "cleanup_calls=\(cleanupCalls)", "keepwarm_pings=\(keepWarmPings)",
             ]
+            // v1.28 (B1): cold-on-HFP — `bt_start=hfp … warm_ms=<n> warm=0 reason=transient`.
+            if capture.transientHFP { fields.insert(contentsOf: ["warm=0", "reason=transient"], at: 5) }
             if let cleanupFallbackReason { fields.append("fallback_reason=\(cleanupFallbackReason)") }
             if let cleanupModelFallback { fields.append("cleanup_model_fallback=\(cleanupModelFallback)") }
             if cleanupMode == "single", let incrementalSkipped {

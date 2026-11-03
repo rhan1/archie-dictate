@@ -45,6 +45,34 @@ public struct HeadsetIOGuard: Sendable {
     /// Running engine, frames had flowed, none for this long: IO ceased (a framework stop the
     /// notification did not report).
     public static let ioCeasedAfter: TimeInterval = 0.5
+    /// v1.28 (B1): HFP found at a start counts as a warm route only when the link has been up this long —
+    /// known as the time since this recorder's previous Bluetooth capture released (the route probe samples
+    /// the profile, not since when). Inside it the voice link is the previous dictation's, collapsing back to
+    /// A2DP (f243a0c8: released 100 ms before the start, `bt_after3s=a2dp` ~1.0 s later).
+    public static let warmAfter: TimeInterval = 2.0
+    /// v1.28 (B1): an escalated obligation belongs to the episode's restart for at most this long when no
+    /// restart ever starts (refused, coalesced away, skipped): then it is owed a re-attach again. The episode's
+    /// worst-case admission (its window twice) plus one verification.
+    public static let restartWait: TimeInterval = 2 * BluetoothRecoveryEpisode.window + BluetoothRecoveryEpisode.successWithin
+
+    /// v1.28 (B1): what the start found on a Bluetooth input.
+    public enum StartRoute: String, Sendable {
+        /// Not on HFP (A2DP or unknown): the v1.12 cold path.
+        case cold
+        /// On HFP for at least `warmAfter` (or no capture of ours released it this launch): v1.13's warm route.
+        case warm
+        /// On HFP less than `warmAfter` after our previous capture released: cold-on-HFP — the built-in carries
+        /// from the first frame, the headset takes over only after `CaptureBridge.takeoverSignal` of signal, and
+        /// the guard's obligations keep `engine_stopped` semantics.
+        case transient
+    }
+    /// v1.28 (B1): `hfp` = the route probe found HFP; `sinceRelease` = seconds since this recorder's previous
+    /// Bluetooth capture released (nil: none this launch).
+    public static func startRoute(hfp: Bool, sinceRelease: TimeInterval?) -> StartRoute {
+        guard hfp else { return .cold }
+        if let since = sinceRelease, since < warmAfter { return .transient }
+        return .warm
+    }
 
     public enum Reaction: Equatable, Sendable {
         /// Re-attach now (the obligation's one in-flight re-attach).
@@ -87,6 +115,12 @@ public struct HeadsetIOGuard: Sendable {
     /// link forming for hands-off to protect, so that notification is IO evidence: an obligation opens
     /// and gets its one re-attach at once, discharged only by sustained signal (else it escalates).
     public let warmRoute: Bool
+    /// v1.28 (B1): HFP at the start, up less than `warmAfter` (`StartRoute.transient`). Obligations open and are
+    /// labelled exactly as on a cold route (`engine_stopped`, never `format_changed`), but the link is known to be
+    /// collapsing: digital zeros from a re-attached client are not IO back — only sustained signal ends its
+    /// re-attach early or discharges the obligation (zeros keep it owed, so it escalates to the restart, the one
+    /// operation that re-requests HFP; f243a0c8 `settled … silent_frames` → `escalate`).
+    public let transientRoute: Bool
     // Attempted operations, per kind (v1.10's `io_ops=start:N …` counts).
     public private(set) var starts = 0
     public private(set) var stops = 0
@@ -113,8 +147,28 @@ public struct HeadsetIOGuard: Sendable {
     public private(set) var settled = false
     private var sustained = SustainedSignal()
     private var lastHeadsetFrame: TimeInterval?
+    /// v1.28 (B1): obligations closed because the episode's restart replaced the engine they were owed to
+    /// (each later stop of the fresh engine opens a new one). Shown as `io_generation=` when non-zero.
+    public private(set) var obligationGeneration = 0
+    /// v1.28 (B1): when the current obligation escalated (nil: it did not).
+    private var escalatedAt: TimeInterval?
+    /// v1.28 (B1): the episode refused this obligation's re-attach for good (its budget is spent): `.exhausted`.
+    private var episodeSpent = false
+    /// v1.28 (B1): sustained signal since the current obligation opened (`transientRoute` discharges on it).
+    private var obligationSignal = SustainedSignal()
+    private var obligationSignalled = false
 
-    public init(bluetooth: Bool, warmRoute: Bool = false) { self.bluetooth = bluetooth; self.warmRoute = bluetooth && warmRoute }
+    public init(bluetooth: Bool, warmRoute: Bool = false, transientRoute: Bool = false) {
+        self.bluetooth = bluetooth
+        self.warmRoute = bluetooth && warmRoute
+        self.transientRoute = bluetooth && transientRoute && !warmRoute
+    }
+
+    /// v1.28 (B1): what ends a re-attach early / discharges the obligation once the engine runs and frames came.
+    private var ioBack: Bool {
+        if obligation?.reason == .formatChanged { return settled }
+        return !transientRoute || obligationSignalled
+    }
 
     public var attempted: Int { starts + stops + rebuilds + retaps + aligns }
 
@@ -153,7 +207,7 @@ public struct HeadsetIOGuard: Sendable {
         guard bluetooth else { return .none }
         if let since = inFlightSince {
             // A warm route's format-change re-attach is over only when signal is back (zeros were the fault).
-            if engineRunning, let frame = lastHeadsetFrame, frame > since, obligation?.reason != .formatChanged || settled {
+            if engineRunning, let frame = lastHeadsetFrame, frame > since, ioBack {
                 inFlightSince = nil
                 discharge()
                 return .none
@@ -175,7 +229,7 @@ public struct HeadsetIOGuard: Sendable {
             return .none
         }
         if engineRunning, obligation?.reason == .engineStopped, let frame = lastHeadsetFrame,
-           frame > (obligation?.since ?? .infinity) {
+           frame > (obligation?.since ?? .infinity), ioBack {
             discharge()                            // IO came back on its own
             return .none
         }
@@ -186,6 +240,9 @@ public struct HeadsetIOGuard: Sendable {
     public mutating func headsetFrames(_ count: Int, peak: Float, at now: TimeInterval) {
         lastHeadsetFrame = now
         if sustained.add(frames: count, peak: peak, at: now) != nil { settled = true; settledOnce = true }
+        if obligation != nil || inFlightSince != nil, obligationSignal.add(frames: count, peak: peak, at: now) != nil {
+            obligationSignalled = true
+        }
     }
 
     /// The caller could not perform the `.reattach` it was given (the episode is still verifying an
@@ -207,7 +264,23 @@ public struct HeadsetIOGuard: Sendable {
         inFlightSince = nil
         obligation?.reattached = true
         obligation?.escalated = true
+        episodeSpent = true
         held += 1
+    }
+
+    /// v1.28 (B1): the episode's restart put a fresh engine on the headset (its start returned at `now`). The
+    /// escalated obligation it answered is closed — it was owed to an engine that no longer exists — and the
+    /// restart is in flight like a re-attach (bounded by `inFlightBound`, ended early by IO). A stop of the fresh
+    /// engine opens a NEW obligation with its own re-attach, still within `maxReattaches` and the episode's
+    /// `maxAttempts` (f243a0c8: `headset_restart=1` +3402, the fresh engine stopped +3654 and was owed nothing).
+    /// No-op when no escalated obligation is open (a bridge zero-run restart owes the guard nothing).
+    public mutating func restarted(at now: TimeInterval) {
+        guard bluetooth, let open = obligation, open.reattached, open.escalated, !episodeSpent else { return }
+        discharge()
+        obligationGeneration += 1
+        inFlightSince = now
+        obligationSignal.reset()
+        obligationSignalled = false
     }
 
     /// The in-flight re-attach's start returned (`started == false`: it threw — the obligation
@@ -222,6 +295,10 @@ public struct HeadsetIOGuard: Sendable {
         guard obligation == nil else { return }
         obligation = Obligation(since: now, reason: reason)
         obligationsOpened += 1
+        escalatedAt = nil
+        episodeSpent = false
+        obligationSignal.reset()
+        obligationSignalled = false
     }
 
     private mutating func discharge() {
@@ -236,10 +313,20 @@ public struct HeadsetIOGuard: Sendable {
             held += 1
             return .pending(until: since + Self.inFlightBound)
         }
+        if episodeSpent { return .exhausted }                // the episode can admit nothing more
         if open.reattached {
-            guard !open.escalated else { return .none }      // the episode owns it now
-            obligation?.escalated = true
-            return .escalate
+            if !open.escalated {
+                obligation?.escalated = true
+                escalatedAt = now
+                return .escalate
+            }
+            // v1.28 (B1): the episode's restart owns it only while that restart can still come; it never owes
+            // nothing for ever. (Once the restart starts, `restarted(at:)` closes this obligation.)
+            if let at = escalatedAt, now < at + Self.restartWait { return .none }
+            obligation?.reattached = false                   // no restart came: owed a re-attach again
+            obligation?.escalated = false
+            escalatedAt = nil
+            obligationGeneration += 1
         }
         guard reattaches < Self.maxReattaches else { return .exhausted }
         reattaches += 1
@@ -304,6 +391,7 @@ public struct HeadsetIOGuard: Sendable {
     public var heldNote: String {
         "io_held=\(held) config_notifications=\(notifications) io_obligations=\(obligationsOpened)/\(obligationsDischarged)"
             + " io_obligation=\(obligation.map { "open:\($0.reason.rawValue)" } ?? "none") reattaches=\(reattaches)"
+            + (obligationGeneration > 0 ? " io_generation=\(obligationGeneration)" : "")
     }
 }
 

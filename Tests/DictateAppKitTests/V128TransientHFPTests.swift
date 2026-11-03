@@ -79,6 +79,44 @@ struct V128TransientHFPTests {
         #expect(second >= 3_650)
     }
 
+    // MARK: requirement 1 through the real recorder and the timeline (1.28 only: new API)
+
+    /// The real `AudioRecorder` (fake units, a route on HFP): the first session (nothing of ours released the link)
+    /// is a warm start; a second started right after the first's release is cold-on-HFP.
+    @Test func backToBackStartOnHFPIsTransientOnTheRealRecorder() async throws {
+        var route = V127FirstDictationTests.route
+        route.hfpAlready = { true }
+        let recorder = AudioRecorder(builtin: { V127FirstDictationTests.SlowBuiltin(startBlocks: 0) },
+                                     headset: { V127FirstDictationTests.SlowHeadset() }, backend: .auhal,
+                                     broker: CaptureLeaseBroker(), route: route)
+        var transient: [Bool] = []
+        for _ in 0..<2 {
+            try await recorder.startAsync(device: .default)
+            recorder.resetCapture()
+            try await Task.sleep(nanoseconds: 300_000_000)
+            _ = recorder.stop()
+            transient.append(recorder.stats.transientHFP)
+            _ = await recorder.awaitRelease()
+        }
+        print("B1 LITERAL real_recorder transient=\(transient)")
+        #expect(transient == [false, true])
+    }
+
+    @Test func timelineNamesTheTransientStart() {
+        var capture = AudioRecorder.CaptureStats()
+        capture.transientHFP = true
+        let transient = AppController.Timeline(media: "none", warmMs: 494, capture: capture, btStart: "hfp",
+                                               capturedSeconds: 1, peakDBFS: -20)
+            .line(sttMs: 1, cleanupMs: 1, path: "groq-chunked", chunkFallback: nil, keyState: "ok")
+        capture.transientHFP = false
+        let warm = AppController.Timeline(media: "none", warmMs: 494, capture: capture, btStart: "hfp",
+                                          capturedSeconds: 1, peakDBFS: -20)
+            .line(sttMs: 1, cleanupMs: 1, path: "groq-chunked", chunkFallback: nil, keyState: "ok")
+        print("B1 LITERAL timeline \(transient.split(separator: " ").prefix(7).joined(separator: " "))")
+        #expect(transient.contains(" bt_start=hfp ") && transient.contains(" warm_ms=494 warm=0 reason=transient media=none "))
+        #expect(!warm.contains("reason=transient") && warm.contains(" warm_ms=494 media=none "))
+    }
+
     // MARK: controls — each literal is pasted from 3a48d95 and from 1.28
 
     @Test func controlWarmHFPTakeover() throws {

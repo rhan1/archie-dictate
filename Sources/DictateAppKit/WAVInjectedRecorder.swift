@@ -460,8 +460,10 @@ public final class WAVInjectedRecorder: EngineRecorder {
             warmRestarting = false
             warmRestartBegun = false
             transientLinkUp = false
-            // The 3a48d95 recorder: HFP at the start is a warm route (`route.hfpAlready()`), however long it has been up.
-            warmIO = HeadsetIOGuard(bluetooth: true, warmRoute: warmRoute)
+            // v1.28 (B1): the recorder's classification — HFP (`warmRoute` = `route.hfpAlready()`) is warm only when up
+            // `HeadsetIOGuard.warmAfter`, known as the time since the previous capture released (`releaseGap`).
+            let startRoute = HeadsetIOGuard.startRoute(hfp: warmRoute, sinceRelease: releaseGap)
+            warmIO = HeadsetIOGuard(bluetooth: true, warmRoute: startRoute == .warm, transientRoute: startRoute == .transient)
             warmEpisode = BluetoothRecoveryEpisode(bluetooth: true)
             warmVerify = nil
             if scenario == .transientHFP {
@@ -470,7 +472,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             } else {
                 warmEvents = arm == .engine ? [(time + WarmModel.notifyAt, .notify(running: true))] : []
             }
-            if warmRoute { feed.setWarmRoute() }
+            if startRoute == .warm { feed.setWarmRoute() }
         }
         if scenario == .scoTornDown250ms {
             let notify = Self.scoNotifyAt
@@ -604,6 +606,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             case .restart:
                 notes += warmRestart(at: at)
             case .restartStart:
+                warmIO.restarted(at: at)                       // v1.28 (B1): the recorder's `restartHeadset`
                 warmRestarting = false
                 warmRunning = true
                 warmNoFrames = true                            // no frames from the restarted engine …
@@ -969,6 +972,7 @@ public final class WAVInjectedRecorder: EngineRecorder {
             }
             stats.ioOps = scenario == .transientHFP ? warmIO.note : ioGuard.note
             stats.ioHeld = scenario == .transientHFP ? warmIO.heldNote : ioGuard.heldNote
+            stats.transientHFP = scenario.hfpModel && warmIO.transientRoute
             stats.carrier = feed.timeline.carrierIntervals(endMs: stats.recordingMs)
             stats.headsetCarriedMs = feed.timeline.headsetIntervalMs(endMs: stats.recordingMs)
             stats.captureIntervalsTruncated = feed.evidence.truncated

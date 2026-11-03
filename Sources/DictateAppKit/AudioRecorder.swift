@@ -99,6 +99,9 @@ public final class AudioRecorder: CaptureEngine {
         public var lease = "lease=-"
         /// v1.12 (L3): the A/B instrumentation, identical in both headset arms.
         public var instrumentation = CaptureInstrumentation().note(boundary: nil)
+        /// v1.28 (B1): the start found HFP up less than `HeadsetIOGuard.warmAfter` (cold-on-HFP; the timeline's
+        /// `warm=0 reason=transient`).
+        public var transientHFP = false
         public init() {}
 
         /// The capture part of the session-end line (counts only), shared by Dictate and hosts:
@@ -228,6 +231,9 @@ public final class AudioRecorder: CaptureEngine {
     /// The engine epoch the lease was granted for (a stale start never reuses it).
     private var leaseEpoch: CaptureEpoch?
     private var lastReleased: CaptureLease?
+    /// v1.28 (B1): uptime at which this recorder last released a Bluetooth capture (the HFP link it held then
+    /// drops back to A2DP over the next ~1 s). The route probe cannot tell since when HFP is up; this is the criterion.
+    private var lastBluetoothReleaseAt: TimeInterval?
     // v1.12 (L3): the headset client arm, and the A/B instrumentation (state under `lock`).
     public let headsetBackend: HeadsetBackend
     private let makeHeadset: () -> HeadsetCapture
@@ -273,7 +279,15 @@ public final class AudioRecorder: CaptureEngine {
         let headset = bluetooth ? route.defaultInput() : nil
         let headsetUID = headset.flatMap(route.uid)
         // v1.13 (L2): the voice link was already up before this dictation's client started.
-        let warmRoute = bluetooth && route.hfpAlready()
+        // v1.28 (B1): … and up long enough to be a warm route — HFP found within `HeadsetIOGuard.warmAfter` of our
+        // previous Bluetooth capture's release is that capture's link collapsing back to A2DP (cold-on-HFP).
+        let hfp = bluetooth && route.hfpAlready()
+        let sinceRelease = lock.withLock { lastBluetoothReleaseAt }.map { ProcessInfo.processInfo.systemUptime - $0 }
+        let startRoute = HeadsetIOGuard.startRoute(hfp: hfp, sinceRelease: sinceRelease)
+        let warmRoute = startRoute == .warm
+        if startRoute == .transient {
+            AppController.note("bt_start=hfp warm=0 reason=transient since_release_ms=\(Int(((sinceRelease ?? 0) * 1000).rounded()))")
+        }
         var abandonedMs: Int?
         let unit: BuiltinCapture? = lock.withLock {
             guard engineEpoch === epoch else { return nil }
@@ -286,7 +300,7 @@ public final class AudioRecorder: CaptureEngine {
             bridgeConfigured = true
             feed.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch)
             episode = BluetoothRecoveryEpisode(bluetooth: bluetooth)
-            ioGuard = HeadsetIOGuard(bluetooth: bluetooth, warmRoute: warmRoute)
+            ioGuard = HeadsetIOGuard(bluetooth: bluetooth, warmRoute: warmRoute, transientRoute: startRoute == .transient)
             if warmRoute { feed.setWarmRoute() }
             headsetDevice = headset
             inputMoved = false
@@ -1298,6 +1312,9 @@ public final class AudioRecorder: CaptureEngine {
             guard engineEpoch === epoch else { return (false, nil) }
             defer { switchNotes = feed.takeSwitchNotes() }
             feed.headsetRestarted(started: outcome.started)
+            // v1.28 (B1): a fresh engine runs: the escalated obligation it answered is closed, and a later stop of
+            // this engine opens a new one with its own re-attach.
+            if outcome.started { ioGuard.restarted(at: ProcessInfo.processInfo.systemUptime) }
             if !outcome.started { verifying = nil }
             if outcome.externalBusy { episode.settled(.externalBusy) }
             else if !outcome.started { episode.settled(.failed) }
@@ -1954,13 +1971,17 @@ public final class AudioRecorder: CaptureEngine {
             stats.kind = captureKind
             stats.carrierFrames = feed.timeline.framesNote
             stats.instrumentation = instrumentation.note(boundary: captureBoundary)
+            stats.transientHFP = ioGuard.transientRoute
         }
         stats.lease = lease?.grantNote ?? stats.lease
         // v1.12 (L1): the lease is released below; it completes when every part acknowledged.
         let releasing = lease
         lease = nil
         leaseEpoch = nil
-        if let releasing { lastReleased = releasing }
+        if let releasing {
+            lastReleased = releasing
+            if episode.bluetooth { lastBluetoothReleaseAt = now }   // v1.28 (B1)
+        }
         let restartResult = live ? feed.bridge.restart?.result : nil
         let watch = defaultInputWatch                 // removed outside the lock
         let conversationWatch = conversationRouteWatch
