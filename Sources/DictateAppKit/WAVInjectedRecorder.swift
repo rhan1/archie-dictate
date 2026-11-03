@@ -67,6 +67,19 @@ import DictateCore
 ///   `TransientModel.restartTakes` after it begins, delivers nothing and is stopped by a notification
 ///   `TransientModel.restartStopsAfter` later. A re-attach after that brings IO with real signal (the WAV) from
 ///   `TransientModel.signalFrom`. The production guard, episode and feed decide every step, as the recorder does.
+///   v1.28 FR1-C: a FITTED failure model of f243a0c8 (run1-stderr.txt lines 348–366), not an exact replay. Modelled
+///   as logged: the re-attach (+988 → +1000), `builtin_fallback` (+1906 → +1900), `settled silent_frames` →
+///   `escalate` → `queued wait_ms=484` (→ 500), the fresh engine's start returning (+3402 → +3400) and its stopped
+///   notification (+3654 → +3650), then nothing (RED). Differs: the previous lease's hardware release was +280 ms
+///   AFTER this start in the log (the model's `releaseGap` = 100 ms before it is the gap between session-end log
+///   lines); the running notification was handled at +1315 in the log (the model puts the flip at +1050, before the
+///   re-attach's IO — the only placement that yields the log's ONE re-attach on the 3a48d95 guard; inferred from the
+///   session line's `open:format_changed`); the log's verdict/escalation were +1992/+2003 (model: both +2000, verdict
+///   processed first at the tick's instant — FR1-A's `EscalationRig` covers both orders); `headset_restart=1` is
+///   noted when the restart BEGINS (+2500), the log notes it when its start returns (+3402); the restart's
+///   verification is armed at the fresh start's return (settles +4400) while production arms it before the start
+///   (the log settled +3825); `signalFrom` (+4500) is a counterfactual fixture assumption — the failed recording
+///   never re-attached. `recovered_ms=4700` is model evidence, not measured hardware recovery.
 public final class WAVInjectedRecorder: EngineRecorder {
     /// Which re-attach the `sco_torn_down_250ms` IO model runs.
     public enum IOPolicy: Sendable { case v19, v110 }
