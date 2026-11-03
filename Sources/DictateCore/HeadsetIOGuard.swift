@@ -152,6 +152,21 @@ public struct HeadsetIOGuard: Sendable {
     public private(set) var obligationGeneration = 0
     /// v1.28 (B1): when the current obligation escalated (nil: it did not).
     private var escalatedAt: TimeInterval?
+    /// v1.28 FR1-A: what the episode answered the current escalation's restart request.
+    public enum RestartAnswer: String, Sendable {
+        /// Admitted (now or after its debounce): the restart will run.
+        case queued
+        /// Folded into a restart that is already running / being verified.
+        case started
+        /// Folded into a RE-ATTACH's verification still running (the guard's bound expired first): nothing will
+        /// restart — the escalation is retained and re-offered once that verification settles.
+        case coalesced
+        /// The episode's budget is spent.
+        case refused
+    }
+    public private(set) var restartAnswer: RestartAnswer?
+    /// FR1-A: the verification a `.coalesced` escalation waited for has settled: `.escalate` is offered again.
+    private var escalationReoffer = false
     /// v1.28 (B1): the episode refused this obligation's re-attach for good (its budget is spent): `.exhausted`.
     private var episodeSpent = false
     /// v1.28 (B1): sustained signal since the current obligation opened (`transientRoute` discharges on it).
@@ -268,6 +283,22 @@ public struct HeadsetIOGuard: Sendable {
         held += 1
     }
 
+    /// v1.28 FR1-A: the recorder asked the episode for the escalation's restart and got `answer`. A `.coalesced`
+    /// answer (a re-attach verification still running) is retained: `attemptSettled()` re-offers `.escalate`
+    /// without reserving a re-attach (no episode attempt is spent until the restart begins). `.refused` makes the
+    /// obligation `.exhausted`. Ignored unless an escalated obligation is open.
+    public mutating func restartRequested(_ answer: RestartAnswer) {
+        guard bluetooth, obligation?.escalated == true, !episodeSpent else { return }
+        if answer == .refused { episodeSpent = true; restartAnswer = nil; return }
+        restartAnswer = answer
+        escalationReoffer = false
+    }
+
+    /// v1.28 FR1-A: an attempt's verification settled (any verdict): a coalesced escalation is due again.
+    public mutating func attemptSettled() {
+        if restartAnswer == .coalesced { escalationReoffer = true }
+    }
+
     /// v1.28 (B1): the episode's restart put a fresh engine on the headset (its start returned at `now`). The
     /// escalated obligation it answered is closed — it was owed to an engine that no longer exists — and the
     /// restart is in flight like a re-attach (bounded by `inFlightBound`, ended early by IO). A stop of the fresh
@@ -279,6 +310,8 @@ public struct HeadsetIOGuard: Sendable {
         discharge()
         obligationGeneration += 1
         inFlightSince = now
+        restartAnswer = nil
+        escalationReoffer = false
         obligationSignal.reset()
         obligationSignalled = false
     }
@@ -297,6 +330,8 @@ public struct HeadsetIOGuard: Sendable {
         obligationsOpened += 1
         escalatedAt = nil
         episodeSpent = false
+        restartAnswer = nil
+        escalationReoffer = false
         obligationSignal.reset()
         obligationSignalled = false
     }
@@ -320,12 +355,22 @@ public struct HeadsetIOGuard: Sendable {
                 escalatedAt = now
                 return .escalate
             }
+            // v1.28 FR1-A: the restart request was folded into a re-attach verification that has now settled:
+            // ask for the restart again (no re-attach reserved, no episode attempt spent).
+            if restartAnswer == .coalesced, escalationReoffer {
+                escalationReoffer = false
+                restartAnswer = nil
+                escalatedAt = now
+                return .escalate
+            }
             // v1.28 (B1): the episode's restart owns it only while that restart can still come; it never owes
             // nothing for ever. (Once the restart starts, `restarted(at:)` closes this obligation.)
             if let at = escalatedAt, now < at + Self.restartWait { return .none }
             obligation?.reattached = false                   // no restart came: owed a re-attach again
             obligation?.escalated = false
             escalatedAt = nil
+            restartAnswer = nil
+            escalationReoffer = false
             obligationGeneration += 1
         }
         guard reattaches < Self.maxReattaches else { return .exhausted }

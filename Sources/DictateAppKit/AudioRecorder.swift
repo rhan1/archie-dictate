@@ -217,6 +217,8 @@ public final class AudioRecorder: CaptureEngine {
     private struct Verification {
         let token: CaptureEpoch
         let since: TimeInterval
+        /// v1.28 FR1-A: which attempt is verified (a restart answers a coalesced escalation; a re-attach does not).
+        var path: RecoveryPath = .configuration
         var firstFrame: TimeInterval?
         var firstSignal: TimeInterval?
         var signal = SustainedSignal()
@@ -607,7 +609,7 @@ public final class AudioRecorder: CaptureEngine {
             guard feed.health.status(.builtin, at: now) == .healthy else { return .headsetContinues("builtin_not_healthy") }
             inputMoved = true
             verifying = nil
-            if episode.isRunning { episode.settled(.skipped) }
+            if episode.isRunning { settledLocked(.skipped) }
             let out = feed.headsetFailed()                              // the built-in carries from the continuity point
             deliverLocked(out.frames)
             switchNotes = feed.takeSwitchNotes()
@@ -837,7 +839,7 @@ public final class AudioRecorder: CaptureEngine {
                 completion(.success(()))
             } catch {
                 teardownEngine()
-                lock.withLock { if engineEpoch === epoch, episode.isRunning { episode.settled(.failed) } }
+                lock.withLock { if engineEpoch === epoch, episode.isRunning { settledLocked(.failed) } }
                 // v1.12 (L1): a start that failed for this session ends it — the built-in unit is
                 // stopped and the lease released — so a host that does not call stop() after a
                 // thrown startAsync cannot leave the microphone owned forever.
@@ -1032,7 +1034,7 @@ public final class AudioRecorder: CaptureEngine {
                     return
                 case .escalate:
                     AppController.note("bt_recovery=escalate path=configuration")
-                    requestHeadsetRestart(epoch: epoch, path: .configuration)
+                    requestHeadsetRestart(epoch: epoch, path: .configuration, escalation: true)
                     return
                 case .exhausted:
                     AppController.note("bt_recovery=obligation_open path=configuration reason=reattach_budget")
@@ -1072,7 +1074,7 @@ public final class AudioRecorder: CaptureEngine {
         guard current() else {
             if bluetooth {
                 lock.withLock {
-                    if engineEpoch === epoch, episode.isRunning { episode.settled(.skipped) }
+                    if engineEpoch === epoch, episode.isRunning { settledLocked(.skipped) }
                     ioGuard.reattachFinished(started: false, at: now)
                 }
             }
@@ -1134,7 +1136,7 @@ public final class AudioRecorder: CaptureEngine {
         if bluetooth {
             lock.withLock {
                 verifying = nil
-                if engineEpoch === epoch, episode.isRunning { episode.settled(.failed) }
+                if engineEpoch === epoch, episode.isRunning { settledLocked(.failed) }
             }
             if result == .failed {
                 // The headset engine stays as it is (stopped by AVAudioEngine); the built-in, if
@@ -1211,8 +1213,17 @@ public final class AudioRecorder: CaptureEngine {
         return check
     }
 
+    /// Caller holds `lock`. v1.28 FR1-A: every settled attempt lets an escalation that was folded into a
+    /// re-attach's verification ask for its restart again (`HeadsetIOGuard.attemptSettled`).
+    private func settledLocked(_ outcome: BluetoothRecoveryEpisode.Outcome) {
+        episode.settled(outcome)
+        ioGuard.attemptSettled()
+    }
+
     /// L3: every headset restart request goes through the episode.
-    private func requestHeadsetRestart(epoch: CaptureEpoch, path: RecoveryPath) {
+    /// `escalation` (v1.28 FR1-A): the guard's escalation — its answer is handed back to the guard, so a request
+    /// folded into a running re-attach verification is retained and asked again, never dropped.
+    private func requestHeadsetRestart(epoch: CaptureEpoch, path: RecoveryPath, escalation: Bool = false) {
         if kind == .conversation {
             onExecutor { [weak self] in self?.observeConversationRoute(epoch: epoch) }
             return
@@ -1221,7 +1232,20 @@ public final class AudioRecorder: CaptureEngine {
         let admission: BluetoothRecoveryEpisode.Admission? = lock.withLock {
             guard engineEpoch === epoch else { return .exhausted }
             guard !inputMoved else { return nil }                          // BT1: never the old device
-            return episode.request(path, at: now)
+            let admission = episode.request(path, at: now)
+            if escalation {
+                switch admission {
+                case .now, .after: ioGuard.restartRequested(.queued)
+                case .coalesced:
+                    // Folded into a queued attempt or a running restart: that restart answers it. Folded into a
+                    // re-attach's verification: nothing will restart — retained, asked again when it settles.
+                    if episode.pendingDue != nil { ioGuard.restartRequested(.queued) }
+                    else if restarting || verifying?.path == .restart { ioGuard.restartRequested(.started) }
+                    else { ioGuard.restartRequested(.coalesced) }
+                case .exhausted: ioGuard.restartRequested(.refused)
+                }
+            }
+            return admission
         }
         guard let admission else {
             AppController.note("bt_recovery=skipped path=\(path.rawValue) reason=default_input_changed")
@@ -1323,8 +1347,8 @@ public final class AudioRecorder: CaptureEngine {
             // this engine opens a new one with its own re-attach.
             if outcome.started { ioGuard.restarted(at: ProcessInfo.processInfo.systemUptime) }
             if !outcome.started { verifying = nil }
-            if outcome.externalBusy { episode.settled(.externalBusy) }
-            else if !outcome.started { episode.settled(.failed) }
+            if outcome.externalBusy { settledLocked(.externalBusy) }
+            else if !outcome.started { settledLocked(.failed) }
             guard !outcome.started else { return (false, nil) }
             let out = feed.headsetFailed(at: ProcessInfo.processInfo.systemUptime)
             deliverLocked(out.frames)
@@ -1348,7 +1372,7 @@ public final class AudioRecorder: CaptureEngine {
     /// `since` must arrive by `since + 1 s`; a later frame is not this attempt's success.
     private func verifyFrames(epoch: CaptureEpoch, since: TimeInterval, path: RecoveryPath) {
         let token = CaptureEpoch()
-        lock.withLock { verifying = Verification(token: token, since: since) }
+        lock.withLock { verifying = Verification(token: token, since: since, path: path) }
         healthQueue.asyncAfter(deadline: .now() + BluetoothRecoveryEpisode.successWithin) { [weak self] in
             guard let self else { return }
             let result: BluetoothRecoveryEpisode.Outcome? = self.lock.withLock {
@@ -1357,7 +1381,7 @@ public final class AudioRecorder: CaptureEngine {
                 guard self.engineEpoch === epoch, self.episode.isRunning else { return nil }
                 let outcome = BluetoothRecoveryEpisode.verdict(since: since, firstFrame: check.firstFrame,
                                                                firstSignal: check.firstSignal)
-                self.episode.settled(outcome)
+                self.settledLocked(outcome)
                 return outcome
             }
             if let result { AppController.note("bt_recovery=settled path=\(path.rawValue) result=\(result.rawValue)") }
@@ -1760,7 +1784,7 @@ public final class AudioRecorder: CaptureEngine {
         }
         lock.withLock {
             ioGuard.reattachFinished(started: started, at: now)
-            if !started, engineEpoch === epoch, episode.isRunning { verifying = nil; episode.settled(.failed) }
+            if !started, engineEpoch === epoch, episode.isRunning { verifying = nil; settledLocked(.failed) }
         }
     }
 
@@ -1851,7 +1875,7 @@ public final class AudioRecorder: CaptureEngine {
         if escalate {
             // v1.12 (L2): the obligation's re-attach brought no IO — one restart through the episode.
             AppController.note("bt_recovery=escalate path=obligation")
-            requestHeadsetRestart(epoch: epoch, path: .restart)
+            requestHeadsetRestart(epoch: epoch, path: .restart, escalation: true)
         }
         if let failure = out.failure { reportFailureOnce(failure, epoch: epoch) }
     }
