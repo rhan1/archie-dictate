@@ -5,10 +5,13 @@ import DictateCore
 /// Scripted Groq: each chunk is recognised by its WAV data size, so responses can be given per
 /// chunk, out of order (delays) or failed (status). No network, no Groq spend.
 private actor ScriptedTransport: HTTPTransport {
+    /// v1.28 FR4-A: Groq's `verbose_json` segment (seconds into the chunk's audio).
+    struct Segment: Sendable { let start: Double; let end: Double; let text: String }
     struct Reply: Sendable {
         let text: String
         var delayMs = 0
         var status = 200
+        var segments: [Segment]? = nil
     }
     private let replies: [Int: Reply]
 
@@ -22,7 +25,12 @@ private actor ScriptedTransport: HTTPTransport {
         let size = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }
         let reply = replies[size] ?? Reply(text: "", status: 500)
         if reply.delayMs > 0 { try await Task.sleep(for: .milliseconds(reply.delayMs)) }
-        let data = try JSONSerialization.data(withJSONObject: ["text": reply.text])
+        var json: [String: Any] = ["text": reply.text]
+        if let segments = reply.segments {
+            json["segments"] = segments.enumerated().map { ["id": $0.offset, "start": $0.element.start, "end": $0.element.end,
+                                                            "text": " " + $0.element.text] as [String: Any] }
+        }
+        let data = try JSONSerialization.data(withJSONObject: json)
         return (data, HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: nil, headerFields: nil)!)
     }
 }
@@ -144,9 +152,12 @@ struct EdgeSentenceGuardTests {
     /// the opening was only ever judged in chunk 0, and inside its own chunk the speech starts < 1 s in (0.95 s).
     /// RED on 0faa887: the invented sentence is kept. GREEN: the text starts at "Cold start one".
     @Test func inventedOpeningAfterSilentChunksIsDropped() async {
+        // v1.28 FR4-A: Groq's segments place the invented sentence inside the chunk's silent lead (0.0–0.9 s).
         let result = await run([(noise(3.0), .init(text: "Thank you.")), (noise(3.5), .init(text: "Dictate.")),
                                 (noise(3.3), .init(text: "Thank you.")),
-                                (noise(0.95) + tone(2.4), .init(text: "And I'll see you next time. Cold start one, this should begin on the first tap, as planned today."))])
+                                (noise(0.95) + tone(2.4), .init(text: "And I'll see you next time. Cold start one, this should begin on the first tap, as planned today.",
+                                    segments: [.init(start: 0.0, end: 0.9, text: "And I'll see you next time."),
+                                               .init(start: 0.95, end: 3.35, text: "Cold start one, this should begin on the first tap, as planned today.")]))])
         print("FR3-A LITERAL text=\"\(result.text)\" silent_chunks=\(result.droppedSilentChunks) opening_drops=\(result.droppedOpeningSentences)")
         #expect(result.text == "Cold start one, this should begin on the first tap, as planned today.")
     }
@@ -157,6 +168,37 @@ struct EdgeSentenceGuardTests {
                                 (noise(0.2) + tone(3.0), .init(text: "Cold start one. This should begin on the first tap."))])
         print("FR3-A CONTROL honest_opening text=\"\(result.text)\"")
         #expect(result.text == "Cold start one. This should begin on the first tap.")
+    }
+
+    // MARK: v1.28 FR4-A — the opening after a silent lead-in is judged on Groq's segment timestamps
+
+    /// The FR3 stop-rule reviewer's honest case: after a silent lead-in the speech chunk has a 3.0 s lead (an arbitrary
+    /// pause cut), so letter-count placement maps the honest "Cold start one." onto the lead. RED on 0051609: dropped.
+    /// GREEN: its segment (3.0–4.2 s) overlaps speech → kept.
+    @Test func honestOpeningAfterLongChunkLeadIsKept() async {
+        let result = await run([(noise(3.0), .init(text: "Thank you.")), (noise(3.5), .init(text: "Dictate.")),
+                                (noise(3.0) + tone(3.0), .init(text: "Cold start one. This should begin on the first tap.",
+                                    segments: [.init(start: 3.0, end: 4.2, text: "Cold start one."),
+                                               .init(start: 4.2, end: 6.0, text: "This should begin on the first tap.")]))])
+        print("FR4-A LITERAL honest_long_lead text=\"\(result.text)\" silent_chunks=\(result.droppedSilentChunks) opening_drops=\(result.droppedOpeningSentences)")
+        #expect(result.text == "Cold start one. This should begin on the first tap.")
+    }
+
+    /// No segments (Apple, Scribe, a stub) after a silent lead-in: a general sentence is never dropped by letters.
+    /// RED on 0051609: "Okay so." (letters inside the 2.0 s lead) dropped. GREEN: kept.
+    @Test func noSegmentsAfterSilentLeadInKeepsGeneralSentence() async {
+        let result = await run([(noise(3.0), .init(text: "Thank you.")), (noise(3.5), .init(text: "Dictate.")),
+                                (noise(2.0) + tone(2.0), .init(text: "Okay so. Book the flight to Denver."))])
+        print("FR4-A LITERAL no_segments_general text=\"\(result.text)\" opening_drops=\(result.droppedOpeningSentences)")
+        #expect(result.text == "Okay so. Book the flight to Denver.")
+    }
+
+    /// No segments after a silent lead-in: a known artifact over the lead is still dropped (both trees).
+    @Test func noSegmentsAfterSilentLeadInDropsArtifact() async {
+        let result = await run([(noise(3.0), .init(text: "Thank you.")), (noise(3.5), .init(text: "Dictate.")),
+                                (noise(2.0) + tone(2.0), .init(text: "Thank you. Book the flight to Denver."))])
+        print("FR4-A LITERAL no_segments_artifact text=\"\(result.text)\" artifacts=\(result.droppedArtifacts)")
+        #expect(result.text == "Book the flight to Denver.")
     }
 
     // MARK: silent chunks
