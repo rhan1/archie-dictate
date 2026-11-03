@@ -766,7 +766,7 @@ public final class AppController {
                 let keys = keyStore
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
-                if let trace = transcriptTrace { incremental?.onCleaned = { trace.cleaned($0) } }
+                if let trace = transcriptTrace { incremental?.onCleaned = { trace.cleaned($0) }; incremental?.onCleanerInput = { trace.cleanerIn($0) } }
                 incrementalCleaner = incremental
                 let stopPhrase = StreamingStopPhrase()
                 let observer = onStreamingSegment
@@ -794,7 +794,7 @@ public final class AppController {
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
                 let trace = transcriptTrace
-                if let trace { incremental?.onCleaned = { trace.cleaned($0) } }
+                if let trace { incremental?.onCleaned = { trace.cleaned($0) }; incremental?.onCleanerInput = { trace.cleanerIn($0) } }
                 incrementalCleaner = incremental
                 let streaming = GroqChunkedTranscriber(transport: sttTransport, apiKey: {
                     guard let key = keys.key(for: "groq-api") else { throw TranscriptionError.missingKey }
@@ -984,6 +984,7 @@ public final class AppController {
                     if incrementalSTT, let incrementalSession {
                         incremental = await incrementalSession.finish(totalChunks: pipeline.chunks ?? 0, rawText: raw,
                             single: { fullRaw in
+                                trace?.cleanerIn(fullRaw)
                                 let outcome = await policy.clean(fullRaw, groq: groqCleaner, local: localCleaner)
                                 trace?.cleaned(outcome.text)
                                 return .init(text: outcome.text, label: outcome.label, model: outcome.model,
@@ -1008,6 +1009,7 @@ public final class AppController {
                             timeline.cleanupModelFallback = String(label.dropFirst("cleanup_model_fallback=".count))
                         }
                     } else {
+                        trace?.cleanerIn(raw)
                         let outcome = await policy.clean(raw, groq: groqCleaner, local: localCleaner)
                         trace?.cleaned(outcome.text)
                         pipeline.text = outcome.text
@@ -1017,6 +1019,14 @@ public final class AppController {
                         timeline.cleanupCalls += outcome.calls
                         if outcome.label.hasPrefix("cleanup_model_fallback=") {
                             timeline.cleanupModelFallback = String(outcome.label.dropFirst("cleanup_model_fallback=".count))
+                        }
+                    }
+                    // v1.28 FR3-C: a short sentence-final answer the cleaner dropped is put back (model-independent).
+                    if let cleaned = pipeline.text, cleaned != raw {
+                        let tail = TranscriptCleaner.restoreShortTail(raw: raw, cleaned: cleaned)
+                        if tail.restored {
+                            pipeline.text = tail.text
+                            Self.note("cleanup_tail_restored=1")
                         }
                     }
                     pipeline.cleanupMs = Int(Date().timeIntervalSince(cleanStart) * 1000)

@@ -56,6 +56,8 @@ public final class TranscriptTrace: @unchecked Sendable {
     public func chunk(index: Int, final: Bool, prompt: String, raw: String) {
         write("chunk=\(index) final=\(final ? 1 : 0) prompt=\(prompt) raw=\(raw)")
     }
+    /// v1.28 FR3-C: what each cleaner call was given (input vs `cleaned=` output).
+    public func cleanerIn(_ text: String) { write("cleaner_in=\(text)") }
     public func cleaned(_ text: String) { write("cleaned=\(text)") }
     public func pasted(_ text: String) { write("pasted=\(text)") }
 
