@@ -1,0 +1,2 @@
+input: Send the invoice to Limpar today. Yes.
+expected: Send the invoice to Limpar today. Yes.
