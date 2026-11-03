@@ -159,6 +159,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private var scribeChunks = 0
     private var scribeNoKey = false
     private var openingIndex: Int?
+    /// v1.28 FR3-A: the opening has been judged on the first chunk that kept text (or the drop budget is spent).
+    private var openingDone = false
     private var openingDrops: [EdgeSentenceGuard.Drop] = []
     private var tailJudged = false
     private var tailDrops: [EdgeSentenceGuard.Drop] = []
@@ -399,7 +401,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         let (shouldEmit, replacements, current) = lock.withLock { () -> (Bool, [(Int, String)], String) in
             guard !cancelled else { return (false, [], "") }
             silenceLocked(chunk.index)
-            openingLocked(chunk.index)
+            openingLocked()
             let replaced = [chunk.index - 1, chunk.index].compactMap { index in guardLocked(index).map { (index, $0) } }
             return (true, replaced, texts[chunk.index] ?? fallbackText)
         }
@@ -582,14 +584,35 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 
     /// v1.11 L1: the dictation's first chunk (index 0) loses an invented opening sentence when its
     /// text arrives. Lock held.
-    private func openingLocked(_ index: Int) {
-        guard edgeGuard, index == 0, openingIndex == nil, let text = texts[index], !text.isEmpty,
-              let windows = windowsByIndex[index] else { return }
-        openingIndex = index
-        let result = EdgeSentenceGuard.filter(text, edge: .opening, windows: windows, reference: referenceWindowsLocked)
-        guard !result.drops.isEmpty else { return }
-        texts[index] = result.text
-        openingDrops = result.drops
+    private func openingLocked() {
+        // v1.28 FR3-A (f049157e): the opening is the FIRST chunk that still holds text once every chunk before it ended
+        // empty (silent, or wholly invented), not only chunk 0; the silent chunks' time counts as the opening's
+        // non-speech (by the FR2-A floor). At most `EdgeSentenceGuard.maxDrops` drops across the whole opening.
+        guard edgeGuard, !openingDone else { return }
+        let windowSeconds = Double(CaptureEvidence.windowFrames) / CaptureEvidence.rate
+        var quiet: TimeInterval = 0
+        var candidate = 0
+        while !openingDone {
+            guard let windows = windowsByIndex[candidate], !failures.contains(candidate), let text = texts[candidate] else { return }
+            if text.isEmpty {
+                if EdgeSentenceGuard.isSilent(windows, reference: referenceWindowsLocked) { quiet += Double(windows.count) * windowSeconds }
+                candidate += 1
+                continue
+            }
+            let budget = EdgeSentenceGuard.maxDrops - openingDrops.count
+            guard budget > 0 else { openingDone = true; return }
+            let result = EdgeSentenceGuard.filter(text, edge: .opening, windows: windows, reference: referenceWindowsLocked,
+                                                  leadingQuiet: quiet, maxDrops: budget)
+            openingIndex = candidate
+            openingDrops += result.drops
+            texts[candidate] = result.text
+            if result.text.isEmpty {                       // the whole chunk was invented: the opening moves on
+                quiet += Double(windows.count) * windowSeconds
+                candidate += 1
+                continue
+            }
+            openingDone = true
+        }
     }
 
     /// v1.11 L1: judges the last chunk's ending (a rejoined last pair as one) once. Returns the

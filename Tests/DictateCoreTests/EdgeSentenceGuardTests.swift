@@ -141,12 +141,12 @@ struct EdgeSentenceGuardTests {
 
     /// Raza's step 2 (2026-11-04, f049157e, 33.4 s, ~20 s silent first): the silent chunks were emptied (FR2-A), yet the
     /// first chunk that held speech began with an invented sentence ("And I'll see you next time. Cold Start 1, …") —
-    /// the opening was only ever judged in chunk 0, and inside its own chunk the speech starts < 1 s in.
+    /// the opening was only ever judged in chunk 0, and inside its own chunk the speech starts < 1 s in (0.95 s).
     /// RED on 0faa887: the invented sentence is kept. GREEN: the text starts at "Cold start one".
     @Test func inventedOpeningAfterSilentChunksIsDropped() async {
         let result = await run([(noise(3.0), .init(text: "Thank you.")), (noise(3.5), .init(text: "Dictate.")),
                                 (noise(3.3), .init(text: "Thank you.")),
-                                (noise(0.8) + tone(2.4), .init(text: "And I'll see you next time. Cold start one, this should begin on the first tap, as planned today."))])
+                                (noise(0.95) + tone(2.4), .init(text: "And I'll see you next time. Cold start one, this should begin on the first tap, as planned today."))])
         print("FR3-A LITERAL text=\"\(result.text)\" silent_chunks=\(result.droppedSilentChunks) opening_drops=\(result.droppedOpeningSentences)")
         #expect(result.text == "Cold start one, this should begin on the first tap, as planned today.")
     }

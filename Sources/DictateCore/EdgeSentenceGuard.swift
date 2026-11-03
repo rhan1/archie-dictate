@@ -37,7 +37,10 @@ public enum EdgeSentenceGuard {
 
     /// Drops invented sentences at `edge` of one chunk. `windows` are that chunk's 50 ms RMS
     /// windows; `reference` is every window of the dictation so far.
-    public static func filter(_ text: String, edge: Edge, windows: [Float], reference: [Float]) -> (text: String, drops: [Drop]) {
+    /// v1.28 FR3-A: `leadingQuiet` = seconds of non-speech before this chunk (the emptied chunks of a silent lead-in),
+    /// counted with the chunk's own lead for the opening's ≥ `minEdgeSeconds` test; `maxDrops` = the edge's budget left.
+    public static func filter(_ text: String, edge: Edge, windows: [Float], reference: [Float],
+                              leadingQuiet: TimeInterval = 0, maxDrops dropBudget: Int = maxDrops) -> (text: String, drops: [Drop]) {
         let sentences = sentences(in: text)
         guard !sentences.isEmpty, !windows.isEmpty else { return (text, []) }
         let speech = CaptureEvidence.possibleSpeechWindows(windows, reference: reference)
@@ -47,7 +50,8 @@ public enum EdgeSentenceGuard {
         let windowSeconds = Double(CaptureEvidence.windowFrames) / CaptureEvidence.rate
         if let first = sections.first, let last = sections.last {
             let quiet = edge == .tail ? count - last.upperBound : first.lowerBound
-            guard Double(quiet) * windowSeconds >= minEdgeSeconds - 0.000001 else { return (text, []) }
+            let lead = edge == .opening ? leadingQuiet : 0
+            guard Double(quiet) * windowSeconds + lead >= minEdgeSeconds - 0.000001 else { return (text, []) }
         } else {
             guard ratio(speech[...]) < maxSpeechRatio else { return (text, []) }
         }
@@ -64,7 +68,7 @@ public enum EdgeSentenceGuard {
         var drops: [Drop] = []
         var dropped: Set<Int> = []
         let order = edge == .tail ? Array(sentences.indices.reversed()) : Array(sentences.indices)
-        for index in order.prefix(maxDrops) {
+        for index in order.prefix(max(0, dropBudget)) {
             let span = bounds[index]..<max(bounds[index] + 1, bounds[index + 1])
             let overlapsSpeech = (sections + words).contains { $0.overlaps(span) }
             guard !overlapsSpeech, ratio(speech[span.clamped(to: 0..<count)]) < maxSpeechRatio else { break }
