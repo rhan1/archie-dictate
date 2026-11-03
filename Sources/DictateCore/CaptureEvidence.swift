@@ -27,6 +27,14 @@ public struct CaptureEvidence: Sendable {
     public static let minContrastDB: Float = 6
     /// Windows below this are digital silence: never part of the floor (a dropped link's zeros).
     public static let digitalSilenceRMS: Float = 0.00001
+    /// v1.28 FR2-A: the possible-speech floor's digital-silence line (−70 dBFS). A Bluetooth headset's near-zeros
+    /// survive the 16 k → 24 k conversion at ≈ −89 dBFS, above `digitalSilenceRMS` (−100): 19f69203 (2026-11-04)
+    /// let them set the floor at ≈ −92.7 dBFS, and room noise at −46 dBFS became "possible speech".
+    public static let possibleFloorSilenceRMS: Float = 0.000_316_227_8
+    /// v1.28 FR2-A: the possible-speech floor never sits below −60 dBFS.
+    public static let possibleFloorMinimumRMS: Float = 0.001
+    /// v1.28 FR2-A: below −50 dBFS a window is never possible speech (−40 dBFS stays the always-speech line).
+    public static let possibleSpeechMinimumRMS: Float = 0.003_162_278
     public static let minSection: TimeInterval = 0.3
     public static let minSeparation: TimeInterval = 0.2
     /// Abutting buffers whose timestamps jitter by up to this much stay one interval.
@@ -114,13 +122,19 @@ public struct CaptureEvidence: Sendable {
     /// v1.11 L1: windows that MAY hold speech — above −40 dBFS, or `minContrastDB` over the floor of
     /// `reference` (the whole dictation so far; never the chunk alone, whose own contrast a key
     /// click supplies). Deleting text needs the absence of even this; soft words veto a drop.
+    /// v1.28 FR2-A: windows below −70 dBFS never enter the floor percentile, the floor is never below −60 dBFS, and
+    /// a window counts only if it is ≥ `minContrastDB` over that floor AND ≥ −50 dBFS.
     public static func possibleSpeechWindows(_ windows: [Float], reference: [Float]) -> [Bool] {
-        let audible = reference.filter { $0 >= digitalSilenceRMS }.sorted()
-        let floor = audible.isEmpty ? nil : audible[Int((Double(audible.count - 1) * 0.1).rounded(.down))]
-        let threshold = floor.map { $0 * pow(10, minContrastDB / 20) }
-        return windows.map { rms in
-            rms >= speechRMS || (rms >= quietSpeechFloor && threshold.map { rms >= $0 } ?? false)
-        }
+        let threshold = max(possibleSpeechMinimumRMS, possibleSpeechFloor(reference: reference) * pow(10, minContrastDB / 20))
+        return windows.map { rms in rms >= speechRMS || rms >= threshold }
+    }
+
+    /// v1.28 FR2-A: the possible-speech floor of `reference` — the 10th percentile of its windows at or above
+    /// −70 dBFS, never below −60 dBFS (no such window: −60 dBFS).
+    public static func possibleSpeechFloor(reference: [Float]) -> Float {
+        let audible = reference.filter { $0 >= possibleFloorSilenceRMS }.sorted()
+        guard !audible.isEmpty else { return possibleFloorMinimumRMS }
+        return max(possibleFloorMinimumRMS, audible[Int((Double(audible.count - 1) * 0.1).rounded(.down))])
     }
 
     /// The relative speech threshold, or nil when the windows hold no contrast.
