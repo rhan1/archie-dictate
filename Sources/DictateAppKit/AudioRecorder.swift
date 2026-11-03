@@ -235,7 +235,10 @@ public final class AudioRecorder: CaptureEngine {
     private var lastReleased: CaptureLease?
     /// v1.28 (B1): uptime at which this recorder last released a Bluetooth capture (the HFP link it held then
     /// drops back to A2DP over the next ~1 s). The route probe cannot tell since when HFP is up; this is the criterion.
+    /// FR1-B: stamped when that session's headset client COMPLETED its teardown (not at `stop()`'s entry), before
+    /// the broker hears the release, by the lease's serial (a late completion of an older lease never overwrites).
     private var lastBluetoothReleaseAt: TimeInterval?
+    private var lastBluetoothReleaseSerial = Int.min
     /// v1.28 FR1-B (diagnostics/tests): the last start's classification, `warm=<0|1> route=<…> since_release_ms=<n|->`.
     private var lastClassification = "none"
     var classificationNote: String { lock.withLock { lastClassification } }
@@ -2009,10 +2012,9 @@ public final class AudioRecorder: CaptureEngine {
         let releasing = lease
         lease = nil
         leaseEpoch = nil
-        if let releasing {
-            lastReleased = releasing
-            if episode.bluetooth { lastBluetoothReleaseAt = now }   // v1.28 (B1)
-        }
+        if let releasing { lastReleased = releasing }
+        // v1.28 FR1-B: only a live Bluetooth session of this lease stamps the release (when its teardown completes).
+        let stampsBluetoothRelease = live && episode.bluetooth
         let restartResult = live ? feed.bridge.restart?.result : nil
         let watch = defaultInputWatch                 // removed outside the lock
         let conversationWatch = conversationRouteWatch
@@ -2078,6 +2080,15 @@ public final class AudioRecorder: CaptureEngine {
         }
         onExecutor { [self] in
             teardownEngine(counted: live)
+            // v1.28 FR1-B: the HFP link starts collapsing now; visible before a waiting start resumes.
+            if stampsBluetoothRelease, let serial = releasing?.serial {
+                lock.withLock {
+                    if serial >= lastBluetoothReleaseSerial {
+                        lastBluetoothReleaseSerial = serial
+                        lastBluetoothReleaseAt = ProcessInfo.processInfo.systemUptime
+                    }
+                }
+            }
             releasing?.partReleased(.headset)
         }
         return captured
