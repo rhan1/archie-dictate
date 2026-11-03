@@ -121,10 +121,20 @@ struct EdgeSentenceGuardTests {
     }
 
     /// Soft words (6 dB over the dictation's floor, under its speech threshold) veto a drop.
+    /// v1.28 FR2-A: possible speech also needs ≥ −50 dBFS, so the soft word is at amplitude 200 (≈ −47 dBFS RMS,
+    /// still under the −40 dBFS speech line); it was 60 (≈ −58 dBFS) — see the twin below.
     @Test func softWordsVetoTheDrop() async {
-        let last = tone(1.0) + noise(0.3) + tone(0.5, amplitude: 60) + noise(1.2) + click + noise(0.25)
+        let last = tone(1.0) + noise(0.3) + tone(0.5, amplitude: 200) + noise(1.2) + click + noise(0.25)
         let result = await run([(tone(1.0), .init(text: report)), (last, .init(text: "Send it. Then call Maria."))])
         #expect(result.text == "Send the report to Maria. Send it. Then call Maria.")
+    }
+
+    /// v1.28 FR2-A (deliberate change, requirement quoted in the 1.28 spec): a −58 dBFS "word" over a −67 dBFS room is
+    /// below the −50 dBFS possible-speech line and no longer vetoes the drop (v1.11–1.27 kept "Then call Maria.").
+    @Test func soundBelowMinus50DoesNotVetoTheDrop() async {
+        let last = tone(1.0) + noise(0.3) + tone(0.5, amplitude: 60) + noise(1.2) + click + noise(0.25)
+        let result = await run([(tone(1.0), .init(text: report)), (last, .init(text: "Send it. Then call Maria."))])
+        #expect(result.text == "Send the report to Maria. Send it.")
     }
 
     // MARK: silent chunks
