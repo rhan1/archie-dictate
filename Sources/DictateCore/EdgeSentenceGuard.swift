@@ -30,6 +30,14 @@ public enum EdgeSentenceGuard {
     /// At most this many sentences are dropped from one edge ("Thank you. Bye.").
     public static let maxDrops = 2
 
+    /// v1.28 FR4-A: one recognizer segment (Groq `verbose_json` `segments[]`), seconds into the chunk's audio.
+    public struct Segment: Sendable, Equatable, Decodable {
+        public let start: Double
+        public let end: Double
+        public let text: String
+        public init(start: Double, end: Double, text: String) { self.start = start; self.end = end; self.text = text }
+    }
+
     /// True when no window of `windows` may be speech by the dictation's floor.
     public static func isSilent(_ windows: [Float], reference: [Float]) -> Bool {
         !windows.isEmpty && !CaptureEvidence.possibleSpeechWindows(windows, reference: reference).contains(true)
@@ -39,15 +47,36 @@ public enum EdgeSentenceGuard {
     /// windows; `reference` is every window of the dictation so far.
     /// v1.28 FR3-A: `leadingQuiet` = seconds of non-speech before this chunk (the emptied chunks of a silent lead-in),
     /// counted with the chunk's own lead for the opening's ≥ `minEdgeSeconds` test; `maxDrops` = the edge's budget left.
+    /// v1.28 FR4-A: `afterSilentLeadIn` = this is the opening chunk and every chunk before it ended empty. There the
+    /// letter-count placement is not used for general sentences (a chunk's lead is an arbitrary pause cut, so an honest
+    /// short opening maps onto it): with the recognizer's `segments`, a sentence is dropped only when its segments'
+    /// [start, end] overlaps no possible-speech window (so no speech-like run either); without segments (Apple, Scribe,
+    /// or segments that do not match the text) only a known artifact (`artifacts`) may be dropped, by the letter rule.
     public static func filter(_ text: String, edge: Edge, windows: [Float], reference: [Float],
-                              leadingQuiet: TimeInterval = 0, maxDrops dropBudget: Int = maxDrops) -> (text: String, drops: [Drop]) {
+                              leadingQuiet: TimeInterval = 0, maxDrops dropBudget: Int = maxDrops,
+                              afterSilentLeadIn: Bool = false, segments: [Segment]? = nil) -> (text: String, drops: [Drop]) {
         let sentences = sentences(in: text)
         guard !sentences.isEmpty, !windows.isEmpty else { return (text, []) }
         let speech = CaptureEvidence.possibleSpeechWindows(windows, reference: reference)
-        let sections = sections(speech)
-        let words = runs(speech, minimum: minSpeechRun)
         let count = windows.count
         let windowSeconds = Double(CaptureEvidence.windowFrames) / CaptureEvidence.rate
+        let leadIn = afterSilentLeadIn && edge == .opening
+        if leadIn, let spans = segmentSpans(sentences, segments: segments) {
+            var drops: [Drop] = []
+            var dropped: Set<Int> = []
+            for index in sentences.indices.prefix(max(0, dropBudget)) {
+                let (start, end) = spans[index]
+                let low = min(count - 1, max(0, Int((start / windowSeconds).rounded(.down))))
+                let high = min(count, max(low + 1, Int((end / windowSeconds).rounded(.up))))
+                guard !speech[low..<high].contains(true) else { break }
+                drops.append(artifacts.contains(normalized(sentences[index])) ? .artifact : .lowSpeech)
+                dropped.insert(index)
+            }
+            guard !drops.isEmpty else { return (text, []) }
+            return (sentences.indices.filter { !dropped.contains($0) }.map { sentences[$0] }.joined(separator: " "), drops)
+        }
+        let sections = sections(speech)
+        let words = runs(speech, minimum: minSpeechRun)
         if let first = sections.first, let last = sections.last {
             let quiet = edge == .tail ? count - last.upperBound : first.lowerBound
             let lead = edge == .opening ? leadingQuiet : 0
@@ -72,12 +101,44 @@ public enum EdgeSentenceGuard {
             let span = bounds[index]..<max(bounds[index] + 1, bounds[index + 1])
             let overlapsSpeech = (sections + words).contains { $0.overlaps(span) }
             guard !overlapsSpeech, ratio(speech[span.clamped(to: 0..<count)]) < maxSpeechRatio else { break }
+            if leadIn, !artifacts.contains(normalized(sentences[index])) { break }     // FR4-A: no segments → artifacts only
             drops.append(artifacts.contains(normalized(sentences[index])) ? .artifact : .lowSpeech)
             dropped.insert(index)
         }
         guard !drops.isEmpty else { return (text, []) }
         let kept = sentences.indices.filter { !dropped.contains($0) }.map { sentences[$0] }
         return (kept.joined(separator: " "), drops)
+    }
+
+    /// v1.28 FR4-A: each sentence's [start, end] in seconds from the segments its letters fall in (a segment that
+    /// spans two sentences gives both its whole time: uncertain text is kept). Nil when there are no segments or
+    /// their letters are not the text's letters (e.g. a repetition loop was collapsed).
+    static func segmentSpans(_ sentences: [String], segments: [Segment]?) -> [(Double, Double)]? {
+        guard let segments, !segments.isEmpty else { return nil }
+        func letters(_ s: String) -> [Character] { Array(s.lowercased().filter { $0.isLetter || $0.isNumber }) }
+        let segmentLetters = segments.map { letters($0.text).count }
+        let sentenceLetters = sentences.map { letters($0).count }
+        guard segments.flatMap({ letters($0.text) }) == sentences.flatMap({ letters($0) }),
+              segments.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.end >= $0.start }) else { return nil }
+        var spans: [(Double, Double)] = []
+        var sentenceStart = 0
+        for sentence in sentenceLetters {
+            let sentenceEnd = sentenceStart + max(1, sentence)
+            var segmentStart = 0
+            var start = Double.infinity, end = -Double.infinity
+            for (index, length) in segmentLetters.enumerated() {
+                let segmentEnd = segmentStart + length
+                if length > 0, segmentStart < sentenceEnd, sentenceStart < segmentEnd {
+                    start = min(start, segments[index].start)
+                    end = max(end, segments[index].end)
+                }
+                segmentStart = segmentEnd
+            }
+            guard start.isFinite, end.isFinite else { return nil }
+            spans.append((start, end))
+            sentenceStart += sentence
+        }
+        return spans
     }
 
     /// Sentences, trimmed. A terminator ends one only before whitespace or the end ("1.11" stays whole).

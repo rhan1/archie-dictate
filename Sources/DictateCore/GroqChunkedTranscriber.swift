@@ -162,6 +162,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     /// v1.28 FR3-A: the opening has been judged on the first chunk that kept text (or the drop budget is spent).
     private var openingDone = false
     private var openingDrops: [EdgeSentenceGuard.Drop] = []
+    /// v1.28 FR4-A: Groq's `verbose_json` segments per chunk (chunks with index ≥ 1 ask for them).
+    private var segmentsByIndex: [Int: [EdgeSentenceGuard.Segment]] = [:]
     private var tailJudged = false
     private var tailDrops: [EdgeSentenceGuard.Drop] = []
     private var rejoinTask: Task<Void, Never>?
@@ -301,6 +303,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private struct Response: Sendable {
         let text: String?
         let http: HTTPURLResponse?
+        var segments: [EdgeSentenceGuard.Segment]? = nil
     }
     private enum RequestEvent: Sendable {
         case response(Int, Response)
@@ -311,6 +314,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         let status: Int?
         let hedgeFired: Bool
         let winningRequest: Int?
+        var segments: [EdgeSentenceGuard.Segment]? = nil
     }
 
     private func send(_ request: URLRequest) async -> Response {
@@ -318,10 +322,13 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             let (data, response) = try await client.transport.send(request)
             onGroqRateLimit?(GroqRateLimit(response: response, endpoint: .stt))
             guard (200...299).contains(response.statusCode) else { return Response(text: nil, http: response) }
+            // v1.28 FR4-A: `verbose_json` adds `segments[]`; a reply without them (or with malformed ones) is text only.
             struct Transcript: Decodable { let text: String }
+            struct Segments: Decodable { let segments: [EdgeSentenceGuard.Segment] }
             let text = (try? JSONDecoder().decode(Transcript.self, from: data))?.text
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return Response(text: text, http: response)
+            let segments = (try? JSONDecoder().decode(Segments.self, from: data))?.segments
+            return Response(text: text, http: response, segments: segments)
         } catch { return Response(text: nil, http: nil) }
     }
 
@@ -381,7 +388,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                     }
                 }
                 if let text = response.text {
-                    return AttemptResult(text: text, status: status, hedgeFired: fired, winningRequest: number)
+                    return AttemptResult(text: text, status: status, hedgeFired: fired, winningRequest: number,
+                                         segments: response.segments)
                 }
                 // Failure before the timer goes straight to today's attempt 2.
                 // After a hedge, wait for the other response to have a chance.
@@ -428,8 +436,11 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 }
                 var requestClient = client
                 requestClient.modelName = model
+                // v1.28 FR4-A: any chunk after the first may open the dictation after a silent lead-in (known only once
+                // the chunks before it are judged), so it asks for segment timestamps; chunk 0 never follows a lead-in.
                 let request = requestClient.makeRequest(wav: wav, prompt: prompt, apiKey: key,
-                                                 boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true)
+                                                 boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true,
+                                                 responseFormat: chunk.index >= 1 ? "verbose_json" : "json")
                 outcome = await requestAttempt(request, hedged: attempt == 1)
             } catch {
                 outcome = AttemptResult(text: nil, status: nil, hedgeFired: false, winningRequest: nil)
@@ -444,6 +455,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 // M2: a Whisper repetition loop is collapsed or dropped before it is streamed or joined.
                 let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
                 texts[chunk.index] = guarded.text
+                segmentsByIndex[chunk.index] = outcome.segments
                 loopEvents += guarded.loops
                 return true
             }
@@ -601,8 +613,11 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             }
             let budget = EdgeSentenceGuard.maxDrops - openingDrops.count
             guard budget > 0 else { openingDone = true; return }
+            // v1.28 FR4-A: after a silent lead-in (candidate > 0) the opening is judged on Groq's segment timestamps;
+            // without segments only a known artifact may go. Chunk 0 keeps the letter rule.
             let result = EdgeSentenceGuard.filter(text, edge: .opening, windows: windows, reference: referenceWindowsLocked,
-                                                  leadingQuiet: quiet, maxDrops: budget)
+                                                  leadingQuiet: quiet, maxDrops: budget,
+                                                  afterSilentLeadIn: candidate > 0, segments: segmentsByIndex[candidate])
             openingIndex = candidate
             openingDrops += result.drops
             texts[candidate] = result.text
