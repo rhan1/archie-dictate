@@ -6,7 +6,11 @@ import DictateCore
 /// chunk, out of order (delays) or failed (status). No network, no Groq spend.
 private actor ScriptedTransport: HTTPTransport {
     /// v1.28 FR4-A: Groq's `verbose_json` segment (seconds into the chunk's audio).
-    struct Segment: Sendable { let start: Double; let end: Double; let text: String }
+    struct Segment: Sendable {
+        let start: Double; let end: Double; let text: String
+        /// v1.28 FR5: Whisper's confidences (`no_speech_prob`, `avg_logprob`, `compression_ratio`); nil = not sent.
+        var p: Double? = nil; var lp: Double? = nil; var cr: Double? = nil
+    }
     struct Reply: Sendable {
         let text: String
         var delayMs = 0
@@ -27,8 +31,14 @@ private actor ScriptedTransport: HTTPTransport {
         if reply.delayMs > 0 { try await Task.sleep(for: .milliseconds(reply.delayMs)) }
         var json: [String: Any] = ["text": reply.text]
         if let segments = reply.segments {
-            json["segments"] = segments.enumerated().map { ["id": $0.offset, "start": $0.element.start, "end": $0.element.end,
-                                                            "text": " " + $0.element.text] as [String: Any] }
+            json["segments"] = segments.enumerated().map { item -> [String: Any] in
+                var segment: [String: Any] = ["id": item.offset, "start": item.element.start, "end": item.element.end,
+                                              "text": " " + item.element.text]
+                if let p = item.element.p { segment["no_speech_prob"] = p }
+                if let lp = item.element.lp { segment["avg_logprob"] = lp }
+                if let cr = item.element.cr { segment["compression_ratio"] = cr }
+                return segment
+            }
         }
         let data = try JSONSerialization.data(withJSONObject: json)
         return (data, HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: nil, headerFields: nil)!)
@@ -200,7 +210,8 @@ struct EdgeSentenceGuardTests {
         #expect(result.text == "Cold start one. This should begin on the first tap.")
     }
 
-    /// Chunk 0 never follows a lead-in and keeps `json`; every later chunk asks Groq for `verbose_json` (segments).
+    /// v1.28 FR5-A: every chunk, chunk 0 included, asks Groq for `verbose_json` (segments + confidences).
+    /// FR4 had chunk 0 on `json` (RED on 3c6aad8: `["json", "verbose_json", "verbose_json"]`).
     @Test func laterChunksAskForSegments() async {
         let transport = FormatTransport()
         let stt = GroqChunkedTranscriber(transport: transport, apiKey: { "test-key" }, prompt: "Politrace",
@@ -212,7 +223,7 @@ struct EdgeSentenceGuardTests {
         _ = await stt.finish()
         let formats = await chunks.map { ScriptedTransport.key($0) }.asyncMap { await transport.formats[$0] ?? "none" }
         print("FR4-A LITERAL response_format=\(formats)")
-        #expect(formats == ["json", "verbose_json", "verbose_json"])
+        #expect(formats == ["verbose_json", "verbose_json", "verbose_json"])     // v1.28 FR5-A: every chunk (was json for chunk 0)
     }
 
     /// No segments (Apple, Scribe, a stub) after a silent lead-in: a general sentence is never dropped by letters.
@@ -230,6 +241,38 @@ struct EdgeSentenceGuardTests {
                                 (noise(2.0) + tone(2.0), .init(text: "Thank you. Book the flight to Denver."))])
         print("FR4-A LITERAL no_segments_artifact text=\"\(result.text)\" artifacts=\(result.droppedArtifacts)")
         #expect(result.text == "Book the flight to Denver.")
+    }
+
+    // MARK: v1.28 FR5 — Whisper's own confidence
+
+    /// Room noise at −46 dBFS (above FR2-A's −50 dBFS possible-speech line, below the −40 dBFS speech line).
+    private func room46(_ seconds: Double) -> [Int16] {
+        (0..<Int(seconds * 24_000)).map { $0.isMultiple(of: 2) ? 164 : -164 }
+    }
+
+    /// Raza's re-test 1 (2026-11-05 06:45:43, trace 97ee30ab.txt; built-in carried 17.8 s, silent ~15 s then
+    /// "Cold start one…"): chunk 0 `Positives`, chunk 1 empty, chunk 2 `Let's see if you can start recording this
+    /// recording.` (INVENTED over room noise), chunk 3 real. Confidences per FR5-C (chunk 2 p=0.82 lp=-1.3; chunk 3
+    /// p=0.02 lp=-0.25); chunk 0's (p=0.7 lp=-1.2) are assumed (not recorded). RED on 3c6aad8: the invented sentence is
+    /// kept. GREEN: only the real sentences.
+    @Test func inventedSentenceOverRoomNoiseIsDroppedByConfidence() async {
+        let result = await run([(noise(3.0), .init(text: "Positives", segments: [.init(start: 0, end: 2.9, text: "Positives", p: 0.7, lp: -1.2, cr: 0.8)])),
+                                (noise(3.5), .init(text: "", segments: [])),
+                                (room46(4.0), .init(text: "Let's see if you can start recording this recording.",
+                                    segments: [.init(start: 0, end: 3.8, text: "Let's see if you can start recording this recording.", p: 0.82, lp: -1.3, cr: 1.1)])),
+                                (tone(2.9), .init(text: "Cold start one. This should begin on the first tap.",
+                                    segments: [.init(start: 0.1, end: 1.2, text: "Cold start one.", p: 0.02, lp: -0.25, cr: 0.9),
+                                               .init(start: 1.2, end: 2.8, text: "This should begin on the first tap.", p: 0.02, lp: -0.25, cr: 1.0)]))])
+        print("FR5 LITERAL transcriber_0645 text=\"\(result.text)\" silent_chunks=\(result.droppedSilentChunks)")
+        #expect(result.text == "Cold start one. This should begin on the first tap.")
+    }
+
+    /// Control: a quiet but real sentence (p=0.3, a window ≥ −40 dBFS) is kept, even with a poor logprob.
+    @Test func quietRealSentenceWithLoudWindowIsKept() async {
+        let result = await run([(tone(2.2, amplitude: 600) + tone(0.4), .init(text: "Call Maria back.",
+                                    segments: [.init(start: 0, end: 2.6, text: "Call Maria back.", p: 0.3, lp: -1.4, cr: 0.9)]))])
+        print("FR5 CONTROL quiet_real text=\"\(result.text)\"")
+        #expect(result.text == "Call Maria back.")
     }
 
     // MARK: silent chunks

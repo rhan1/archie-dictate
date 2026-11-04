@@ -32,13 +32,27 @@ private actor FR2HTTP: HTTPTransport {
     enum Cleanup { case reject, clean(String), offline }
     let stt: @Sendable (Int, Int) -> String          // (request index, body bytes) → text
     let cleanup: Cleanup
+    /// v1.28 FR5: (request index, the request's 16 kHz samples) → the whole `verbose_json` payload, when set.
+    let verbose: (@Sendable (Int, [Int16]) -> [String: Any])?
     private var sttRequests = 0
-    init(stt: @escaping @Sendable (Int, Int) -> String, cleanup: Cleanup) { self.stt = stt; self.cleanup = cleanup }
+    init(stt: @escaping @Sendable (Int, Int) -> String, cleanup: Cleanup,
+         verbose: (@Sendable (Int, [Int16]) -> [String: Any])? = nil) {
+        self.stt = stt; self.cleanup = cleanup; self.verbose = verbose
+    }
+    static func samples(_ body: Data) -> [Int16] {
+        guard let riff = body.range(of: Data("RIFF".utf8))?.lowerBound else { return [] }
+        let size = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }
+        let start = riff + 44
+        return stride(from: start, to: min(body.count - 1, start + size), by: 2).map {
+            Int16(bitPattern: UInt16(body[$0]) | UInt16(body[$0 + 1]) << 8)
+        }
+    }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let url = request.url!
         let payload: [String: Any]
         if url.path.contains("transcriptions") {
-            payload = ["text": stt(sttRequests, request.httpBody?.count ?? 0)]
+            if let verbose { payload = verbose(sttRequests, Self.samples(request.httpBody ?? Data())) }
+            else { payload = ["text": stt(sttRequests, request.httpBody?.count ?? 0)] }
             sttRequests += 1
         } else if url.path.hasSuffix("/models") {
             payload = ["data": []]
@@ -106,7 +120,8 @@ struct V128SilenceTests {
 
     @MainActor private func dictate(samples: [Int16], scenario: WAVInjectedRecorder.Scenario, mediaSeconds: Double,
                                     stt: @escaping @Sendable (Int, Int) -> String, cleanup: FR2HTTP.Cleanup,
-                                    trace: Bool = false) async throws -> Run {
+                                    trace: Bool = false,
+                                    verbose: (@Sendable (Int, [Int16]) -> [String: Any])? = nil) async throws -> Run {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-v128-fr2-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -128,7 +143,7 @@ struct V128SilenceTests {
         let recorder = WAVInjectedRecorder(url: url, pace: 0.05, scenario: scenario)
         recorder.mediaLimit = mediaSeconds + 0.3
         recorder.note = { _ in }
-        let http = FR2HTTP(stt: stt, cleanup: cleanup)
+        let http = FR2HTTP(stt: stt, cleanup: cleanup, verbose: verbose)
         let dependencies = EngineDependencies(recorder: recorder, makeApple: { Apple() },
             sttTransport: http, groqCleanupTransport: http, localCleanupTransport: http, inserter: inserter,
             panelFactory: { Panel() }, requestMicrophoneAccess: { $0(true) },
@@ -230,5 +245,58 @@ struct V128SilenceTests {
         print("FR3-C LITERAL outcome=\(Self.field("outcome", r.end)) pasted=\"\(r.pasted ?? "")\" trace_cleaner_in=\(cleanerIn)")
         #expect(r.pasted == "Send the invoice to Limpar today. Yes.")
         #expect(cleanerIn.contains("cleaner_in=Send the invoice to Limpar today. Yes."))
+    }
+
+    // MARK: v1.28 FR5 — Whisper's own confidence
+
+    /// 14.5 s of built-in room noise (≈ −46 dBFS, as `roomNoise` without the headset's zero stretch), 3.0 s of speech
+    /// (220 Hz at 0.25 peak), 0.4 s room: Raza's re-test 1 (2026-11-05 06:45:43, 17.9 s, `carrier=builtin:0-17802`).
+    static func silentThenSpeech() -> [Int16] {
+        let room = (0..<Int(17.9 * 24_000)).map { i -> Int16 in
+            let rms = pow(10, (-46 + 3.6 * gauss(i / 1_200, salt: 3)) / 20)
+            return Int16(max(-32_767, min(32_767, (gauss(i, salt: 11) * rms * 32_768).rounded())))
+        }
+        let toneStart = Int(14.5 * 24_000), toneEnd = Int(17.5 * 24_000)
+        return room.enumerated().map { i, sample in
+            guard i >= toneStart && i < toneEnd else { return sample }
+            return Int16(0.25 * 32_767 * sin(Double(i - toneStart) * 2 * .pi * 220 / 24_000))
+        }
+    }
+
+    /// The stub plays Whisper as trace 97ee30ab.txt recorded it: the first noise-only request `Positives`, the second
+    /// empty, later noise-only requests the invented `Let's see if you can start recording this recording.`
+    /// (p=0.82 lp=-1.3, FR5-C); a request holding the speech returns the invented sentence over its noise lead (when
+    /// ≥ 0.5 s) and the real sentences over the speech (p=0.02 lp=-0.25). Segment times come from the request's audio.
+    static func whisper0645(_ index: Int, _ samples: [Int16]) -> [String: Any] {
+        let invented = "Let's see if you can start recording this recording."
+        let duration = Double(samples.count) / 16_000
+        func segment(_ start: Double, _ end: Double, _ text: String, _ p: Double, _ lp: Double) -> [String: Any] {
+            ["start": start, "end": end, "text": " " + text, "no_speech_prob": p, "avg_logprob": lp, "compression_ratio": 1.1]
+        }
+        var segments: [[String: Any]] = []
+        if let first = samples.firstIndex(where: { abs(Int($0)) > 4_000 }) {
+            let lead = Double(first) / 16_000
+            if lead >= 0.5 { segments.append(segment(0, lead, invented, 0.82, -1.3)) }
+            segments.append(segment(lead, lead + 1.1, "Cold start one.", 0.02, -0.25))
+            segments.append(segment(lead + 1.1, duration, "This should begin on the first tap.", 0.02, -0.25))
+        } else if index == 0 {
+            segments.append(segment(0, duration, "Positives", 0.7, -1.2))
+        } else if index > 1 {
+            segments.append(segment(0, duration, invented, 0.82, -1.3))
+        }
+        let text = segments.compactMap { ($0["text"] as? String)?.trimmingCharacters(in: .whitespaces) }.joined(separator: " ")
+        return ["text": text, "segments": segments]
+    }
+
+    /// RED on 3c6aad8: the invented sentence is pasted with the real one. GREEN: only "Cold start one. This should
+    /// begin on the first tap." The cleaner is offline (strong audio → the transcript is pasted as recognised), so the
+    /// paste shows exactly what recognition kept.
+    @MainActor @Test func inventedSentenceOverRoomNoiseIsNeverPasted() async throws {
+        let r = try await dictate(samples: Self.silentThenSpeech(), scenario: .plain, mediaSeconds: 17.9,
+                                  stt: { _, _ in "" }, cleanup: .offline, trace: true, verbose: Self.whisper0645)
+        let segmentLines = r.trace.split(separator: "\n").filter { $0.contains("segments=") }.count
+        print("FR5 LITERAL controller_0645 \(Self.literal(r)) stt_dropped_segment_conf=\(Self.field("stt_dropped_segment_conf", r.timeline)) trace_segment_lines=\(segmentLines)")
+        print("FR5 TRACE \(r.trace.split(separator: "\n").filter { $0.hasPrefix("chunk=") }.joined(separator: " | "))")
+        #expect(r.pasted == "Cold start one. This should begin on the first tap.")
     }
 }
