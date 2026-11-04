@@ -607,7 +607,7 @@ struct GroqChunkedTests {
         let request = await transport.request(tag: 1000)
         let body = try #require(request.httpBody)
         let text = String(decoding: body, as: UTF8.self)
-        for part in ["name=\"model\"\r\n\r\nwhisper-large-v3-turbo", "name=\"response_format\"\r\n\r\njson",
+        for part in ["name=\"model\"\r\n\r\nwhisper-large-v3-turbo", "name=\"response_format\"\r\n\r\nverbose_json",   // v1.28 FR5-A (was json)
                      "name=\"language\"\r\n\r\nen", "name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. \r\n",
                      "name=\"file\"; filename=\"audio.wav\"", "Content-Type: audio/wav"] {
             #expect(text.contains(part))
