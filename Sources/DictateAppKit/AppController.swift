@@ -813,6 +813,7 @@ public final class AppController {
                    onChunkTrace: trace.map { trace in { index, final, prompt, raw in
                        trace.chunk(index: index, final: final, prompt: prompt, raw: raw)
                    } },
+                   onChunkSegments: trace.map { trace in { index, description in trace.segments(index: index, description) } },
                    onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
                 chunked = streaming
                 recorder.onPCMChunk = { [pcmTap] pcm in
@@ -1322,6 +1323,7 @@ public final class AppController {
                            "stt_dropped_low_speech_pos=\(Self.droppedPosition(chunked))",
                            "stt_dropped_artifact=\(chunked.droppedArtifacts)",
                            "stt_dropped_silent_chunk=\(chunked.droppedSilentChunks)",
+                           "stt_dropped_segment_conf=\(chunked.droppedSegmentConf)",
                            "rpm_remaining=\(chunked.rateLimits?.rpmRemaining ?? "-")",
                            "rpd_remaining=\(chunked.rateLimits?.rpdRemaining ?? "-")"]
                 for call in chunked.calls {

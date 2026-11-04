@@ -108,6 +108,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public var droppedLoops: Int = 0
         public var scribeChunks: Int = 0
         public var scribeNoKey: Bool = false
+        /// v1.28 FR5-A: Whisper segments dropped on their own confidence (`stt_dropped_segment_conf`).
+        public var droppedSegmentConf: Int = 0
 
         public init(text: String, chunks: Int, rejoins: Int, failedCount: Int, lastChunkMs: Int, sttMs: Int,
                     calls: [Call], hedges: Int, hedgeWins: Int, rateLimits: RateLimits?,
@@ -172,6 +174,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let onChunkText: (@Sendable (Int, String) -> Void)?
     /// v1.27 (B3): (index, isFinal, prompt `full|none|skipped`, Whisper's raw text) — only with the opt-in trace.
     private let onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)?
+    /// v1.28 FR5-A: (index, `SegmentConfidence.describe` of Whisper's segments, or `none`) — only with the opt-in trace.
+    private let onChunkSegments: (@Sendable (Int, String) -> Void)?
+    private var droppedSegmentConf = 0
     private var chunker: PauseChunker
     private var tasks: [Task<Void, Never>] = []
     private var texts: [Int: String] = [:]
@@ -191,6 +196,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                             edgeGuard: Bool = true,
                             onChunkText: (@Sendable (Int, String) -> Void)? = nil,
                             onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
+                            onChunkSegments: (@Sendable (Int, String) -> Void)? = nil,
                             onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
                             clock: any DictateClock = SystemClock()) {
         self.init(transport: transport, apiKey: apiKey, prompt: prompt, fillerLeadIn: fillerLeadIn, leadIn: leadIn,
@@ -198,7 +204,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                   hedgeAfterMs: hedgeAfterMs, finalSplitSeconds: finalSplitSeconds, finalModel: finalModel,
                   rejoinGuard: rejoinGuard, lowSpeechGuard: lowSpeechGuard, edgeGuard: edgeGuard,
                   scribeAPIKey: scribeAPIKey, onChunkText: onChunkText, onChunkTrace: onChunkTrace,
-                  onGroqRateLimit: onGroqRateLimit, clock: clock)
+                  onChunkSegments: onChunkSegments, onGroqRateLimit: onGroqRateLimit, clock: clock)
     }
 
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
@@ -209,6 +215,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 scribeAPIKey: (@Sendable () throws -> String)? = nil,
                 onChunkText: (@Sendable (Int, String) -> Void)? = nil,
                 onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
+                onChunkSegments: (@Sendable (Int, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
                 clock: any DictateClock = SystemClock()) {
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
@@ -229,6 +236,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         self.onGroqRateLimit = onGroqRateLimit
         self.onChunkText = onChunkText
         self.onChunkTrace = onChunkTrace
+        self.onChunkSegments = onChunkSegments
         chunker = PauseChunker(firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds)
     }
 
@@ -436,31 +444,36 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 }
                 var requestClient = client
                 requestClient.modelName = model
-                // v1.28 FR4-A: any chunk after the first may open the dictation after a silent lead-in (known only once
-                // the chunks before it are judged), so it asks for segment timestamps; chunk 0 never follows a lead-in.
+                // v1.28 FR4-A/FR5-A: every chunk asks for segments (timestamps for the opening after a silent lead-in;
+                // Whisper's own confidence for every chunk).
                 let request = requestClient.makeRequest(wav: wav, prompt: prompt, apiKey: key,
                                                  boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true,
-                                                 responseFormat: chunk.index >= 1 ? "verbose_json" : "json")
+                                                 responseFormat: "verbose_json")
                 outcome = await requestAttempt(request, hedged: attempt == 1)
             } catch {
                 outcome = AttemptResult(text: nil, status: nil, hedgeFired: false, winningRequest: nil)
             }
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
-            let accepted: Bool = lock.withLock {
-                guard !cancelled else { return false }
+            let accepted: (ok: Bool, segments: String) = lock.withLock {
+                guard !cancelled else { return (false, "") }
                 calls.append(Call(index: chunk.index, attempt: attempt, model: model, isFinal: isFinal, isRejoin: false, milliseconds: Self.ms(from: start),
                                   status: outcome.status, hedgeFired: outcome.hedgeFired,
                                   winningRequest: outcome.winningRequest, prompt: emptyPrompt ? "none" : "full"))
-                guard let text = outcome.text else { return false }
+                guard let text = outcome.text else { return (false, "") }
+                // v1.28 FR5-A: segments Whisper itself marks as no speech / a loop go before any other guard.
+                let windows = windowsByIndex[chunk.index] ?? []
+                let confident = SegmentConfidence.filter(text: text, segments: outcome.segments, windows: windows)
+                droppedSegmentConf += confident.dropped
                 // M2: a Whisper repetition loop is collapsed or dropped before it is streamed or joined.
-                let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
+                let guarded = RepetitionGuard.guardChunk(confident.text, audioSeconds: Self.seconds(chunk.samples.count))
                 texts[chunk.index] = guarded.text
-                segmentsByIndex[chunk.index] = outcome.segments
+                segmentsByIndex[chunk.index] = confident.segments
                 loopEvents += guarded.loops
-                return true
+                return (true, onChunkSegments == nil ? "" : SegmentConfidence.describe(outcome.segments, windows: windows))
             }
-            if accepted, let text = outcome.text {
+            if accepted.ok, let text = outcome.text {
                 onChunkTrace?(chunk.index, isFinal, emptyPrompt ? "none" : "full", text)
+                onChunkSegments?(chunk.index, accepted.segments)
                 emitChunk(chunk, fallbackText: text)
                 return
             }
@@ -514,6 +527,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             }
             if accepted, let text = response.text {
                 onChunkTrace?(chunk.index, isFinal, "none", text)    // Scribe takes no prompt
+                onChunkSegments?(chunk.index, "none")                // FR5-B: Scribe sends no confidences
                 emitChunk(chunk, fallbackText: text)
                 return
             }
@@ -563,6 +577,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedOpeningSentences: openingDrops.filter { $0 == .lowSpeech }.count,
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
                           droppedSilentChunks: droppedSilent).withLoops(loopEvents).withScribe(chunks: scribeChunks, noKey: scribeNoKey)
+                .withSegmentConf(droppedSegmentConf)
         }
     }
 
@@ -700,7 +715,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 let tail = snapshot.1[index - 2].map { String($0.suffix(200)) } ?? ""
                 let prompt = (leadIn.isEmpty ? "" : leadIn + " ") + vocabulary + (tail.isEmpty ? "" : " " + tail)
                 let request = client.makeRequest(wav: wav, prompt: prompt, apiKey: key,
-                    boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true)
+                    boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true, responseFormat: "verbose_json")
                 response = await send(request) // Exactly one request, no hedge or retry.
             } catch { response = Response(text: nil, http: nil) }
             guard !Task.isCancelled else { return }
@@ -711,7 +726,12 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                                   hedgeFired: false, winningRequest: response.text == nil ? nil : 1))
                 if let http = response.http { limits = RateLimits(response: http) }
                 lastResponse = DispatchTime.now().uptimeNanoseconds
-                guard let text = response.text, !text.isEmpty else { return nil }
+                guard let raw = response.text, !raw.isEmpty else { return nil }
+                // v1.28 FR5-A: the joined pair's segments are judged on both chunks' windows.
+                let confident = SegmentConfidence.filter(text: raw, segments: response.segments,
+                    windows: (windowsByIndex[index - 1] ?? []) + (windowsByIndex[index] ?? []))
+                droppedSegmentConf += confident.dropped
+                let text = confident.text
                 let guardedJoin = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(previous.samples.count + current.samples.count))
                 loopEvents += guardedJoin.loops
                 texts[index - 1] = guardedJoin.text
@@ -753,6 +773,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 extension GroqChunkedTranscriber.Result {
     /// M2: the same result with the loop count set (keeps the long memberwise init unchanged).
     func withLoops(_ loops: Int) -> Self { var copy = self; copy.droppedLoops = loops; return copy }
+    func withSegmentConf(_ dropped: Int) -> Self { var copy = self; copy.droppedSegmentConf = dropped; return copy }
     func withScribe(chunks: Int, noKey: Bool) -> Self {
         var copy = self
         copy.scribeChunks = chunks
