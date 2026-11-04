@@ -265,6 +265,8 @@ struct EdgeSentenceGuardTests {
                                                .init(start: 1.2, end: 2.8, text: "This should begin on the first tap.", p: 0.02, lp: -0.25, cr: 1.0)]))])
         print("FR5 LITERAL transcriber_0645 text=\"\(result.text)\" silent_chunks=\(result.droppedSilentChunks)")
         #expect(result.text == "Cold start one. This should begin on the first tap.")
+        print("FR5 LITERAL transcriber_0645 stt_dropped_segment_conf=\(result.droppedSegmentConf)")      // FR5-A field
+        #expect(result.droppedSegmentConf == 2)
     }
 
     /// Control: a quiet but real sentence (p=0.3, a window ≥ −40 dBFS) is kept, even with a poor logprob.

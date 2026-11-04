@@ -298,5 +298,7 @@ struct V128SilenceTests {
         print("FR5 LITERAL controller_0645 \(Self.literal(r)) stt_dropped_segment_conf=\(Self.field("stt_dropped_segment_conf", r.timeline)) trace_segment_lines=\(segmentLines)")
         print("FR5 TRACE \(r.trace.split(separator: "\n").filter { $0.hasPrefix("chunk=") }.joined(separator: " | "))")
         #expect(r.pasted == "Cold start one. This should begin on the first tap.")
+        #expect(Self.field("stt_dropped_segment_conf", r.timeline) == "2")        // Positives + the invented chunk 2
+        #expect(segmentLines == 4)
     }
 }

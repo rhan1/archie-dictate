@@ -35,7 +35,19 @@ public enum EdgeSentenceGuard {
         public let start: Double
         public let end: Double
         public let text: String
-        public init(start: Double, end: Double, text: String) { self.start = start; self.end = end; self.text = text }
+        /// v1.28 FR5-A: Whisper's own confidences; nil when the recognizer did not send them.
+        public var noSpeechProb: Double?
+        public var avgLogprob: Double?
+        public var compressionRatio: Double?
+        enum CodingKeys: String, CodingKey {
+            case start, end, text
+            case noSpeechProb = "no_speech_prob", avgLogprob = "avg_logprob", compressionRatio = "compression_ratio"
+        }
+        public init(start: Double, end: Double, text: String,
+                    noSpeechProb: Double? = nil, avgLogprob: Double? = nil, compressionRatio: Double? = nil) {
+            self.start = start; self.end = end; self.text = text
+            self.noSpeechProb = noSpeechProb; self.avgLogprob = avgLogprob; self.compressionRatio = compressionRatio
+        }
     }
 
     /// True when no window of `windows` may be speech by the dictation's floor.

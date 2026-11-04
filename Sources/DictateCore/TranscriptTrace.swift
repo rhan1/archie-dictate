@@ -6,7 +6,7 @@ import Foundation
 /// `defaults write com.razakhan.dictate DictateTranscriptTrace -bool true` turns it on; it is read at each
 /// session start. When off, no `TranscriptTrace` exists, so nothing is created, formatted or written.
 /// When on: `~/Library/Logs/Dictate/trace/<session-id>.txt` (directory 0700, file 0600), one line per event:
-/// `chunk=<i> final=<0|1> prompt=<full|none> raw=<text>`, `cleaned=<text>`, and `pasted=<text>` only when the
+/// `chunk=<i> final=<0|1> prompt=<full|none> raw=<text>`, `chunk=<i> segments=[…]|none` (v1.28 FR5), `cleaned=<text>`, and `pasted=<text>` only when the
 /// paste/type (or a capture-only host's delivery) succeeded. The file is closed when the session ends.
 /// Nothing here is uploaded or sent anywhere.
 public final class TranscriptTrace: @unchecked Sendable {
@@ -56,6 +56,8 @@ public final class TranscriptTrace: @unchecked Sendable {
     public func chunk(index: Int, final: Bool, prompt: String, raw: String) {
         write("chunk=\(index) final=\(final ? 1 : 0) prompt=\(prompt) raw=\(raw)")
     }
+    /// v1.28 FR5-A: Whisper's segments for chunk `index` with their confidences (`SegmentConfidence.describe`), or `none`.
+    public func segments(index: Int, _ description: String) { write("chunk=\(index) segments=\(description)") }
     /// v1.28 FR3-C: what each cleaner call was given (input vs `cleaned=` output).
     public func cleanerIn(_ text: String) { write("cleaner_in=\(text)") }
     public func cleaned(_ text: String) { write("cleaned=\(text)") }
