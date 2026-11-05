@@ -10,6 +10,8 @@ struct CaptureRouteProbe {
     var eligibility: () -> (CaptureBridge.DefaultInput, Bool)?
     var defaultInput: () -> AudioDeviceID?
     var uid: (AudioDeviceID) -> String?
+    /// Resolves an engine's current device to its unambiguous capture input (nil: unreadable or ambiguous).
+    var captureDevice: (AudioDeviceID) -> AudioDeviceID? = { $0 }
     var defaultInputName: () -> String?
     /// The headset restart's idle check (`kAudioDevicePropertyDeviceIsRunningSomewhere`).
     var isRunningSomewhere: (AudioDeviceID) -> Bool? = { _ in nil }
@@ -31,6 +33,7 @@ struct CaptureRouteProbe {
         eligibility: { try? AudioDevices.bridgeEligibility() },
         defaultInput: { AudioDevices.defaultInputDevice() },
         uid: { AudioDevices.uid(of: $0) },
+        captureDevice: { AudioDevices.captureDevice(of: $0) },
         defaultInputName: { AVCaptureDevice.default(for: .audio)?.localizedName },
         isRunningSomewhere: { AudioDevices.isRunningSomewhere($0) },
         hfpAlready: { BluetoothProfile.sample() == "hfp" },

@@ -83,6 +83,34 @@ enum AudioDevices {
         try check(AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size))
         return device
     }
+    /// The input device an AUHAL current-device read actually captures from. macOS may bind an
+    /// AVAudioEngine to its private default aggregate; only a single active input sub-device is
+    /// unambiguous. All unreadable or multi-input aggregates deliberately remain unknown.
+    static func captureDevice(of device: AudioDeviceID) -> AudioDeviceID? {
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport) == noErr else { return nil }
+        guard transport == kAudioDeviceTransportTypeAggregate else { return device }
+
+        address.mSelector = kAudioAggregateDevicePropertyActiveSubDeviceList
+        size = 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr,
+              size > 0, size % UInt32(MemoryLayout<AudioObjectID>.size) == 0 else { return nil }
+        var subdevices = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard subdevices.withUnsafeMutableBytes({ bytes in
+            AudioObjectGetPropertyData(device, &address, 0, nil, &size, bytes.baseAddress!)
+        }) == noErr else { return nil }
+        let inputSubdevices = subdevices.filter { subdevice in
+            var streams = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+            var streamSize: UInt32 = 0
+            return AudioObjectGetPropertyDataSize(subdevice, &streams, 0, nil, &streamSize) == noErr && streamSize > 0
+        }
+        guard inputSubdevices.count == 1 else { return nil }
+        return inputSubdevices[0]
+    }
     static func setCurrentDevice(_ device: AudioDeviceID, on unit: AudioUnit) throws {
         var device = device
         try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,

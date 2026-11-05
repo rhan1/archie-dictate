@@ -99,6 +99,7 @@ struct V129InPlaceRouteApplyTests {
         private var _defaultDevice: AudioDeviceID? = 77
         private var _uids: [AudioDeviceID: String] = [77: V129InPlaceRouteApplyTests.sonyUID, 78: "AA-BB-CC-DD-EE-FF:input", 81: "BuiltInMicrophoneDevice"]
         private var _uidReadable = true
+        private var _captureDevice: (AudioDeviceID) -> AudioDeviceID? = { $0 }
         private var _input: CaptureBridge.DefaultInput = .bluetooth
         private var _fingerprint = "headset:77:16000:1:1"
         private var _engines: [FakeEngine] = []
@@ -129,6 +130,9 @@ struct V129InPlaceRouteApplyTests {
             set { lock.withLock { _uidReadable = newValue } }
         }
         func setUID(_ uid: String, for device: AudioDeviceID) { lock.withLock { _uids[device] = uid } }
+        func setCaptureDevice(_ resolve: @escaping (AudioDeviceID) -> AudioDeviceID?) {
+            lock.withLock { _captureDevice = resolve }
+        }
         var engine: FakeEngine { lock.withLock { _engines.last! } }
         var engines: [FakeEngine] { lock.withLock { _engines } }
 
@@ -146,6 +150,7 @@ struct V129InPlaceRouteApplyTests {
                 eligibility: { (self.input, false) },          // no built-in bridge: the headset carries directly
                 defaultInput: { self.defaultDevice },
                 uid: { device in self.lock.withLock { self._uidReadable ? self._uids[device] : nil } },
+                captureDevice: { device in self.lock.withLock { self._captureDevice(device) } },
                 defaultInputName: { "fake-default" },
                 outputIsBluetooth: { self.input == .bluetooth })
             probe.effectiveRoute = { self.fingerprint }
@@ -319,6 +324,55 @@ struct V129InPlaceRouteApplyTests {
         #expect(current > 0)
         _ = s.recorder.stop()
         print("F1 GREEN T-2 same_engine=\(sameEngine ? 1 : 0) rebuilds=\(s.rig.rebuilds) installs=2 removes=1 lease_same=1 settled_once=1 stale_pcm=\(stale) current_pcm=\(current) note=\(note)")
+    }
+
+    /// RED on 1.29: AVAudioEngine reads back macOS's private default aggregate (142), while the sampled
+    /// default input is the headset input (90). The second admitted generation should stay in place.
+    @Test func aggregateEngineReadBackForTheDefaultInputRestartsInPlace() throws {
+        let rig = Rig()
+        rig.defaultDevice = 90
+        rig.setUID(Self.sonyUID, for: 90)
+        rig.engine.device = 142
+        rig.nextEngineDevice = .some(142)
+        rig.setCaptureDevice { $0 == 142 ? 90 : $0 }
+        let s = try Self.start(rig)
+
+        _ = try Self.apply(s)
+        _ = try Self.apply(s)
+
+        let note = s.recorder.conversationApplyNote
+        print("V129.1 GREEN aggregate_input=90 second=\(Self.outcome(note)) note=\(note)")
+        #expect(Self.outcome(note) == "I")
+    }
+
+    @Test func aggregateResolutionRejectsAmbiguousDisagreeingAndUnreadableInputs() throws {
+        func aggregateOutcome(_ resolution: AudioDeviceID?) throws -> String {
+            let rig = Rig()
+            rig.defaultDevice = 90
+            rig.setUID(Self.sonyUID, for: 90)
+            rig.engine.device = 142
+            rig.setCaptureDevice { $0 == 142 ? resolution : $0 }
+            let s = try Self.start(rig)
+            _ = try Self.apply(s)
+            return s.recorder.conversationApplyNote
+        }
+
+        let twoInputs = try aggregateOutcome(nil)
+        let differentInput = try aggregateOutcome(78)
+        let unreadable = try aggregateOutcome(nil)
+        #expect(twoInputs.contains("conv_apply=rebuild reason=no_bound bound=nil"))
+        #expect(differentInput.contains("conv_apply=rebuild reason=no_bound bound=nil"))
+        #expect(unreadable.contains("conv_apply=rebuild reason=no_bound bound=nil"))
+
+        let direct = Rig()
+        direct.defaultDevice = 90
+        direct.setUID(Self.sonyUID, for: 90)
+        direct.engine.device = 90
+        let directSession = try Self.start(direct)
+        _ = try Self.apply(directSession)
+        let directNote = directSession.recorder.conversationApplyNote
+        #expect(Self.outcome(directNote) == "I")
+        print("V129.1 CONTROL aggregate_two_inputs=R aggregate_other_input=R aggregate_unreadable=R direct_input=I")
     }
 
     @Test func runningEngineAndAWatchOnlyRateChangeAlsoApplyInPlace() throws {
