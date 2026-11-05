@@ -684,7 +684,7 @@ public final class AudioRecorder: CaptureEngine {
         }
         let native = engineNative
         plan.observed = sampledDefaultInput()
-        plan.engineDevice = native.boundDevice()
+        plan.engineDevice = native.boundDevice().flatMap(route.captureDevice)
         plan.engineRunning = native.isRunning()
         plan.decision = ConversationRouteReplacement.decide(bluetooth: bluetooth, bound: bound, observed: plan.observed,
             engineDevice: plan.engineDevice, consecutive: consecutive)
@@ -710,7 +710,8 @@ public final class AudioRecorder: CaptureEngine {
     private func conversationActivationBinding(bluetooth: Bool) -> ConversationRouteReplacement.Bound? {
         guard kind == .conversation, selectedDevice == .default, bluetooth,
               !headsetUnitArm(device: selectedDevice, bluetooth: bluetooth) else { return nil }
-        return ConversationRouteReplacement.binding(observed: sampledDefaultInput(), engineDevice: engineNative.boundDevice())
+        return ConversationRouteReplacement.binding(observed: sampledDefaultInput(),
+                                                    engineDevice: engineNative.boundDevice().flatMap(route.captureDevice))
     }
 
     /// 1.29: the in-place half of `teardownEngine()`: the same capture flags and converter reset, the tap removed (its

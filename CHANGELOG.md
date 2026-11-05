@@ -76,3 +76,6 @@ Raza (2026-11-05 23:5x): "pressing the two command keys isn't doing anything; it
 - Anything else is handled exactly as before: a different headset, the MacBook microphone, a device Dictate can't read, or a restart that fails all rebuild the microphone the old way, and after three in-place restarts in a row the next one rebuilds too. The very first second of a conversation that starts on music-mode audio can still be discarded, as on earlier versions.
 - Dictation is unchanged.
 - Each conversation restart now writes one `conv_apply=in_place|rebuild reason=…` line to the log.
+
+## v1.29.1 — 2026-11-06
+- The 1.29 in-place restart now recognises a Bluetooth headset when macOS routes it through its combined default device (it never took effect on real hardware in 1.29).
