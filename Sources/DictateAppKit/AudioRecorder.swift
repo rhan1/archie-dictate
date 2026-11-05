@@ -32,6 +32,16 @@ public final class AudioRecorder: CaptureEngine {
     private var routeGeneration: UInt64 = 0
     private var appliedRouteGeneration: UInt64 = 0
     private var routeApplying = false
+    /// 1.29: the input the current conversation engine was activated on (ID + full UID, recorded only when the
+    /// engine's own read-back agreed), and how many consecutive applies restarted that engine in place.
+    /// Cleared by `stop()`, by every engine disposal (`teardownEngine`) and by any non-eligible activation.
+    private var boundInput: ConversationRouteReplacement.Bound?
+    private var inPlaceApplies = 0
+    /// 1.29 (diagnostics/tests): the last engine-arm apply's `conv_apply=` line ("none": no apply yet).
+    private var lastConversationApply = "none"
+    var conversationApplyNote: String { lock.withLock { lastConversationApply } }
+    /// 1.29 test seam: nil in production (this recorder's AVAudioEngine).
+    var offlineConversationEngine: OfflineConversationEngine?
     private var failureReported = false
     private var streamOverrun = false
     private var keptFrameCount = 0
@@ -524,14 +534,33 @@ public final class AudioRecorder: CaptureEngine {
                 throw RecorderError.routeTeardownPending
             }
         }
-        teardownEngine()
+        // 1.29: the engine arm decides before any engine operation (one sample, on the executor, outside the lock).
+        // A same-device Bluetooth apply keeps the engine and only removes its tap; anything else tears down as before.
+        var plan: ConversationApplyPlan?
+        if make == nil {
+            let bluetooth = route.eligibility()?.0 == .bluetooth
+            plan = headsetUnitArm(device: selectedDevice, bluetooth: bluetooth)
+                ? ConversationApplyPlan(unitArm: true, bluetooth: bluetooth, generation: generation)
+                : conversationApplyPlan(bluetooth: bluetooth, generation: generation)
+        }
+        if plan?.inPlace == true {
+            do { try removeTapForInPlace() } catch {
+                // Never retap a node whose tap removal failed: today's full rebuild, in this same apply.
+                plan?.fallBack(reason: "remove_failed", error: error)
+                teardownEngine()
+            }
+        } else {
+            teardownEngine()
+        }
+        let keepsVoiceProcessing = plan?.inPlace == true
         let freshEpoch = CaptureEpoch()
         try lock.withLock {
             guard engineEpoch === oldEpoch, lease?.isActive == true else { throw CancellationError() }
             engineEpoch = freshEpoch
             leaseEpoch = freshEpoch // same physical broker token; only callback epoch changes
             bridgeConfigured = false
-            stats.voiceProcessing = "off"
+            // 1.29: an in-place restart keeps the engine, so its voice-processing verdict is still the truth.
+            if !keepsVoiceProcessing { stats.voiceProcessing = "off" }
             stats.firstBufferMs = nil
             pendingPCM.removeAll(keepingCapacity: true)
             delivery.discardPending()
@@ -551,8 +580,8 @@ public final class AudioRecorder: CaptureEngine {
                 }
             }
             try startCaptureInput(now: { now }, make: make)
-        } else {
-            let unitArm = headsetUnitArm(device: selectedDevice, bluetooth: route.eligibility()?.0 == .bluetooth)
+        } else if var applying = plan {
+            let unitArm = applying.unitArm
             configureBridge(device: selectedDevice, epoch: freshEpoch)
             lock.withLock {
                 if engineEpoch === freshEpoch {
@@ -560,18 +589,30 @@ public final class AudioRecorder: CaptureEngine {
                 }
             }
             stats.device = selectedDevice == .builtIn ? "built-in" : unitArm ? (route.defaultInputName() ?? "unknown")
-                : (AVCaptureDevice.default(for: .audio)?.localizedName ?? "unknown")
+                : (engineNative.deviceName() ?? "unknown")
             guard lock.withLock({ lease?.started(.headset) == true && engineEpoch === freshEpoch }) else { throw CancellationError() }
             if unitArm {
                 try startCaptureInput { _ in CaptureInputUnit(start: { try self.startHeadsetUnit(epoch: freshEpoch) }, dispose: {}) }
+            } else if applying.inPlace {
+                // 1.29: the same engine, its configuration observer kept; a throwing retap/start rebuilds as before.
+                do {
+                    try installConvertingTapAndStart()
+                    noteConversationApply(applying.note)
+                } catch {
+                    applying.fallBack(reason: "in_place_failed", error: error)
+                    teardownEngine()                      // removes the partial tap and drops the engine
+                    lock.withLock { if engineEpoch === freshEpoch { stats.voiceProcessing = "off" } }   // re-evaluated below
+                    noteConversationApply(applying.note)
+                    try rebuildEngineAndStart()
+                }
             } else {
-                try rebuild()
-                if selectedDevice == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) } }
-                registerConfigurationObserver()
-                try installTapAndStart()
-                if selectedDevice == .builtIn { checkBuiltinPin() }
+                noteConversationApply(applying.note)
+                try rebuildEngineAndStart()
             }
+            plan = applying
         }
+        // 1.29: an eligible activation records the identity this engine may restart in place on (else nil).
+        let binding = plan.flatMap { $0.unitArm ? nil : conversationActivationBinding(bluetooth: $0.bluetooth) }
         let settledRoute = route.effectiveRoute()
         let (handler, vp): (((ConversationCaptureState) -> Void)?, String) = try lock.withLock {
             guard engineEpoch === freshEpoch, lease?.isActive == true else { throw CancellationError() }
@@ -579,12 +620,148 @@ public final class AudioRecorder: CaptureEngine {
             observedRoute = settledRoute
             appliedRouteGeneration = generation
             routeGeneration = generation
+            if let plan {
+                boundInput = binding
+                inPlaceApplies = plan.inPlace ? inPlaceApplies + 1 : 0
+            }
             return (conversationStateHandler, stats.voiceProcessing)
         }
         recording = true
-        if make == nil { startHealthClock(epoch: freshEpoch) }
+        if make == nil, offlineConversationEngine == nil { startHealthClock(epoch: freshEpoch) }
         handler?(.routeSettled(generation: generation, voiceProcessing: vp))
         return true
+    }
+
+    /// 1.29: one engine-arm apply's decision and its inputs (for its one `conv_apply=` line).
+    private struct ConversationApplyPlan {
+        let unitArm: Bool
+        let bluetooth: Bool
+        let generation: UInt64
+        var decision: ConversationRouteReplacement.Decision = .rebuild(reason: "unit_arm")
+        var bound: ConversationRouteReplacement.Bound?
+        var observed: ConversationRouteReplacement.Bound?
+        var engineDevice: AudioDeviceID?
+        var engineRunning: Bool?
+        var consecutive = 0
+        var error: String?
+
+        init(unitArm: Bool, bluetooth: Bool, generation: UInt64) {
+            self.unitArm = unitArm
+            self.bluetooth = bluetooth
+            self.generation = generation
+        }
+
+        var inPlace: Bool { decision == .inPlace }
+        /// The in-place attempt failed: today's rebuild takes over in the same apply.
+        mutating func fallBack(reason: String, error: Error) {
+            let e = error as NSError
+            decision = .rebuild(reason: reason)
+            self.error = "\(e.domain):\(e.code)"
+        }
+        var note: String {
+            let reason: String
+            switch decision {
+            case .inPlace: reason = "same_device"
+            case .rebuild(let why): reason = why
+            }
+            return ConversationRouteReplacement.note(inPlace: inPlace, reason: reason, bound: bound, observed: observed,
+                engineDevice: engineDevice, engineRunning: engineRunning, consecutive: inPlace ? consecutive + 1 : 0,
+                generation: generation) + (error.map { " err=\($0)" } ?? "")
+        }
+    }
+
+    /// 1.29: the engine arm's decision for this apply. Reads run outside the lock, in guard order, so a non-Bluetooth
+    /// or explicit-device conversation adds no device or engine read to today's path.
+    private func conversationApplyPlan(bluetooth: Bool, generation: UInt64) -> ConversationApplyPlan {
+        var plan = ConversationApplyPlan(unitArm: false, bluetooth: bluetooth, generation: generation)
+        let (bound, consecutive) = lock.withLock { (boundInput, inPlaceApplies) }
+        plan.bound = bound
+        plan.consecutive = consecutive
+        guard selectedDevice == .default else { plan.decision = .rebuild(reason: "explicit_device"); return plan }
+        guard bluetooth, bound != nil else {
+            plan.decision = .rebuild(reason: bluetooth ? "no_bound" : "not_bluetooth")
+            return plan
+        }
+        let native = engineNative
+        plan.observed = sampledDefaultInput()
+        plan.engineDevice = native.boundDevice()
+        plan.engineRunning = native.isRunning()
+        plan.decision = ConversationRouteReplacement.decide(bluetooth: bluetooth, bound: bound, observed: plan.observed,
+            engineDevice: plan.engineDevice, consecutive: consecutive)
+        return plan
+    }
+
+    /// 1.29: the apply's one `conv_apply=` line (also kept as `conversationApplyNote` for diagnostics/tests).
+    private func noteConversationApply(_ line: String) {
+        lock.withLock { lastConversationApply = line }
+        AppController.note(line)
+    }
+
+    /// 1.29: the default input and its full UID, read once (nil: either read failed).
+    private func sampledDefaultInput() -> ConversationRouteReplacement.Bound? {
+        guard let device = route.defaultInput(), let uid = route.uid(device) else { return nil }
+        return ConversationRouteReplacement.Bound(device: device, uid: uid)
+    }
+
+    /// 1.29: after an engine-arm conversation activation (start, or an applied generation), outside the lock: the
+    /// identity this engine may later restart in place on — recorded only when the engine's own read-back agrees with
+    /// the sampled default. Nil for a non-eligible activation (not a conversation, AUHAL arm, explicit device, not
+    /// Bluetooth) and for any unreadable or disagreeing read.
+    private func conversationActivationBinding(bluetooth: Bool) -> ConversationRouteReplacement.Bound? {
+        guard kind == .conversation, selectedDevice == .default, bluetooth,
+              !headsetUnitArm(device: selectedDevice, bluetooth: bluetooth) else { return nil }
+        return ConversationRouteReplacement.binding(observed: sampledDefaultInput(), engineDevice: engineNative.boundDevice())
+    }
+
+    /// 1.29: the in-place half of `teardownEngine()`: the same capture flags and converter reset, the tap removed (its
+    /// token rotated), but no engine stop, reset or disposal — the headset's voice link stays up. Throws when the
+    /// native removal failed (the caller rebuilds instead of retapping that node).
+    private func removeTapForInPlace() throws {
+        recording = false
+        lock.withLock { captureRunning = false; converter = nil; tapEpoch = CaptureEpoch() }
+        try removeTap()
+    }
+
+    /// Today's engine-arm replacement: a fresh engine, its observer, and the voice-processing policy's start.
+    private func rebuildEngineAndStart() throws {
+        if let offline = offlineConversationEngine {
+            try offline.rebuild()
+            try installTapAndStart(make: offline.make)
+            return
+        }
+        try rebuild()
+        if selectedDevice == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) } }
+        registerConfigurationObserver()
+        try installTapAndStart()
+        if selectedDevice == .builtIn { checkBuiltinPin() }
+    }
+
+    /// 1.29: the engine arm's native input node — the offline seam's fake, else this recorder's AVAudioEngine, with
+    /// exactly the calls the recorder made before.
+    private var engineNative: EngineInputNative {
+        if let offline = offlineConversationEngine { return offline.native() }
+        return EngineInputNative(
+            formats: {
+                let input = try self.requireEngine().inputNode
+                return (input.inputFormat(forBus: 0), input.outputFormat(forBus: 0))
+            },
+            installTap: { block in try self.requireEngine().inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil, block: block) },
+            removeTap: { try self.requireEngine().inputNode.removeTap(onBus: 0) },
+            prepare: { try self.requireEngine().prepare() },
+            start: { try self.requireEngine().start() },
+            boundDevice: {
+                // The read `checkBuiltinPin` makes; a nil unit or a failed read is unknown, never a force-unwrap.
+                guard let engine = self.engine else { return nil }
+                return (try? captureObjC { () throws -> AudioDeviceID? in
+                    guard let unit = engine.inputNode.audioUnit else { return nil }
+                    return try AudioDevices.currentDevice(of: unit)
+                }) ?? nil
+            },
+            isRunning: {
+                guard let engine = self.engine else { return nil }
+                return try? captureObjC { engine.isRunning }
+            },
+            deviceName: { AVCaptureDevice.default(for: .audio)?.localizedName })
     }
 
     /// BT1 (v1.19): watch the system default input while this Bluetooth dictation runs.
@@ -700,7 +877,8 @@ public final class AudioRecorder: CaptureEngine {
         // v1.12 (L1): nothing starts without this session's lease.
         try holdLease(epoch: startEpoch, wait: Thread.isMainThread ? 0 : CaptureLeaseBroker.releaseWait)
         // v1.12 (L3): the AUHAL arm replaces the AVAudioEngine headset client — never both.
-        let unitArm = headsetUnitArm(device: device, bluetooth: route.eligibility()?.0 == .bluetooth)
+        let bluetooth = route.eligibility()?.0 == .bluetooth
+        let unitArm = headsetUnitArm(device: device, bluetooth: bluetooth)
         if unitArm {
             if lock.withLock({ engine != nil }) { teardownEngine() }
         } else if lock.withLock({ engine == nil }) || selectedDevice != device || tapInstalled {
@@ -761,10 +939,13 @@ public final class AudioRecorder: CaptureEngine {
         if device == .builtIn { checkBuiltinPin() }
         stats.engineStartMs = elapsedMs()
         let settledRoute = kind == .conversation ? route.effectiveRoute() : nil
+        // 1.29: an eligible conversation activation records its engine's bound input; any other clears it.
+        let binding = kind == .conversation ? conversationActivationBinding(bluetooth: bluetooth) : nil
         let activated = lock.withLock {
             guard engineEpoch === startEpoch else { return false }
             captureRunning = true
             if let settledRoute { observedRoute = settledRoute }
+            boundInput = binding; inPlaceApplies = 0
             return true
         }
         guard activated else { throw CancellationError() }
@@ -1452,12 +1633,14 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
-    private func installTapAndStart() throws {
+    /// `make`: the start-unit factory (nil = `makeCaptureInputUnit`; the 1.29 offline seam supplies its fake engine's).
+    private func installTapAndStart(make: ((CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit)? = nil) throws {
+        let make = make ?? makeCaptureInputUnit
         // A configuration notification must not re-enable the graph this capture rejected.
         if lock.withLock({ stats.voiceProcessing == "fallback" }) {
-            try makeCaptureInputUnit(.halout).start()
+            try make(.halout).start()
         } else {
-            try startCaptureInput(make: makeCaptureInputUnit)
+            try startCaptureInput(make: make)
         }
     }
 
@@ -1569,9 +1752,9 @@ public final class AudioRecorder: CaptureEngine {
     /// The hands-off re-attach: tap in the input node's current output format (nil = whatever the
     /// bus delivers; never a format-mismatch exception), converted to 24 kHz per buffer in `consume`.
     private func installConvertingTapAndStart() throws {
+        let native = engineNative                  // 1.29: this recorder's AVAudioEngine (or the offline seam's fake)
         try captureObjC {
-            let input = try requireEngine().inputNode
-            let hardware = input.inputFormat(forBus: 0), output = input.outputFormat(forBus: 0)
+            let (hardware, output) = try native.formats()
             if hardware.sampleRate != output.sampleRate || hardware.channelCount != output.channelCount {
                 AppController.note("bt_reattach_converted=1 hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch out=\(Int(output.sampleRate))Hz/\(output.channelCount)ch")
             }
@@ -1579,18 +1762,19 @@ public final class AudioRecorder: CaptureEngine {
             let token = CaptureEpoch()
             lock.withLock { tapEpoch = token }
             tapInstalled = true
-            input.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, time in
+            try native.installTap { [weak self] buffer, time in
                 self?.consume(buffer, time: time, epoch: token)
             }
-            try requireEngine().prepare()
-            try ioOp(.start) { try requireEngine().start() }
+            try native.prepare()
+            try ioOp(.start) { try native.start() }
         }
     }
 
     private func removeTap() throws {
         guard tapInstalled else { return }
         defer { tapInstalled = false; lock.withLock { tapEpoch = CaptureEpoch() } }
-        try captureObjC { try requireEngine().inputNode.removeTap(onBus: 0) }
+        let native = engineNative
+        try captureObjC { try native.removeTap() }
     }
 
     /// Continue cleanup after any individual exception, including a partial tap install.
@@ -1600,6 +1784,7 @@ public final class AudioRecorder: CaptureEngine {
         let unit: HeadsetCapture? = lock.withLock {
             if engine != nil || headsetUnitActive, !counted { ioGuard.record(.stop) }
             captureRunning = false; converter = nil; tapEpoch = CaptureEpoch()
+            boundInput = nil; inPlaceApplies = 0     // 1.29: a disposed engine is bound to nothing
             defer { headsetUnitActive = false }
             return headsetUnitActive ? headsetUnit : nil
         }
@@ -1940,6 +2125,7 @@ public final class AudioRecorder: CaptureEngine {
             appliedRouteGeneration = 0
             routeApplying = false
             observedRoute = nil
+            boundInput = nil; inPlaceApplies = 0
             feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: epoch)
             feed.sourceStarted(.headset, at: time)
             captureBoundary = time
@@ -1947,9 +2133,15 @@ public final class AudioRecorder: CaptureEngine {
         }
         try startCaptureInput(now: now ?? { time }, note: note, make: make)
         let settledRoute = route.effectiveRoute()
-        lock.withLock { captureRunning = true; observedRoute = settledRoute }
+        // 1.29: the offline engine seam's activation runs production's binding bookkeeping (no seam: unchanged).
+        let binding = offlineConversationEngine == nil ? nil
+            : conversationActivationBinding(bluetooth: route.eligibility()?.0 == .bluetooth)
+        lock.withLock { captureRunning = true; observedRoute = settledRoute; boundInput = binding }
         if kind == .conversation { installConversationRouteWatch(epoch: epoch) }
     }
+
+    /// 1.29 offline seam: the production converting tap + start on the seam's fake engine (a test's start unit calls this).
+    func offlineInstallConvertingTapAndStart() throws { try installConvertingTapAndStart() }
 
     /// Count the injected native start through the same operation guard as the live engine.
     func offlineInputStarted(_ start: () throws -> Void) rethrows { try ioOp(.start, start) }
@@ -2029,6 +2221,7 @@ public final class AudioRecorder: CaptureEngine {
         conversationRouteWatch = nil
         observedRoute = nil
         routeGeneration = 0; appliedRouteGeneration = 0; routeApplying = false
+        boundInput = nil; inPlaceApplies = 0
         failureReported = false; streamOverrun = false; keptFrameCount = 0
         defaultInputWatch = nil
         inputMoved = false
