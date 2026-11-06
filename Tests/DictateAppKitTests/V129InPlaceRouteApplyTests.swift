@@ -19,6 +19,12 @@ struct V129InPlaceRouteApplyTests {
     struct NativeError: Error {}
 
     /// One fake AVAudioEngine: its input node's tap, start and bound-device read-back.
+    ///
+    /// 1.29.2: the input node models the native format contract, not a decision. `hardware` (the device's input
+    /// format) and `output` (the node's bus-0 output/client format) are separate mutable values; a nil-format tap
+    /// leaves `output` as it is; an explicit tap format sets it; `start()` throws
+    /// `NSError(domain: "com.apple.coreaudio.avfaudio", code: -10868)` iff they disagree (rate or channels). A new
+    /// engine binds the then-current hardware format (`output == hardware`).
     final class FakeEngine: @unchecked Sendable {
         let id: Int
         private let lock = NSLock()
@@ -30,12 +36,33 @@ struct V129InPlaceRouteApplyTests {
         var removeError: Error?, installError: Error?, startError: Error?
         /// Runs inside `start()` before it returns (a stop racing the apply).
         var onStart: (() -> Void)?
-        let hardware: AVAudioFormat
+        private var _hardware: AVAudioFormat
+        private var _output: AVAudioFormat
+        private var _tapFormats: [AVAudioFormat?] = []
+        private var _startErrors: [NSError] = []
 
         init(id: Int, device: AudioDeviceID?, hardware: AVAudioFormat) {
             self.id = id
             _device = device
-            self.hardware = hardware
+            _hardware = hardware
+            _output = hardware
+        }
+        /// The device's current input (hardware) format; changing it leaves `output` stale.
+        var hardware: AVAudioFormat {
+            get { lock.withLock { _hardware } }
+            set { lock.withLock { _hardware = newValue } }
+        }
+        /// The input node's bus-0 output (client) format.
+        var output: AVAudioFormat {
+            get { lock.withLock { _output } }
+            set { lock.withLock { _output = newValue } }
+        }
+        /// The format each installTap asked for, in order (nil: the node's own).
+        var tapFormats: [AVAudioFormat?] { lock.withLock { _tapFormats } }
+        /// Every native format refusal `start()` returned, in order.
+        var startErrors: [NSError] { lock.withLock { _startErrors } }
+        static func agree(_ a: AVAudioFormat, _ b: AVAudioFormat) -> Bool {
+            a.sampleRate == b.sampleRate && a.channelCount == b.channelCount
         }
         var device: AudioDeviceID? {
             get { lock.withLock { _device } }
@@ -52,11 +79,13 @@ struct V129InPlaceRouteApplyTests {
 
         var native: EngineInputNative {
             EngineInputNative(
-                formats: { (self.hardware, self.hardware) },
-                installTap: { block in
+                formats: { self.lock.withLock { (self._hardware, self._output) } },
+                installTap: { format, block in
                     try self.lock.withLock {
                         self.installs += 1
+                        self._tapFormats.append(format)
                         if let e = self.installError { throw e }
+                        if let format { self._output = format }      // an explicit tap format sets the bus
                         self._tap = block
                         self._taps.append(block)
                     }
@@ -74,6 +103,11 @@ struct V129InPlaceRouteApplyTests {
                     try self.lock.withLock {
                         self.starts += 1
                         if let e = self.startError { throw e }
+                        guard Self.agree(self._hardware, self._output) else {
+                            let e = NSError(domain: "com.apple.coreaudio.avfaudio", code: -10868)
+                            self._startErrors.append(e)
+                            throw e
+                        }
                         self._running = true
                     }
                 },
@@ -107,11 +141,20 @@ struct V129InPlaceRouteApplyTests {
         var rebuildError: Error?
         /// The device a newly built engine binds to (nil: the current default).
         var nextEngineDevice: AudioDeviceID??
-        let hardware: AVAudioFormat
+        private var _hardware: AVAudioFormat
 
         init(hardware: AVAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!) {
-            self.hardware = hardware
+            _hardware = hardware
             _engines = [FakeEngine(id: 0, device: 77, hardware: hardware)]
+        }
+        /// The headset's current input format. Setting it changes ONLY the live engine's hardware side (its output
+        /// bus keeps the old client format); a later rebuild binds this format.
+        var hardware: AVAudioFormat {
+            get { lock.withLock { _hardware } }
+            set {
+                let engine = lock.withLock { () -> FakeEngine in _hardware = newValue; return _engines.last! }
+                engine.hardware = newValue
+            }
         }
         var defaultDevice: AudioDeviceID? {
             get { lock.withLock { _defaultDevice } }
@@ -141,7 +184,7 @@ struct V129InPlaceRouteApplyTests {
                 if let e = rebuildError { throw e }
                 rebuilds += 1
                 let device: AudioDeviceID? = nextEngineDevice ?? _defaultDevice
-                _engines.append(FakeEngine(id: _engines.count, device: device, hardware: hardware))
+                _engines.append(FakeEngine(id: _engines.count, device: device, hardware: _hardware))
             }
         }
 
