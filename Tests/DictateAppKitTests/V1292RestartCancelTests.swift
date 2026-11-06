@@ -14,14 +14,6 @@ import Testing
 struct V1292RestartCancelTests {
     typealias V129 = V129InPlaceRouteApplyTests
 
-    final class Notes: @unchecked Sendable {
-        private let lock = NSLock()
-        private var lines: [(TimeInterval, String)] = []
-        func add(_ line: String) { lock.withLock { lines.append((ProcessInfo.processInfo.systemUptime, line)) } }
-        var all: [(TimeInterval, String)] { lock.withLock { lines } }
-        func first(_ fragment: String) -> (TimeInterval, String)? { all.first { $0.1.contains(fragment) } }
-    }
-
     /// A live default-input watch token (an observer the recorder must release on stop).
     final class Watch {}
     final class Watches: @unchecked Sendable {
@@ -37,14 +29,11 @@ struct V1292RestartCancelTests {
         let recorder: AudioRecorder
         let rig: V129.Rig
         let broker: CaptureLeaseBroker
-        let notes: Notes
         let watches: Watches
     }
 
     /// `running`: the restart's idle check (`isRunningSomewhere` on the headset device).
     static func start(running: @escaping @Sendable (AudioDeviceID) -> Bool? = { _ in false }) throws -> Session {
-        let notes = Notes()
-        AppController.setNoteSink { notes.add($0) }
         let rig = V129.Rig()
         let watches = Watches()
         let log = V61CaptureLifetimeTests.Log()
@@ -62,7 +51,7 @@ struct V1292RestartCancelTests {
         recorder.offlineConversationEngine = OfflineConversationEngine(
             native: { rig.engine.native }, rebuild: { try rig.rebuild() }, make: make)
         try recorder.offlineStartInput(at: ProcessInfo.processInfo.systemUptime, note: { _ in }, bridge: true, make: make)
-        return Session(recorder: recorder, rig: rig, broker: broker, notes: notes, watches: watches)
+        return Session(recorder: recorder, rig: rig, broker: broker, watches: watches)
     }
 
     /// The headset delivers 1 s of digital zeros through the live tap: the bridge asks for its one restart.
@@ -74,7 +63,9 @@ struct V1292RestartCancelTests {
         }
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
-            if let line = s.notes.first("headset_restart=1 path=") { return line.1 }
+            // The recorder's own copy of its restart line (the global note sink is shared by concurrent suites).
+            let line = s.recorder.headsetRestartNote
+            if line != "none" { return line }
             Thread.sleep(forTimeInterval: 0.02)
         }
         return nil
@@ -89,9 +80,7 @@ struct V1292RestartCancelTests {
 
     static func finish(_ s: Session) async -> CaptureLease.State? {
         _ = s.recorder.stop()
-        let state = await s.recorder.awaitRelease()
-        AppController.setNoteSink(nil)
-        return state
+        return await s.recorder.awaitRelease()
     }
 
     @Test func stopDuringTheRestartsStartNeverStopsIOMillisecondsAfterTheStart() async throws {
@@ -108,7 +97,7 @@ struct V1292RestartCancelTests {
         let stopMs: Int? = candidate.startTimes.first.flatMap { started in
             candidate.removeTimes.first(where: { $0 >= started }).map { Int((($0 - started) * 1000).rounded()) }
         }
-        let errorNote = s.notes.first("headset_restart_error=") != nil
+        let errorNote = s.recorder.headsetRestartDiagnostics.errors > 0
         let cancelled = V129.field("cancelled", line)
         _ = await Self.finish(s)
         let green = !errorNote && (starts == 0 || (stopMs ?? 0) >= 300)
@@ -149,7 +138,7 @@ struct V1292RestartCancelTests {
         #expect(starts == 1)
         #expect(V129.field("started", line) == "1")
         #expect(V129.field("cancelled", line) == nil)
-        #expect(s.notes.first("headset_restart_error=") == nil)
+        #expect(s.recorder.headsetRestartDiagnostics.errors == 0)
     }
 
     @Test func leaseIsReleasedAfterTheCancelledRestartsTeardownAndNothingRecoversAfterStop() async throws {
@@ -161,24 +150,26 @@ struct V1292RestartCancelTests {
             }
         }
         #expect(s.watches.made == 1)                               // the start's default-input watch
+        final class Released: @unchecked Sendable { let lock = NSLock(); var at: TimeInterval? }
+        let released = Released()
+        let lease = try #require(s.recorder.currentLease)
+        lease.whenSettled { _ in released.lock.withLock { released.at = ProcessInfo.processInfo.systemUptime } }
         let line = try #require(Self.silentHeadsetUntilRestart(s))
+        let atRestart = s.recorder.headsetRestartDiagnostics
         let state = await s.recorder.awaitRelease()
         let candidate = try #require(s.rig.engines.count > 1 ? s.rig.engines[1] : nil)
         let teardownAt = candidate.removeTimes.last ?? .infinity
-        let releasedAt = s.notes.first("lease_released=")?.0
-        // Let any straggling work (a busy retry, a verification, a recovery) surface before reading the tail.
+        // Let any straggling work (a busy retry, a verification, a recovery) surface before reading the counters.
         try await Task.sleep(nanoseconds: 1_300_000_000)
-        let restartAt = s.notes.first("headset_restart=1 path=")!.0
-        let after = s.notes.all.filter { $0.0 > restartAt }.map(\.1)
-        let recoveries = after.filter { $0.contains("bt_recovery=") || $0.contains("headset_restart_error=") || $0.contains("headset_restart=1 path=") }
-        let releasedAfterTeardown = releasedAt.map { $0 >= teardownAt } ?? false
+        let end = s.recorder.headsetRestartDiagnostics
+        let recoveries = (end.restarts - atRestart.restarts) + (end.requests - atRestart.requests) + end.errors
+        let releasedAfterTeardown = released.lock.withLock { released.at }.map { $0 >= teardownAt } ?? false
         let observers = s.watches.live
-        AppController.setNoteSink(nil)
-        print("D1 LEASE released_after_teardown=\(releasedAfterTeardown ? 1 : 0) observers=\(observers) state=\(state.map { "\($0)" } ?? "nil") lease_active=\(s.recorder.currentLease == nil ? 0 : 1) recoveries_after_stop=\(recoveries.count) note=\(line)")
+        print("D1 LEASE released_after_teardown=\(releasedAfterTeardown ? 1 : 0) observers=\(observers) state=\(state.map { "\($0)" } ?? "nil") lease_active=\(s.recorder.currentLease == nil ? 0 : 1) recoveries_after_stop=\(recoveries) note=\(line)")
         #expect(state == .released)
         #expect(s.recorder.currentLease == nil)
         #expect(releasedAfterTeardown)
         #expect(observers == 0)
-        #expect(recoveries.isEmpty)
+        #expect(recoveries == 0)
     }
 }
