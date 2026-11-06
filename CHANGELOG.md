@@ -79,3 +79,6 @@ Raza (2026-11-05 23:5x): "pressing the two command keys isn't doing anything; it
 
 ## v1.29.1 — 2026-11-06
 - The 1.29 in-place restart now recognises a Bluetooth headset when macOS routes it through its combined default device (it never took effect on real hardware in 1.29).
+
+## v1.29.2 — 2026-11-07
+- An Archie conversation on a Bluetooth headset starts its microphone at the headset's real rate the first time, instead of failing once and rebuilding. Cancelling while the headset microphone is restarting no longer starts the microphone again for a dictation that has ended.
