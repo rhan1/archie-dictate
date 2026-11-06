@@ -83,30 +83,58 @@ enum AudioDevices {
         try check(AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size))
         return device
     }
+    /// Property reads beneath the capture resolver. Tests replace only hardware reads, so activation
+    /// and apply still execute the production resolver and the recorder's identity agreement policy.
+    struct CaptureDevicePropertyReader {
+        var transport: (AudioDeviceID) -> UInt32?
+        var activeSubdevices: (AudioDeviceID) -> [AudioObjectID]?
+        var inputStreamCount: (AudioObjectID) -> Int?
+
+        static let live = Self(
+            transport: { device in
+                var transport: UInt32 = 0
+                var size = UInt32(MemoryLayout<UInt32>.size)
+                var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+                    mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+                guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport) == noErr else { return nil }
+                return transport
+            },
+            activeSubdevices: { device in
+                var address = AudioObjectPropertyAddress(mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
+                    mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+                var size: UInt32 = 0
+                guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr,
+                      size > 0, size % UInt32(MemoryLayout<AudioObjectID>.size) == 0 else { return nil }
+                var subdevices = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+                guard subdevices.withUnsafeMutableBytes({ bytes in
+                    AudioObjectGetPropertyData(device, &address, 0, nil, &size, bytes.baseAddress!)
+                }) == noErr else { return nil }
+                return subdevices
+            },
+            inputStreamCount: { subdevice in
+                var streams = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+                    mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+                var size: UInt32 = 0
+                guard AudioObjectGetPropertyDataSize(subdevice, &streams, 0, nil, &size) == noErr else { return nil }
+                return Int(size) / MemoryLayout<AudioStreamID>.size
+            })
+    }
+
     /// The input device an AUHAL current-device read actually captures from. macOS may bind an
     /// AVAudioEngine to its private default aggregate; only a single active input sub-device is
-    /// unambiguous. All unreadable or multi-input aggregates deliberately remain unknown.
+    /// unambiguous. Every property read must succeed before an aggregate can bind.
     static func captureDevice(of device: AudioDeviceID) -> AudioDeviceID? {
-        var transport: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
-            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport) == noErr else { return nil }
-        guard transport == kAudioDeviceTransportTypeAggregate else { return device }
+        captureDevice(of: device, reading: .live)
+    }
 
-        address.mSelector = kAudioAggregateDevicePropertyActiveSubDeviceList
-        size = 0
-        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr,
-              size > 0, size % UInt32(MemoryLayout<AudioObjectID>.size) == 0 else { return nil }
-        var subdevices = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
-        guard subdevices.withUnsafeMutableBytes({ bytes in
-            AudioObjectGetPropertyData(device, &address, 0, nil, &size, bytes.baseAddress!)
-        }) == noErr else { return nil }
-        let inputSubdevices = subdevices.filter { subdevice in
-            var streams = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
-                mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
-            var streamSize: UInt32 = 0
-            return AudioObjectGetPropertyDataSize(subdevice, &streams, 0, nil, &streamSize) == noErr && streamSize > 0
+    static func captureDevice(of device: AudioDeviceID, reading reader: CaptureDevicePropertyReader) -> AudioDeviceID? {
+        guard let transport = reader.transport(device) else { return nil }
+        guard transport == kAudioDeviceTransportTypeAggregate else { return device }
+        guard let subdevices = reader.activeSubdevices(device) else { return nil }
+        var inputSubdevices: [AudioDeviceID] = []
+        for subdevice in subdevices {
+            guard let count = reader.inputStreamCount(subdevice) else { return nil }
+            if count > 0 { inputSubdevices.append(subdevice) }
         }
         guard inputSubdevices.count == 1 else { return nil }
         return inputSubdevices[0]

@@ -326,53 +326,151 @@ struct V129InPlaceRouteApplyTests {
         print("F1 GREEN T-2 same_engine=\(sameEngine ? 1 : 0) rebuilds=\(s.rig.rebuilds) installs=2 removes=1 lease_same=1 settled_once=1 stale_pcm=\(stale) current_pcm=\(current) note=\(note)")
     }
 
-    /// RED on 1.29: AVAudioEngine reads back macOS's private default aggregate (142), while the sampled
-    /// default input is the headset input (90). The second admitted generation should stay in place.
-    @Test func aggregateEngineReadBackForTheDefaultInputRestartsInPlace() throws {
-        let rig = Rig()
-        rig.defaultDevice = 90
-        rig.setUID(Self.sonyUID, for: 90)
-        rig.engine.device = 142
-        rig.nextEngineDevice = .some(142)
-        rig.setCaptureDevice { $0 == 142 ? 90 : $0 }
-        let s = try Self.start(rig)
+    /// Only the three CoreAudio property reads are faked. Both recorder call sites execute
+    /// AudioDevices.captureDevice, including on every activation after a rebuild.
+    final class CaptureProperties: @unchecked Sendable {
+        private let lock = NSLock()
+        private var transport: UInt32? = kAudioDeviceTransportTypeAggregate
+        private var members: [AudioObjectID]? = [90, 84]
+        private var streams: [AudioObjectID: Int] = [90: 1, 84: 0, 91: 1]
+        private var reads: [String] = []
 
-        _ = try Self.apply(s)
-        _ = try Self.apply(s)
-
-        let note = s.recorder.conversationApplyNote
-        print("V129.1 GREEN aggregate_input=90 second=\(Self.outcome(note)) note=\(note)")
-        #expect(Self.outcome(note) == "I")
+        func setTransport(_ value: UInt32?) { lock.withLock { transport = value } }
+        func setMembers(_ value: [AudioObjectID]?) { lock.withLock { members = value } }
+        func setStreams(_ value: Int?, for device: AudioObjectID) { lock.withLock { streams[device] = value } }
+        var queries: [String] { lock.withLock { reads } }
+        var reader: AudioDevices.CaptureDevicePropertyReader {
+            AudioDevices.CaptureDevicePropertyReader(
+                transport: { device in self.lock.withLock {
+                    self.reads.append("transport:\(device)")
+                    return device == 142 ? self.transport : kAudioDeviceTransportTypeBluetooth
+                } },
+                activeSubdevices: { device in self.lock.withLock {
+                    self.reads.append("members:\(device)")
+                    return device == 142 ? self.members : nil
+                } },
+                inputStreamCount: { device in self.lock.withLock {
+                    self.reads.append("streams:\(device)")
+                    return self.streams[device]
+                } })
+        }
     }
 
-    @Test func aggregateResolutionRejectsAmbiguousDisagreeingAndUnreadableInputs() throws {
-        func aggregateOutcome(_ resolution: AudioDeviceID?) throws -> String {
-            let rig = Rig()
-            rig.defaultDevice = 90
-            rig.setUID(Self.sonyUID, for: 90)
-            rig.engine.device = 142
-            rig.setCaptureDevice { $0 == 142 ? resolution : $0 }
-            let s = try Self.start(rig)
-            _ = try Self.apply(s)
-            return s.recorder.conversationApplyNote
-        }
+    static func resolverSession(_ properties: CaptureProperties, engineDevice: AudioDeviceID = 142) throws -> Session {
+        let rig = Rig()
+        rig.defaultDevice = 90
+        rig.setUID(sonyUID, for: 90)
+        rig.engine.device = engineDevice
+        rig.nextEngineDevice = .some(engineDevice)
+        let reader = properties.reader
+        rig.setCaptureDevice { AudioDevices.captureDevice(of: $0, reading: reader) }
+        return try start(rig)
+    }
 
-        let twoInputs = try aggregateOutcome(nil)
-        let differentInput = try aggregateOutcome(78)
-        let unreadable = try aggregateOutcome(nil)
-        #expect(twoInputs.contains("conv_apply=rebuild reason=no_bound bound=nil"))
-        #expect(differentInput.contains("conv_apply=rebuild reason=no_bound bound=nil"))
-        #expect(unreadable.contains("conv_apply=rebuild reason=no_bound bound=nil"))
+    /// Assert the resolver result AND the real activation/apply decision. The successful single-input
+    /// fixture is the positive control for the rejection fixtures; none injects a resolved ID or nil.
+    static func rejectedResolution(_ label: String, _ properties: CaptureProperties,
+                                   expectedResolution: AudioDeviceID? = nil) throws {
+        let resolved = AudioDevices.captureDevice(of: 142, reading: properties.reader)
+        let s = try resolverSession(properties)
+        defer { _ = s.recorder.stop() }
+        let engine = s.rig.engine
+        #expect(try apply(s))
+        let note = s.recorder.conversationApplyNote
+        print("FR1-B \(label) actual resolved=\(resolved.map(String.init) ?? "nil") rebuilds=\(s.rig.rebuilds) note=\(note) queries=\(properties.queries.joined(separator: ","))")
+        #expect(resolved == expectedResolution)
+        #expect(note.hasPrefix("conv_apply=rebuild reason=no_bound bound=nil"))
+        #expect(s.rig.rebuilds == 1)
+        #expect(s.rig.engine !== engine)
+    }
 
-        let direct = Rig()
-        direct.defaultDevice = 90
-        direct.setUID(Self.sonyUID, for: 90)
-        direct.engine.device = 90
-        let directSession = try Self.start(direct)
-        _ = try Self.apply(directSession)
-        let directNote = directSession.recorder.conversationApplyNote
-        #expect(Self.outcome(directNote) == "I")
-        print("V129.1 CONTROL aggregate_two_inputs=R aggregate_other_input=R aggregate_unreadable=R direct_input=I")
+    @Test func fr1DirectNonAggregateBindsTheDefault() throws {
+        let p = CaptureProperties()
+        let s = try Self.resolverSession(p, engineDevice: 90)
+        defer { _ = s.recorder.stop() }
+        let engine = s.rig.engine
+        #expect(try Self.apply(s))
+        let note = s.recorder.conversationApplyNote
+        print("FR1-B direct actual rebuilds=\(s.rig.rebuilds) note=\(note) queries=\(p.queries.joined(separator: ","))")
+        #expect(note.hasPrefix("conv_apply=in_place reason=same_device bound=90/"))
+        #expect(s.rig.rebuilds == 0 && s.rig.engine === engine)
+        #expect(!p.queries.isEmpty && p.queries.allSatisfy { $0 == "transport:90" })
+    }
+
+    @Test func fr1SingleInputAggregateBindsAndSecondGenerationAppliesInPlace() throws {
+        let p = CaptureProperties() // 142 = {90 input, 84 output}; sampled default = 90
+        let s = try Self.resolverSession(p)
+        defer { _ = s.recorder.stop() }
+        let engine = s.rig.engine
+        #expect(try Self.apply(s))
+        #expect(try Self.apply(s))
+        let note = s.recorder.conversationApplyNote
+        print("FR1-B single_input actual rebuilds=\(s.rig.rebuilds) note=\(note) queries=\(p.queries.joined(separator: ","))")
+        #expect(note.hasPrefix("conv_apply=in_place reason=same_device bound=90/\"\(Self.sonyUID)\" consecutive=2 gen=2"))
+        #expect(s.rig.rebuilds == 0 && s.rig.engine === engine)
+        #expect(p.queries == Array(repeating: ["transport:142", "members:142", "streams:90", "streams:84"], count: 5).flatMap { $0 })
+    }
+
+    @Test func fr1TwoInputAggregateRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setMembers([90, 91, 84])
+        try Self.rejectedResolution("two_inputs", p)
+        #expect(p.queries.contains("streams:84")) // even after two inputs, every member is queried
+    }
+
+    @Test func fr1ZeroInputAggregateRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setStreams(0, for: 90)
+        try Self.rejectedResolution("zero_inputs", p)
+    }
+
+    @Test func fr1FailedMemberStreamQueryRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setMembers([90, 91, 84])
+        p.setStreams(nil, for: 91) // a9888ff silently drops 91 and incorrectly binds 90
+        try Self.rejectedResolution("failed_member", p)
+        #expect(p.queries.contains("streams:91"))
+    }
+
+    @Test func fr1FailedTransportReadRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setTransport(nil)
+        try Self.rejectedResolution("failed_transport", p)
+        #expect(p.queries.allSatisfy { $0 == "transport:142" })
+    }
+
+    @Test func fr1FailedSubdeviceListReadRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setMembers(nil)
+        try Self.rejectedResolution("failed_members", p)
+        #expect(!p.queries.contains { $0.hasPrefix("streams:") })
+    }
+
+    @Test func fr1EmptySubdeviceListRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setMembers([])
+        try Self.rejectedResolution("empty_members", p)
+    }
+
+    @Test func fr1AggregateInputDifferentFromDefaultRejectsBinding() throws {
+        let p = CaptureProperties()
+        p.setMembers([91, 84])
+        try Self.rejectedResolution("different_input", p, expectedResolution: 91)
+    }
+
+    @Test func fr1AggregateMembershipChangeBetweenActivationAndApplyRebuilds() throws {
+        let p = CaptureProperties()
+        let s = try Self.resolverSession(p) // activation binds 90 from {90 input, 84 output}
+        defer { _ = s.recorder.stop() }
+        let engine = s.rig.engine
+        p.setMembers([91, 84]) // same aggregate ID and sampled default, different actual input
+        #expect(try Self.apply(s))
+        let note = s.recorder.conversationApplyNote
+        print("FR1-B membership_change actual rebuilds=\(s.rig.rebuilds) note=\(note) queries=\(p.queries.joined(separator: ","))")
+        #expect(note.hasPrefix("conv_apply=rebuild reason=engine_bound_elsewhere bound=90/"))
+        #expect(note.contains("engine_dev=91"))
+        #expect(s.rig.rebuilds == 1 && s.rig.engine !== engine)
+        #expect(p.queries.contains("streams:90") && p.queries.contains("streams:91"))
     }
 
     @Test func runningEngineAndAWatchOnlyRateChangeAlsoApplyInPlace() throws {
