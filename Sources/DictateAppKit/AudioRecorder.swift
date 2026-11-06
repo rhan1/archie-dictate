@@ -46,6 +46,20 @@ public final class AudioRecorder: CaptureEngine {
     private var headsetRestartCounts = (restarts: 0, errors: 0, requests: 0)
     var headsetRestartNote: String { lock.withLock { lastHeadsetRestart } }
     var headsetRestartDiagnostics: (restarts: Int, errors: Int, requests: Int) { lock.withLock { headsetRestartCounts } }
+    /// 1.29.3 recorder-local copies of retap notes; concurrent suites never share a note sink.
+    private var retapNotes: [String] = []
+    private var retapErrors: [(domain: String, code: Int)] = []
+    var retapErrorDiagnostics: [(domain: String, code: Int)] { lock.withLock { retapErrors } }
+    var retapDiagnostics: [String] { lock.withLock { retapNotes } }
+    private func noteRetap(_ line: String) {
+        lock.withLock { retapNotes.append(line) }
+        AppController.note(line)
+    }
+    private func noteRetapError(_ error: Error) {
+        let native = error as NSError
+        lock.withLock { retapErrors.append((native.domain, native.code)) }
+        noteRetap("config_retap_error=\(native)")
+    }
     /// 1.29 test seam: nil in production (this recorder's AVAudioEngine).
     var offlineConversationEngine: OfflineConversationEngine?
     private var failureReported = false
@@ -1224,7 +1238,7 @@ public final class AudioRecorder: CaptureEngine {
                 evidenceNotes.forEach { AppController.note($0) }
                 // v1.9 (L1): AVAudioEngine auto-stopped on the profile switch — re-attach IO now,
                 // before coreaudiod tears the idle SCO route down (~250 ms after it connected).
-                let running = (try? captureObjC { self.engine?.isRunning ?? false }) ?? false
+                let running = engineNative.isRunning() ?? false
                 // v1.12 (L2): a stopped engine opens an obligation that gets its re-attach as soon as
                 // none is in flight — also a SECOND stopped notification (v1.10 swallowed it).
                 switch lock.withLock({ ioGuard.configurationChanged(at: now, engineRunning: running) }) {
@@ -1301,7 +1315,7 @@ public final class AudioRecorder: CaptureEngine {
                 result = lock.withLock { engineEpoch === epoch } ? .retapped : .stale
             } catch {
                 lock.withLock { ioGuard.finished(.retap, ok: false) }
-                AppController.note("config_retap_error=\(error as NSError)")
+                noteRetapError(error)
                 result = .failed
             }
             lock.withLock { ioGuard.reattachFinished(started: result == .retapped, at: now) }
@@ -1323,7 +1337,7 @@ public final class AudioRecorder: CaptureEngine {
                 }
                 try self.installTapAndStart()
             }, teardown: { self.teardownEngine() }, note: {
-                AppController.note("config_retap_error=\($0 as NSError)")
+                self.noteRetapError($0)
             })
         }
         if result == .retapped || result == .rebuilt {
@@ -1685,7 +1699,7 @@ public final class AudioRecorder: CaptureEngine {
 
     /// `make`: the start-unit factory (nil = `makeCaptureInputUnit`; the 1.29 offline seam supplies its fake engine's).
     private func installTapAndStart(make: ((CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit)? = nil) throws {
-        let make = make ?? makeCaptureInputUnit
+        let make = make ?? offlineConversationEngine?.make ?? makeCaptureInputUnit
         // A configuration notification must not re-enable the graph this capture rejected.
         if lock.withLock({ stats.voiceProcessing == "fallback" }) {
             try make(.halout).start()
@@ -1849,7 +1863,7 @@ public final class AudioRecorder: CaptureEngine {
             }
             if let requested {
                 let after = try native.formats().output
-                AppController.note("bt_reattach_reformatted=1 hw=\(Int(requested.sampleRate))Hz/\(requested.channelCount)ch out_before=\(Int(output.sampleRate))Hz/\(output.channelCount)ch out_after=\(Int(after.sampleRate))Hz/\(after.channelCount)ch")
+                noteRetap("bt_reattach_reformatted=1 hw=\(Int(requested.sampleRate))Hz/\(requested.channelCount)ch out_before=\(Int(output.sampleRate))Hz/\(output.channelCount)ch out_after=\(Int(after.sampleRate))Hz/\(after.channelCount)ch")
                 guard after.sampleRate == requested.sampleRate, after.channelCount == requested.channelCount else {
                     throw InPlaceFormatError(errorCode: 2, reason: "output_not_reconciled")
                 }
@@ -2047,7 +2061,7 @@ public final class AudioRecorder: CaptureEngine {
         let now = ProcessInfo.processInfo.systemUptime
         let (identity, unitArm, reason, live): (CaptureEpoch, Bool, String, Bool) = lock.withLock {
             (engineIdentity, instrumentation.backend == .auhal, ioGuard.obligation?.reason.rawValue ?? "none",
-             engineEpoch === epoch && captureRunning && !restarting && (engine != nil || headsetUnitActive))
+             engineEpoch === epoch && captureRunning && !restarting && (engine != nil || offlineConversationEngine != nil || headsetUnitActive))
         }
         guard live, recording, lock.withLock({ episode.admitReattach(at: now) }) else {
             lock.withLock { if episode.budgetSpent { ioGuard.reattachUnavailable() } else { ioGuard.reattachDeclined() } }
@@ -2096,8 +2110,13 @@ public final class AudioRecorder: CaptureEngine {
         let check = unit?.deviceCheck()
         // v1.12 (L2): the headset client's observed IO state (engine or AUHAL unit).
         let probe: (AVAudioEngine?, HeadsetCapture?) = lock.withLock { (engine, headsetUnitActive ? headsetUnit : nil) }
-        let headsetRunning: Bool? = probe.1.map { $0.isRunning } ?? probe.0.map { engine in
-            (try? captureObjC { engine.isRunning }) ?? false
+        let headsetRunning: Bool?
+        if offlineConversationEngine != nil, probe.1 == nil {
+            headsetRunning = engineNative.isRunning() ?? false
+        } else {
+            headsetRunning = probe.1.map { $0.isRunning } ?? probe.0.map { engine in
+                (try? captureObjC { engine.isRunning }) ?? false
+            }
         }
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
@@ -2238,11 +2257,32 @@ public final class AudioRecorder: CaptureEngine {
         let binding = offlineConversationEngine == nil ? nil
             : conversationActivationBinding(bluetooth: route.eligibility()?.0 == .bluetooth)
         lock.withLock { captureRunning = true; observedRoute = settledRoute; boundInput = binding }
+        // Match live start's recording liveness for hardware-free configuration notifications.
+        if offlineConversationEngine != nil { recording = true }
         if kind == .conversation { installConversationRouteWatch(epoch: epoch) }
     }
 
     /// 1.29 offline seam: the production converting tap + start on the seam's fake engine (a test's start unit calls this).
     func offlineInstallConvertingTapAndStart() throws { try installConvertingTapAndStart() }
+
+    /// Hardware-free configuration observer/obligation boundary. Uses the production watched executor.
+    /// Returns only after completion, or false after a bounded 5 s wait. Call outside the executor.
+    /// `completion` snapshots the retap before queued restart work can run.
+    /// `admitted: false` also lets fixtures drive the real notification's format-generation/admission policy.
+    @discardableResult
+    func offlineConfigurationReattach(at now: TimeInterval, admitted: Bool = true, completion: (() -> Void)? = nil) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        onExecutor { [self] in
+            let (identity, epoch) = lock.withLock { (engineIdentity, engineEpoch) }
+            configurationChanged(identity: identity, epoch: epoch, queued: false, notifiedAt: now, admitted: admitted)
+            completion?()
+            done.signal()
+        }
+        return done.wait(timeout: .now() + 5) == .success
+    }
+
+    /// The same graph marker assigned by the real VPIO configure, before its start/state callback.
+    func offlineVoiceProcessingConfigure() { voiceProcessingEngine = true }
 
     /// Count the injected native start through the same operation guard as the live engine.
     func offlineInputStarted(_ start: () throws -> Void) rethrows { try ioOp(.start, start) }
