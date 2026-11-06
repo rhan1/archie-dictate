@@ -746,7 +746,9 @@ public final class AudioRecorder: CaptureEngine {
                 let input = try self.requireEngine().inputNode
                 return (input.inputFormat(forBus: 0), input.outputFormat(forBus: 0))
             },
-            installTap: { block in try self.requireEngine().inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil, block: block) },
+            installTap: { format, block in
+                try self.requireEngine().inputNode.installTap(onBus: 0, bufferSize: 1024, format: format, block: block)
+            },
             removeTap: { try self.requireEngine().inputNode.removeTap(onBus: 0) },
             prepare: { try self.requireEngine().prepare() },
             start: { try self.requireEngine().start() },
@@ -1763,7 +1765,7 @@ public final class AudioRecorder: CaptureEngine {
             let token = CaptureEpoch()
             lock.withLock { tapEpoch = token }
             tapInstalled = true
-            try native.installTap { [weak self] buffer, time in
+            try native.installTap(nil) { [weak self] buffer, time in
                 self?.consume(buffer, time: time, epoch: token)
             }
             try native.prepare()

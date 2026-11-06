@@ -66,8 +66,10 @@ enum ConversationRouteReplacement {
 struct EngineInputNative {
     /// The input node's bus-0 input (hardware) and output formats.
     var formats: () throws -> (hardware: AVAudioFormat, output: AVAudioFormat)
-    /// Installs the bus-0 tap in the node's own format (`format: nil`).
-    var installTap: (@escaping AVAudioNodeTapBlock) throws -> Void
+    /// Installs the bus-0 tap. `nil` = the node's own current output format (the bus is left as it is); an explicit
+    /// format asks the node to set its bus-0 output format to it (AVAudioNode.h) — 1.29.2 passes the hardware format
+    /// only when a conversation's in-place apply finds the stopped node's output bus stale.
+    var installTap: (AVAudioFormat?, @escaping AVAudioNodeTapBlock) throws -> Void
     var removeTap: () throws -> Void
     var prepare: () throws -> Void
     var start: () throws -> Void
