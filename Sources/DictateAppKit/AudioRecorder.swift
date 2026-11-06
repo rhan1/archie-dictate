@@ -616,7 +616,7 @@ public final class AudioRecorder: CaptureEngine {
             } else if applying.inPlace {
                 // 1.29: the same engine, its configuration observer kept; a throwing retap/start rebuilds as before.
                 do {
-                    try installConvertingTapAndStart(reconcilingStaleOutput: inPlaceMayReconcileFormat())
+                    try installConvertingTapAndStart(reconcilingStaleOutput: mayReconcileStaleOutput())
                     noteConversationApply(applying.note)
                 } catch {
                     applying.fallBack(reason: "in_place_failed", error: error)
@@ -1713,7 +1713,7 @@ public final class AudioRecorder: CaptureEngine {
             return CaptureInputUnit(start: {
                 // VPIO owns its rate/layout. A nil tap accepts its output;
                 // consume converts every buffer to 24 kHz mono as before.
-                do { try self.installConvertingTapAndStart() }
+                do { try self.installConvertingTapAndStart(reconcilingStaleOutput: false) }
                 catch { throw CaptureVoiceProcessing.Refusal(reason: "start_refused") }
             }, dispose: {
                 self.teardownEngine()
@@ -1822,10 +1822,12 @@ public final class AudioRecorder: CaptureEngine {
         var description: String { "in_place_format:\(reason)" }
     }
 
-    /// 1.29.2: the conversation in-place apply may re-pin a stale output bus only on a plain (non-VPIO) engine that is
-    /// stopped (the HFP bring-up stopped it). A running or voice-processing graph keeps today's nil-format tap.
-    private func inPlaceMayReconcileFormat() -> Bool {
-        // FR1-B: "fallback" is the same plain `.halout` engine after VPIO was refused; only "on" is a VPIO graph.
+    /// 1.29.3: every plain stopped graph may re-pin a stale output bus (the HFP bring-up stopped it).
+    /// Running graphs and VPIO graphs retain native format ownership and the nil-format tap.
+    private func mayReconcileStaleOutput() -> Bool {
+        // VPIO owns its format; stats.voiceProcessing is still "off" during its initial start.
+        guard !voiceProcessingEngine else { return false }
+        // FR1-B: "fallback" is the same plain `.halout` engine after VPIO was refused.
         let plain = lock.withLock { ["off", "unavailable", "fallback"].contains(stats.voiceProcessing) }
         return plain && engineNative.isRunning() == false
     }
@@ -1835,10 +1837,12 @@ public final class AudioRecorder: CaptureEngine {
     /// or channel count differs from the node's output format, `AVAudioEngine.start()` throws
     /// `com.apple.coreaudio.avfaudio -10868` (the 11-06 gen-1 failure: hw 16 kHz, out 44.1 kHz).
     ///
-    /// 1.29.2 `reconcilingStaleOutput` (the conversation in-place apply only): on such a mismatch the tap is installed
-    /// WITH the freshly read hardware format and the node's output format is verified to match before prepare/start;
-    /// an invalid hardware format (0 Hz / 0 channels) throws before any native start. Equal formats keep `nil`.
-    private func installConvertingTapAndStart(reconcilingStaleOutput: Bool = false) throws {
+    /// 1.29.3: decide the rule here for every plain stopped graph. On a mismatch, install the freshly read hardware
+    /// format and verify the node's output before prepare/start. Equal formats keep `nil`.
+    /// Invalid hardware (0 Hz / 0 channels) throws dictate.in_place_format code 1 before native start; on a dictation
+    /// retap this becomes config_retap_error → .failed → the same restart request previously made for -10868.
+    private func installConvertingTapAndStart(reconcilingStaleOutput: Bool? = nil) throws {
+        let reconciling = reconcilingStaleOutput ?? mayReconcileStaleOutput()
         let native = engineNative                  // 1.29: this recorder's AVAudioEngine (or the offline seam's fake)
         try captureObjC {
             let (hardware, output) = try native.formats()
@@ -1847,7 +1851,7 @@ public final class AudioRecorder: CaptureEngine {
                 AppController.note("bt_reattach_converted=1 hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch out=\(Int(output.sampleRate))Hz/\(output.channelCount)ch")
             }
             var requested: AVAudioFormat?
-            if reconcilingStaleOutput {
+            if reconciling {
                 guard hardware.sampleRate > 0, hardware.channelCount > 0 else {
                     AppController.note("bt_reattach_format_refused=1 reason=invalid_hardware hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch")
                     throw InPlaceFormatError(errorCode: 1, reason: "invalid_hardware")
