@@ -82,3 +82,6 @@ Raza (2026-11-05 23:5x): "pressing the two command keys isn't doing anything; it
 
 ## v1.29.2 — 2026-11-07
 - An Archie conversation on a Bluetooth headset starts its microphone at the headset's real rate the first time, instead of failing once and rebuilding. Cancelling while the headset microphone is restarting no longer starts the microphone again for a dictation that has ended.
+
+## v1.29.3 — 2026-11-07
+- A dictation on a Bluetooth headset that re-attaches its microphone after the headset switches to call mode now starts at the headset's real rate instead of failing and giving up.
