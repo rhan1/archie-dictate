@@ -1517,8 +1517,7 @@ public final class AudioRecorder: CaptureEngine {
                 if self.lock.withLock({ self.instrumentation.backend == .auhal }) {
                     try self.startHeadsetUnit(epoch: epoch)            // v1.12 (L3): the AUHAL arm's restart
                 } else {
-                    try self.rebuild()
-                    try self.installTapAndStart()
+                    try self.rebuildEngineAndStart()      // 1.29.2 D1: the same production calls, drivable beneath the seam
                 }
             }
             let activated = self.lock.withLock {
@@ -2154,6 +2153,7 @@ public final class AudioRecorder: CaptureEngine {
     func offlineStartInput(at time: TimeInterval,
         now: (() -> TimeInterval)? = nil,
         note: (String) -> Void = { AppController.note($0) },
+        bridge: Bool = false,
         make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit) throws {
         let epoch = lock.withLock { engineEpoch }
         try holdLease(epoch: epoch, wait: 0)
@@ -2171,6 +2171,13 @@ public final class AudioRecorder: CaptureEngine {
             feed.sourceStarted(.headset, at: time)
             captureBoundary = time
             _ = feed.recordingStarted(at: time)
+        }
+        // 1.29.2 D1 fixture: production's start-time bridge/episode/guard configuration and the lease's headset part
+        // (`start` runs both before the input starts), so a dictation fixture's headset recovery runs the real episode
+        // and its release waits for the headset teardown. Default: unchanged.
+        if bridge {
+            configureBridge(device: selectedDevice, epoch: epoch)
+            _ = lock.withLock { lease?.started(.headset) }
         }
         try startCaptureInput(now: now ?? { time }, note: note, make: make)
         let settledRoute = route.effectiveRoute()
