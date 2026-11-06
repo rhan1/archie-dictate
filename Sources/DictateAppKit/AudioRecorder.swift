@@ -1515,8 +1515,9 @@ public final class AudioRecorder: CaptureEngine {
         defer { lock.withLock { restarting = false } }
         // 1.29.2 D1: a stop (cancel or finish) can land while this restart runs. Nothing starts IO for that dead
         // session; a start that already ran is stopped only after the voice link had time to form.
-        var cancelled: String?                     // before_start | after_start
+        var cancelled: String?                     // before_start | during_start | after_start
         var settleMs = 0
+        var nativeError: String?                   // FR1-A: a native error a dead session's start threw
         let live = { self.lock.withLock { self.engineEpoch === epoch } }
         // Same shape as a cold start: a fresh engine, never the stopped one (its input
         // format reads 0 Hz while the headset is back on A2DP).
@@ -1557,9 +1558,16 @@ public final class AudioRecorder: CaptureEngine {
             self.recording = true
         }, startWhenBusy: !builtinCarries, isCancelled: { !live() }, note: { error in
             self.teardownEngine()
-            // 1.29.2 D1: a dead session's restart is a cancellation, never a restart error (no recovery follows).
-            if error is CancellationError, !live() {
-                if cancelled == nil { cancelled = "after_start" }   // the AUHAL arm's own post-start stale stop
+            // 1.29.2 D1 / FR1-A: whatever was thrown, a restart whose session already ended is a cancellation — never
+            // a restart error, never counted, never a busy retry. The session's validity decides, not the error type.
+            if !live() {
+                if error is CancellationError {
+                    if cancelled == nil { cancelled = "after_start" }   // the AUHAL arm's own post-start stale stop
+                } else {
+                    let native = error as NSError
+                    nativeError = "\(native.domain):\(native.code)"
+                    if cancelled == nil { cancelled = "during_start" }  // the stop landed while the native start ran
+                }
                 return
             }
             self.lock.withLock { self.headsetRestartCounts.errors += 1 }
@@ -1585,6 +1593,7 @@ public final class AudioRecorder: CaptureEngine {
         delivery.drain()
         let restartLine = "headset_restart=1 path=\(path.rawValue) idle=\(outcome.deviceIdle ? 1 : 0) waited_ms=\(outcome.waitedMs) started=\(outcome.started ? 1 : 0)"
             + (cancelled.map { " cancelled=\($0) settle_ms=\(settleMs)" } ?? "")
+            + (nativeError.map { " native_error=\($0)" } ?? "")
         lock.withLock { lastHeadsetRestart = restartLine; headsetRestartCounts.restarts += 1 }
         AppController.note(restartLine)
         if cancelled != nil { return }                 // the session ended: no busy retry, no failure report
@@ -1802,7 +1811,8 @@ public final class AudioRecorder: CaptureEngine {
     /// 1.29.2: the conversation in-place apply may re-pin a stale output bus only on a plain (non-VPIO) engine that is
     /// stopped (the HFP bring-up stopped it). A running or voice-processing graph keeps today's nil-format tap.
     private func inPlaceMayReconcileFormat() -> Bool {
-        let plain = lock.withLock { stats.voiceProcessing == "off" || stats.voiceProcessing == "unavailable" }
+        // FR1-B: "fallback" is the same plain `.halout` engine after VPIO was refused; only "on" is a VPIO graph.
+        let plain = lock.withLock { ["off", "unavailable", "fallback"].contains(stats.voiceProcessing) }
         return plain && engineNative.isRunning() == false
     }
 

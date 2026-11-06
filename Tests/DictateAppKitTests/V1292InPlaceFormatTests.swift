@@ -125,4 +125,68 @@ struct V1292InPlaceFormatTests {
         #expect(kept >= 23_500 && kept <= 24_000)
         #expect(peak > 5_000 && peak < 12_000)
     }
+
+    // MARK: - FR1-B the plain fallback engine after VPIO was refused is reconciled too; a VPIO graph is not
+
+    /// A conversation with voice processing requested, evaluated while the route reads as the built-in (so VPIO is
+    /// attempted); `refuse` makes the VPIO unit report a multichannel input → the plain `.halout` fallback. Once a unit
+    /// starts, the route is the Bluetooth headset (default 77) the in-place apply binds to.
+    static func startVoiceProcessing(refuse: Bool, rig: V129.Rig) throws -> V129.Session {
+        rig.input = .builtin
+        let log = V61CaptureLifetimeTests.Log()
+        let builtin = V61CaptureLifetimeTests.FakeBuiltin("fr1b.builtin", log: log)
+        let headset = V61CaptureLifetimeTests.FakeHeadset("fr1b.headset", log: log)
+        let broker = CaptureLeaseBroker()
+        let recorder = AudioRecorder(builtin: { builtin }, headset: { headset }, backend: .engine, broker: broker, route: rig.probe)
+        recorder.kind = .conversation
+        recorder.conversationVoiceProcessingEnabled = true
+        let states = V129.States()
+        recorder.onConversationCaptureState = { states.append($0) }
+        let make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit = { [weak recorder] unit in
+            var u = CaptureInputUnit(start: {
+                rig.input = .bluetooth
+                try recorder?.offlineInstallConvertingTapAndStart()
+            }, dispose: {})
+            if unit == .vpio, refuse { u.hardwareChannels = { 3 } }   // refused: multichannel_input → plain fallback
+            return u
+        }
+        recorder.offlineConversationEngine = OfflineConversationEngine(
+            native: { rig.engine.native }, rebuild: { try rig.rebuild() }, make: make)
+        try recorder.offlineStartInput(at: ProcessInfo.processInfo.systemUptime, note: { _ in }, make: make)
+        return V129.Session(recorder: recorder, rig: rig, states: states, broker: broker)
+    }
+
+    static func vpApply(refuse: Bool) async throws -> (vp: String, gen1: String, requested: AVAudioFormat?, rebuilds: Int, note: String) {
+        let rig = V129.Rig(hardware: format(44_100))
+        let s = try startVoiceProcessing(refuse: refuse, rig: rig)
+        let vp = s.recorder.stats.voiceProcessing
+        let engine = rig.engine
+        engine.running = false
+        rig.hardware = format(16_000)
+        let taps = engine.tapFormats.count
+        s.recorder.observeConversationRoute(invalidated: true)
+        #expect(try await s.recorder.applyPendingConversationDeviceChange())
+        let note = s.recorder.conversationApplyNote
+        let requested = engine.tapFormats.dropFirst(taps).first.flatMap { $0 }
+        _ = s.recorder.stop()
+        _ = await s.recorder.awaitRelease()
+        return (vp, V129.outcome(note) == "I" ? "in_place" : "rebuild", requested, rig.rebuilds, note)
+    }
+
+    @Test func fr1bPlainFallbackAfterRefusedVPIOIsReconciled() async throws {
+        let o = try await Self.vpApply(refuse: true)
+        let green = o.vp == "fallback" && o.gen1 == "in_place" && o.requested?.sampleRate == 16_000
+        print("FR1-B \(green ? "GREEN" : "RED") vp=\(o.vp) gen1=\(o.gen1) requested_tap=\(Self.show(o.requested)) rebuilds=\(o.rebuilds) note=\(o.note)")
+        #expect(o.vp == "fallback")
+        #expect(o.gen1 == "in_place" && o.rebuilds == 0)
+        #expect(o.requested?.sampleRate == 16_000)
+    }
+
+    @Test func fr1bVPIOGraphIsNeverReconciled() async throws {
+        let o = try await Self.vpApply(refuse: false)
+        let reconcile = o.requested != nil ? 1 : 0
+        print("FR1-B CONTROL vp=\(o.vp) reconcile=\(reconcile) gen1=\(o.gen1) requested_tap=\(Self.show(o.requested))")
+        #expect(o.vp == "on")
+        #expect(reconcile == 0)
+    }
 }

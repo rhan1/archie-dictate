@@ -112,6 +112,54 @@ struct V1292RestartCancelTests {
         #expect(V129.field("started", line) == "0")
     }
 
+    /// FR1-A: the stop lands while the restart's native start runs, and that start then throws an NSError. The
+    /// session is dead, so this is a cancellation: one cancelled restart line carrying the native error, no
+    /// `headset_restart_error=`, no error count, and no busy retry (the device reads busy, so a7ce429-shaped code
+    /// would ask for another restart).
+    @Test func fr1aStopDuringANativeStartThatThrowsIsACancellationNotAnError() async throws {
+        let s = try Self.start(running: { _ in true })            // still running elsewhere: busy, started anyway
+        s.rig.onNewEngine = { [weak recorder = s.recorder] engine in
+            engine.startError = NSError(domain: "com.apple.coreaudio.avfaudio", code: -10875)
+            engine.onStart = {
+                engine.onStart = nil
+                if let recorder { Self.stopFromAnotherThread(recorder) }   // cancelled mid-start; the start then throws
+            }
+        }
+        let line = try #require(Self.silentHeadsetUntilRestart(s))
+        let atRestart = s.recorder.headsetRestartDiagnostics
+        try await Task.sleep(nanoseconds: 600_000_000)           // any follow-up request would surface here
+        let end = s.recorder.headsetRestartDiagnostics
+        _ = await Self.finish(s)
+        let cancelledNotes = V129.field("cancelled", line) != nil ? 1 : 0
+        let followups = end.requests - atRestart.requests
+        let green = cancelledNotes == 1 && end.errors == 0 && followups == 0
+        print("FR1-A \(green ? "GREEN" : "RED") notes_cancelled=\(cancelledNotes) restart_error=\(end.errors) followup_requests=\(followups) note=\(line)")
+        #expect(cancelledNotes == 1)
+        #expect(V129.field("native_error", line) == "com.apple.coreaudio.avfaudio:-10875")
+        #expect(end.errors == 0)
+        #expect(followups == 0)
+    }
+
+    /// FR1-C: the stop lands between the rebuild and the tap/start (the rig's new-engine hook runs in exactly that
+    /// window): the candidate engine is torn down without ever starting.
+    @Test func fr1cStopBetweenRebuildAndStartNeverStarts() async throws {
+        let s = try Self.start()
+        s.rig.onNewEngine = { [weak recorder = s.recorder] _ in
+            if let recorder { Self.stopFromAnotherThread(recorder) }
+        }
+        let line = try #require(Self.silentHeadsetUntilRestart(s))
+        let candidate = try #require(s.rig.engines.count > 1 ? s.rig.engines[1] : nil)
+        let starts = candidate.counts.starts
+        let errors = s.recorder.headsetRestartDiagnostics.errors
+        _ = await Self.finish(s)
+        let cancelled = V129.field("cancelled", line)
+        let green = starts == 0 && cancelled == "before_start" && errors == 0
+        print("FR1-C \(green ? "GREEN" : "RED") starts=\(starts) cancelled=\(cancelled ?? "none") restart_error=\(errors) note=\(line)")
+        #expect(starts == 0)
+        #expect(cancelled == "before_start")
+        #expect(errors == 0)
+    }
+
     @Test func twinStopInTheIdlePollNeverStarts() async throws {
         final class Box: @unchecked Sendable { weak var recorder: AudioRecorder?; var fired = false }
         let box = Box()
