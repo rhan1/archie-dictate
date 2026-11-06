@@ -118,15 +118,20 @@ struct V1292RestartCancelTests {
     /// would ask for another restart).
     @Test func fr1aStopDuringANativeStartThatThrowsIsACancellationNotAnError() async throws {
         let s = try Self.start(running: { _ in true })            // still running elsewhere: busy, started anyway
+        final class Snapshot: @unchecked Sendable { let lock = NSLock(); var requests: Int? }
+        let snapshot = Snapshot()
         s.rig.onNewEngine = { [weak recorder = s.recorder] engine in
             engine.startError = NSError(domain: "com.apple.coreaudio.avfaudio", code: -10875)
             engine.onStart = {
                 engine.onStart = nil
+                // Inside the restart, before its outcome: every request after this point is a follow-up.
+                let requests = recorder?.headsetRestartDiagnostics.requests
+                snapshot.lock.withLock { snapshot.requests = requests }
                 if let recorder { Self.stopFromAnotherThread(recorder) }   // cancelled mid-start; the start then throws
             }
         }
         let line = try #require(Self.silentHeadsetUntilRestart(s))
-        let atRestart = s.recorder.headsetRestartDiagnostics
+        let atRestart = (requests: try #require(snapshot.lock.withLock { snapshot.requests }), errors: 0)
         try await Task.sleep(nanoseconds: 600_000_000)           // any follow-up request would surface here
         let end = s.recorder.headsetRestartDiagnostics
         _ = await Self.finish(s)
