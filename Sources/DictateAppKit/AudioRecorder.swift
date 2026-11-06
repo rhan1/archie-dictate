@@ -1851,7 +1851,10 @@ public final class AudioRecorder: CaptureEngine {
                 AppController.note("bt_reattach_converted=1 hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch out=\(Int(output.sampleRate))Hz/\(output.channelCount)ch")
             }
             var requested: AVAudioFormat?
-            if reconciling {
+            // The explicit caller (the conversation in-place apply) keeps 1.29.2's refusal of invalid hardware even when
+            // the formats agree; a rule decided here refuses it only when it would re-pin to it — equal formats (even an
+            // invalid pair, e.g. a freshly rebuilt engine on a vanished input) keep today's nil tap exactly.
+            if reconciling, mismatch || reconcilingStaleOutput == true {
                 guard hardware.sampleRate > 0, hardware.channelCount > 0 else {
                     AppController.note("bt_reattach_format_refused=1 reason=invalid_hardware hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch")
                     throw InPlaceFormatError(errorCode: 1, reason: "invalid_hardware")
