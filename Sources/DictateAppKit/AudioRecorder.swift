@@ -724,15 +724,18 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     /// Today's engine-arm replacement: a fresh engine, its observer, and the voice-processing policy's start.
-    private func rebuildEngineAndStart() throws {
+    /// `beforeStart` (1.29.2 D1): runs between the rebuild and the tap/start; throwing skips the start.
+    private func rebuildEngineAndStart(beforeStart: (() throws -> Void)? = nil) throws {
         if let offline = offlineConversationEngine {
             try offline.rebuild()
+            try beforeStart?()
             try installTapAndStart(make: offline.make)
             return
         }
         try rebuild()
         if selectedDevice == .builtIn { try captureObjC { try AudioDevices.selectBuiltIn(on: requireEngine().inputNode) } }
         registerConfigurationObserver()
+        try beforeStart?()
         try installTapAndStart()
         if selectedDevice == .builtIn { checkBuiltinPin() }
     }
@@ -1503,6 +1506,11 @@ public final class AudioRecorder: CaptureEngine {
         }
         lock.withLock { restarting = true; restartEpoch = epoch }
         defer { lock.withLock { restarting = false } }
+        // 1.29.2 D1: a stop (cancel or finish) can land while this restart runs. Nothing starts IO for that dead
+        // session; a start that already ran is stopped only after the voice link had time to form.
+        var cancelled: String?                     // before_start | after_start
+        var settleMs = 0
+        let live = { self.lock.withLock { self.engineEpoch === epoch } }
         // Same shape as a cold start: a fresh engine, never the stopped one (its input
         // format reads 0 Hz while the headset is back on A2DP).
         let outcome = HeadsetRestart.perform(stop: {
@@ -1511,13 +1519,17 @@ public final class AudioRecorder: CaptureEngine {
         }, isRunningSomewhere: {
             device.flatMap { self.route.isRunningSomewhere($0) }
         }, sleep: { Thread.sleep(forTimeInterval: $0) }, start: {
-            guard self.lock.withLock({ self.engineEpoch === epoch }) else { throw CancellationError() }
+            guard live() else { cancelled = "before_start"; throw CancellationError() }
             self.verifyFrames(epoch: epoch, since: ProcessInfo.processInfo.systemUptime, path: path)    // armed before the start
             try self.headsetStartInFlight(epoch: epoch) {
                 if self.lock.withLock({ self.instrumentation.backend == .auhal }) {
                     try self.startHeadsetUnit(epoch: epoch)            // v1.12 (L3): the AUHAL arm's restart
                 } else {
-                    try self.rebuildEngineAndStart()      // 1.29.2 D1: the same production calls, drivable beneath the seam
+                    // 1.29.2 D1: the same production calls, drivable beneath the seam; a candidate engine built for a
+                    // session that ended meanwhile is torn down without being started.
+                    try self.rebuildEngineAndStart(beforeStart: {
+                        guard live() else { cancelled = "before_start"; self.teardownEngine(); throw CancellationError() }
+                    })
                 }
             }
             let activated = self.lock.withLock {
@@ -1525,12 +1537,27 @@ public final class AudioRecorder: CaptureEngine {
                     self.captureRunning = true
                 }
             }
-            guard activated else { self.teardownEngine(); throw CancellationError() }
+            guard activated else {
+                // 1.29.2 D1: started for a session that already ended: stop it once the link had time to form
+                // (a normal finish never stops IO inside the eSCO setup), never milliseconds after the start.
+                cancelled = "after_start"
+                let settle = BluetoothRecoveryEpisode.settleAfterStop
+                Thread.sleep(forTimeInterval: settle)
+                settleMs = Int((settle * 1000).rounded())
+                self.teardownEngine()
+                throw CancellationError()
+            }
             self.recording = true
-        }, startWhenBusy: !builtinCarries, note: { error in
+        }, startWhenBusy: !builtinCarries, isCancelled: { !live() }, note: { error in
             self.teardownEngine()
+            // 1.29.2 D1: a dead session's restart is a cancellation, never a restart error (no recovery follows).
+            if error is CancellationError, !live() {
+                if cancelled == nil { cancelled = "after_start" }   // the AUHAL arm's own post-start stale stop
+                return
+            }
             AppController.note("headset_restart_error=\(error as NSError)")
         })
+        if outcome.cancelled, cancelled == nil { cancelled = "before_start" }
         var switchNotes: [String] = []
         let carried: (nothing: Bool, event: CaptureBridge.Event?) = lock.withLock {
             guard engineEpoch === epoch else { return (false, nil) }
@@ -1548,7 +1575,9 @@ public final class AudioRecorder: CaptureEngine {
             return (out.event == nil && !out.deferred, out.event)
         }
         delivery.drain()
-        AppController.note("headset_restart=1 path=\(path.rawValue) idle=\(outcome.deviceIdle ? 1 : 0) waited_ms=\(outcome.waitedMs) started=\(outcome.started ? 1 : 0)")
+        AppController.note("headset_restart=1 path=\(path.rawValue) idle=\(outcome.deviceIdle ? 1 : 0) waited_ms=\(outcome.waitedMs) started=\(outcome.started ? 1 : 0)"
+            + (cancelled.map { " cancelled=\($0) settle_ms=\(settleMs)" } ?? ""))
+        if cancelled != nil { return }                 // the session ended: no busy retry, no failure report
         if outcome.externalBusy {
             AppController.note("bt_external_busy=1 device=\(device.map(String.init) ?? "?") builtin_carries=\(builtinCarries ? 1 : 0)")
             // At most one more attempt this dictation, admitted like any other (no spin).
@@ -1854,7 +1883,11 @@ public final class AudioRecorder: CaptureEngine {
         let clean = CaptureConfigurationRecovery.teardown(calls) {
             AppController.note("mic_teardown_error=\($0 as NSError)")
         }
-        if hadEngine { lock.withLock { ioGuard.finished(.stop, ok: clean) } }
+        if hadEngine {
+            lock.withLock { ioGuard.finished(.stop, ok: clean) }
+            // 1.29.2 D1 (diagnostics only): whether every native teardown call succeeded; nil engine is not proof.
+            AppController.note("headset_teardown_complete ok=\(clean ? 1 : 0)")
+        }
     }
 
     /// v1.12 (L3): start the explicit-device AUHAL headset client on the headset's UID. Its frames

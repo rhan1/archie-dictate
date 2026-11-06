@@ -59,26 +59,34 @@ public enum HeadsetRestart {
         public var started: Bool
         /// Our units were stopped and the device still ran: another client holds it.
         public var externalBusy = false
-        public init(waitedMs: Int, deviceIdle: Bool, started: Bool, externalBusy: Bool = false) {
+        /// 1.29.2 D1: the session ended before the start (`isCancelled`): nothing was started, no busy verdict.
+        public var cancelled = false
+        public init(waitedMs: Int, deviceIdle: Bool, started: Bool, externalBusy: Bool = false, cancelled: Bool = false) {
             self.waitedMs = waitedMs; self.deviceIdle = deviceIdle; self.started = started
-            self.externalBusy = externalBusy
+            self.externalBusy = externalBusy; self.cancelled = cancelled
         }
     }
     /// `isRunningSomewhere` returns nil when the property cannot be read (treated as running).
     /// `stop` returns whether every owned IO unit is confirmed stopped (false: no busy verdict).
+    /// `isCancelled` (1.29.2 D1): the session this restart serves has ended. Polled in the idle loop and once more
+    /// before `start`: a cancelled restart returns `cancelled` without starting anything (and without `note`).
     public static func perform(stop: () -> Bool, isRunningSomewhere: () -> Bool?,
                                sleep: (TimeInterval) -> Void, start: () throws -> Void,
-                               startWhenBusy: Bool = true, note: (Error) -> Void) -> Outcome {
+                               startWhenBusy: Bool = true, isCancelled: () -> Bool = { false },
+                               note: (Error) -> Void) -> Outcome {
         let ownStopped = stop()
         var waited: TimeInterval = 0
+        func ms() -> Int { Int((waited * 1000).rounded()) }
         var idle = isRunningSomewhere() == false
         while !idle, waited + pollStep <= idlePoll + 0.000001 {
+            if isCancelled() { return Outcome(waitedMs: ms(), deviceIdle: idle, started: false, cancelled: true) }
             sleep(pollStep)
             waited += pollStep
             idle = isRunningSomewhere() == false
         }
         sleep(settle)
         waited += settle
+        if isCancelled() { return Outcome(waitedMs: ms(), deviceIdle: idle, started: false, cancelled: true) }
         let busy = ownStopped && !idle && isRunningSomewhere() == true
         var started = false
         if !busy || startWhenBusy {
