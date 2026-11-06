@@ -40,6 +40,12 @@ public final class AudioRecorder: CaptureEngine {
     /// 1.29 (diagnostics/tests): the last engine-arm apply's `conv_apply=` line ("none": no apply yet).
     private var lastConversationApply = "none"
     var conversationApplyNote: String { lock.withLock { lastConversationApply } }
+    /// 1.29.2 D1 (diagnostics/tests, like `conversationApplyNote`): this recorder's last `headset_restart=1 path=…`
+    /// line, and how many restarts ran, `headset_restart_error=` lines it wrote and dictation restart requests it made.
+    private var lastHeadsetRestart = "none"
+    private var headsetRestartCounts = (restarts: 0, errors: 0, requests: 0)
+    var headsetRestartNote: String { lock.withLock { lastHeadsetRestart } }
+    var headsetRestartDiagnostics: (restarts: Int, errors: Int, requests: Int) { lock.withLock { headsetRestartCounts } }
     /// 1.29 test seam: nil in production (this recorder's AVAudioEngine).
     var offlineConversationEngine: OfflineConversationEngine?
     private var failureReported = false
@@ -1427,6 +1433,7 @@ public final class AudioRecorder: CaptureEngine {
         }
         let now = ProcessInfo.processInfo.systemUptime
         let admission: BluetoothRecoveryEpisode.Admission? = lock.withLock {
+            headsetRestartCounts.requests += 1
             guard engineEpoch === epoch else { return .exhausted }
             guard !inputMoved else { return nil }                          // BT1: never the old device
             let admission = episode.request(path, at: now)
@@ -1555,6 +1562,7 @@ public final class AudioRecorder: CaptureEngine {
                 if cancelled == nil { cancelled = "after_start" }   // the AUHAL arm's own post-start stale stop
                 return
             }
+            self.lock.withLock { self.headsetRestartCounts.errors += 1 }
             AppController.note("headset_restart_error=\(error as NSError)")
         })
         if outcome.cancelled, cancelled == nil { cancelled = "before_start" }
@@ -1575,8 +1583,10 @@ public final class AudioRecorder: CaptureEngine {
             return (out.event == nil && !out.deferred, out.event)
         }
         delivery.drain()
-        AppController.note("headset_restart=1 path=\(path.rawValue) idle=\(outcome.deviceIdle ? 1 : 0) waited_ms=\(outcome.waitedMs) started=\(outcome.started ? 1 : 0)"
-            + (cancelled.map { " cancelled=\($0) settle_ms=\(settleMs)" } ?? ""))
+        let restartLine = "headset_restart=1 path=\(path.rawValue) idle=\(outcome.deviceIdle ? 1 : 0) waited_ms=\(outcome.waitedMs) started=\(outcome.started ? 1 : 0)"
+            + (cancelled.map { " cancelled=\($0) settle_ms=\(settleMs)" } ?? "")
+        lock.withLock { lastHeadsetRestart = restartLine; headsetRestartCounts.restarts += 1 }
+        AppController.note(restartLine)
         if cancelled != nil { return }                 // the session ended: no busy retry, no failure report
         if outcome.externalBusy {
             AppController.note("bt_external_busy=1 device=\(device.map(String.init) ?? "?") builtin_carries=\(builtinCarries ? 1 : 0)")
