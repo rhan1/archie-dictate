@@ -596,7 +596,7 @@ public final class AudioRecorder: CaptureEngine {
             } else if applying.inPlace {
                 // 1.29: the same engine, its configuration observer kept; a throwing retap/start rebuilds as before.
                 do {
-                    try installConvertingTapAndStart()
+                    try installConvertingTapAndStart(reconcilingStaleOutput: inPlaceMayReconcileFormat())
                     noteConversationApply(applying.note)
                 } catch {
                     applying.fallBack(reason: "in_place_failed", error: error)
@@ -1752,21 +1752,59 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
-    /// The hands-off re-attach: tap in the input node's current output format (nil = whatever the
-    /// bus delivers; never a format-mismatch exception), converted to 24 kHz per buffer in `consume`.
-    private func installConvertingTapAndStart() throws {
+    /// 1.29.2: why a conversation's in-place apply did not start natively (its caller falls back to the rebuild).
+    /// Rendered on the `conv_apply=` line as `err=dictate.in_place_format:<1 invalid hardware | 2 output not reconciled>`.
+    struct InPlaceFormatError: CustomNSError, CustomStringConvertible {
+        static let errorDomain = "dictate.in_place_format"
+        let errorCode: Int
+        let reason: String
+        var description: String { "in_place_format:\(reason)" }
+    }
+
+    /// 1.29.2: the conversation in-place apply may re-pin a stale output bus only on a plain (non-VPIO) engine that is
+    /// stopped (the HFP bring-up stopped it). A running or voice-processing graph keeps today's nil-format tap.
+    private func inPlaceMayReconcileFormat() -> Bool {
+        let plain = lock.withLock { stats.voiceProcessing == "off" || stats.voiceProcessing == "unavailable" }
+        return plain && engineNative.isRunning() == false
+    }
+
+    /// The hands-off re-attach: tap in the input node's current output format (`nil`: the bus is left as it is),
+    /// converted to 24 kHz per buffer in `consume`. A nil tap never fixes a stale output bus: when the hardware rate
+    /// or channel count differs from the node's output format, `AVAudioEngine.start()` throws
+    /// `com.apple.coreaudio.avfaudio -10868` (the 11-06 gen-1 failure: hw 16 kHz, out 44.1 kHz).
+    ///
+    /// 1.29.2 `reconcilingStaleOutput` (the conversation in-place apply only): on such a mismatch the tap is installed
+    /// WITH the freshly read hardware format and the node's output format is verified to match before prepare/start;
+    /// an invalid hardware format (0 Hz / 0 channels) throws before any native start. Equal formats keep `nil`.
+    private func installConvertingTapAndStart(reconcilingStaleOutput: Bool = false) throws {
         let native = engineNative                  // 1.29: this recorder's AVAudioEngine (or the offline seam's fake)
         try captureObjC {
             let (hardware, output) = try native.formats()
-            if hardware.sampleRate != output.sampleRate || hardware.channelCount != output.channelCount {
+            let mismatch = hardware.sampleRate != output.sampleRate || hardware.channelCount != output.channelCount
+            if mismatch {
                 AppController.note("bt_reattach_converted=1 hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch out=\(Int(output.sampleRate))Hz/\(output.channelCount)ch")
+            }
+            var requested: AVAudioFormat?
+            if reconcilingStaleOutput {
+                guard hardware.sampleRate > 0, hardware.channelCount > 0 else {
+                    AppController.note("bt_reattach_format_refused=1 reason=invalid_hardware hw=\(Int(hardware.sampleRate))Hz/\(hardware.channelCount)ch")
+                    throw InPlaceFormatError(errorCode: 1, reason: "invalid_hardware")
+                }
+                if mismatch { requested = hardware }
             }
             lock.withLock { converter = nil }      // built from the first buffer's own format
             let token = CaptureEpoch()
             lock.withLock { tapEpoch = token }
             tapInstalled = true
-            try native.installTap(nil) { [weak self] buffer, time in
+            try native.installTap(requested) { [weak self] buffer, time in
                 self?.consume(buffer, time: time, epoch: token)
+            }
+            if let requested {
+                let after = try native.formats().output
+                AppController.note("bt_reattach_reformatted=1 hw=\(Int(requested.sampleRate))Hz/\(requested.channelCount)ch out_before=\(Int(output.sampleRate))Hz/\(output.channelCount)ch out_after=\(Int(after.sampleRate))Hz/\(after.channelCount)ch")
+                guard after.sampleRate == requested.sampleRate, after.channelCount == requested.channelCount else {
+                    throw InPlaceFormatError(errorCode: 2, reason: "output_not_reconciled")
+                }
             }
             try native.prepare()
             try ioOp(.start) { try native.start() }
