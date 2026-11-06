@@ -40,6 +40,7 @@ struct V129InPlaceRouteApplyTests {
         private var _output: AVAudioFormat
         private var _tapFormats: [AVAudioFormat?] = []
         private var _startErrors: [NSError] = []
+        private var _startTimes: [TimeInterval] = [], _removeTimes: [TimeInterval] = []
 
         init(id: Int, device: AudioDeviceID?, hardware: AVAudioFormat) {
             self.id = id
@@ -61,6 +62,9 @@ struct V129InPlaceRouteApplyTests {
         var tapFormats: [AVAudioFormat?] { lock.withLock { _tapFormats } }
         /// Every native format refusal `start()` returned, in order.
         var startErrors: [NSError] { lock.withLock { _startErrors } }
+        /// 1.29.2 D1: uptime of every successful start / tap removal on this engine.
+        var startTimes: [TimeInterval] { lock.withLock { _startTimes } }
+        var removeTimes: [TimeInterval] { lock.withLock { _removeTimes } }
         static func agree(_ a: AVAudioFormat, _ b: AVAudioFormat) -> Bool {
             a.sampleRate == b.sampleRate && a.channelCount == b.channelCount
         }
@@ -95,6 +99,7 @@ struct V129InPlaceRouteApplyTests {
                         self.removes += 1
                         if let e = self.removeError { throw e }
                         self._tap = nil
+                        self._removeTimes.append(ProcessInfo.processInfo.systemUptime)
                     }
                 },
                 prepare: {},
@@ -109,6 +114,7 @@ struct V129InPlaceRouteApplyTests {
                             throw e
                         }
                         self._running = true
+                        self._startTimes.append(ProcessInfo.processInfo.systemUptime)
                     }
                 },
                 boundDevice: { self.device },
@@ -141,6 +147,8 @@ struct V129InPlaceRouteApplyTests {
         var rebuildError: Error?
         /// The device a newly built engine binds to (nil: the current default).
         var nextEngineDevice: AudioDeviceID??
+        /// 1.29.2 D1: called (outside the rig lock) with every engine a rebuild creates, before it is used.
+        var onNewEngine: ((FakeEngine) -> Void)?
         private var _hardware: AVAudioFormat
 
         init(hardware: AVAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!) {
@@ -180,12 +188,15 @@ struct V129InPlaceRouteApplyTests {
         var engines: [FakeEngine] { lock.withLock { _engines } }
 
         func rebuild() throws {
-            try lock.withLock {
+            let fresh = try lock.withLock { () -> FakeEngine in
                 if let e = rebuildError { throw e }
                 rebuilds += 1
                 let device: AudioDeviceID? = nextEngineDevice ?? _defaultDevice
-                _engines.append(FakeEngine(id: _engines.count, device: device, hardware: _hardware))
+                let engine = FakeEngine(id: _engines.count, device: device, hardware: _hardware)
+                _engines.append(engine)
+                return engine
             }
+            onNewEngine?(fresh)
         }
 
         var probe: CaptureRouteProbe {
