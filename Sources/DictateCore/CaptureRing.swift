@@ -162,8 +162,10 @@ public struct CaptureFeed {
         ring = CaptureRing(capacity: ringCapacity)
     }
 
+    /// 1.29.4 (H): `startupPolicy` = the recorder's explicit choice for this capture's health (default: none).
     public mutating func start(defaultInput: CaptureBridge.DefaultInput, hasBuiltin: Bool,
-                               epoch: CaptureEpoch = CaptureEpoch()) {
+                               epoch: CaptureEpoch = CaptureEpoch(),
+                               startupPolicy: CaptureHealth.StartupPolicy = .standard) {
         bridge.start(defaultInput: defaultInput, hasBuiltin: hasBuiltin, epoch: epoch)
         ring.removeAll()
         standby.removeAll()
@@ -173,7 +175,7 @@ public struct CaptureFeed {
         aligned = false
         alignNote = nil
         extraNotes = []
-        health = CaptureHealth()
+        health = CaptureHealth(startupPolicy: startupPolicy)
         health.bluetooth = defaultInput == .bluetooth
         evidence = CaptureEvidence()
         timeline = SourceTimeline()
@@ -188,7 +190,10 @@ public struct CaptureFeed {
     /// preserving the recording boundary, bridge, evidence, timeline and captured frames.
     public mutating func restartInputHealth(at time: TimeInterval) { health.restartInput(at: time) }
     /// v1.27 (B1): the headset client's start or re-attach was called (true) / returned (false).
-    public mutating func headsetStart(inFlight: Bool) { health.headsetStart(inFlight: inFlight) }
+    /// 1.29.4 (H): `time` = when it returned (the startup grace's first-start return).
+    public mutating func headsetStart(inFlight: Bool, at time: TimeInterval? = nil) {
+        health.headsetStart(inFlight: inFlight, at: time)
+    }
     /// v1.27 (B1): a new built-in unit replaces a lost one (its start returns → `sourceStarted`).
     public mutating func builtinRestarting() { health.sourceRestarting(.builtin) }
     /// The device read-back or listener found a problem with a source.

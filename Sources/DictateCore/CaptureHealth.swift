@@ -27,6 +27,15 @@ public struct CaptureHealth: Sendable {
     /// re-attach is in flight, and nothing delivered yet waits for the headset up to this cap from the
     /// session start (`mic_dead` still fires here). A non-Bluetooth input keeps `failAfter`.
     public static let bluetoothNoInputCap: TimeInterval = 4.0
+    /// 1.29.4 (H): the recorder's explicit startup policy for this capture (never inferred from `bluetooth`).
+    public enum StartupPolicy: String, Sendable {
+        /// v1.8/v1.27 deadlines only.
+        case standard
+        /// A non-Bluetooth input's startup grace: while no source has delivered a buffer, `mic_dead` waits
+        /// for the capture's first native start — `min(boundary + bluetoothNoInputCap, max(boundary + failAfter,
+        /// startReturned + builtinGrace))` from the ORIGINAL recording boundary, the cap while it is in flight.
+        case nonBluetoothGrace = "non_bluetooth_grace"
+    }
     public static let silencePeak: Float = CaptureBridge.silencePeak
     private static let rate = 24_000.0
 
@@ -73,11 +82,25 @@ public struct CaptureHealth: Sendable {
     public var bluetooth = false
     /// v1.27 (B1): the headset's start or re-attach has been called and has not returned.
     public private(set) var headsetInFlight = false
+    /// 1.29.4 (H): fixed for this capture when the recorder starts it.
+    public let startupPolicy: StartupPolicy
+    /// 1.29.4 (H): the first recording boundary of this capture; a later boundary (re-listen) never moves it.
+    private var graceBoundary: TimeInterval?
+    /// 1.29.4 (H): the capture's FIRST native start — a retry/re-attach never renews it.
+    private enum FirstStart: Equatable { case none, inFlight, returned(TimeInterval?) }
+    private var firstStart = FirstStart.none
+    /// 1.29.4 (H): any source delivered a buffer (exact zeros included): the startup grace is over for good.
+    private var delivered = false
 
-    public init() {}
+    public init(startupPolicy: StartupPolicy = .standard) { self.startupPolicy = startupPolicy }
 
     /// v1.27 (B1): the recorder calls the headset client's start/re-attach (true) and it returned (false).
-    public mutating func headsetStart(inFlight: Bool) { headsetInFlight = inFlight }
+    /// 1.29.4 (H): `time` = when it returned (host clock); only the capture's first start is remembered.
+    public mutating func headsetStart(inFlight: Bool, at time: TimeInterval? = nil) {
+        headsetInFlight = inFlight
+        if inFlight, firstStart == .none { firstStart = .inFlight }
+        if !inFlight, firstStart == .inFlight { firstStart = .returned(time) }
+    }
 
     /// v1.27 (B1): the headset cannot carry yet — its start is in flight, or it is inside its startup
     /// grace without a first buffer.
@@ -119,6 +142,7 @@ public struct CaptureHealth: Sendable {
 
     public mutating func recordingStarted(at time: TimeInterval) {
         boundary = time
+        if graceBoundary == nil { graceBoundary = time }
         firstInputSince = time
         lastUseful = nil
         warned = nil
@@ -139,6 +163,7 @@ public struct CaptureHealth: Sendable {
     @discardableResult
     public mutating func buffer(_ source: Source, at time: TimeInterval, frames: Int, peak: Float) -> Bool {
         guard frames > 0 else { return false }
+        delivered = true
         var started = false
         update(source) { s in
             // A source that delivers is part of the dictation even without an explicit start.
