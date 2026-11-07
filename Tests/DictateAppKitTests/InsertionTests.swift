@@ -142,31 +142,55 @@ struct InsertionTests {
         #expect(pb.string(forType: .string) == "ORIGINAL")
     }
 
-    /// RED twin: the v1.11 wall-clock form under a 1.2 s stall of the queue the restore window runs
-    /// on (a private queue standing in for a loaded main queue — never stall the shared main queue
-    /// in a parallel suite): the 750 ms wall-clock wait elapses before the 600 ms reader could run.
+    /// RED twin: the wall-clock sample elapses while the reader's queue is provably stalled.
+    /// The sampling interval is real; the stall ends only AFTER the reader-side assertion.
     @Test func recipientReadsDictationAfter600MillisecondsRealClockUnderStallRed() async {
         let pb = seededPasteboard()
         defer { pb.releaseGlobally() }
         let box = ReaderBox()
         let loaded = DispatchQueue(label: "insertion-tests.loaded")
+        let stallEntered = DispatchSemaphore(value: 0)
+        let releaseStall = DispatchSemaphore(value: 0)
+        let completed = DispatchSemaphore(value: 0)
         let inserter = TextInserter(pasteboard: pb, postKeystroke: {
+            loaded.async {
+                stallEntered.signal()
+                if releaseStall.wait(timeout: .now() + 10) != .success {
+                    Issue.record("T3 insertion stall was not released within 10s")
+                }
+            }
             loaded.asyncAfter(deadline: .now() + 0.6) { box.value = pb.string(forType: .string) }
-            loaded.asyncAfter(deadline: .now() + 0.1) { Thread.sleep(forTimeInterval: 1.2) }   // the stall: busy 0.1–1.3 s
-        }, schedule: { delay, work in loaded.asyncAfter(deadline: .now() + delay, execute: work) })
-        inserter.insert("DICTATION")
-        let seen = await Task.detached { () -> String? in
-            try? await Task.sleep(nanoseconds: 750_000_000)
-            return box.value
-        }.value
+        }, schedule: { delay, work in loaded.asyncAfter(deadline: .now() + delay, execute: work) },
+            axReader: { box.value.map { [$0] } ?? [] })
+        inserter.insert("DICTATION", completion: { completed.signal() })
+        let entered = await Task.detached { stallEntered.wait(timeout: .now() + 10) == .success }.value
+        #expect(entered, "T3 insertion queue did not enter its stall within 10s")
+        // This timer supplies the original 750ms sampling interval, never the stall ordering.
+        let sample = ReaderBox()
+        let sampled = DispatchSemaphore(value: 0)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.75) {
+            sample.value = box.value
+            sampled.signal()
+        }
+        let sampledInTime = await Task.detached { sampled.wait(timeout: .now() + 10) == .success }.value
+        #expect(sampledInTime, "T3 insertion wall-clock sample did not arrive within 10s")
+        let seen = sample.value
         withKnownIssue("a loaded queue breaks the wall-clock reader bound") {
             #expect(seen == "DICTATION")
         }
+        releaseStall.signal()
+        let drained = await Task.detached { completed.wait(timeout: .now() + 10) == .success }.value
+        #expect(drained, "T3 insertion did not complete after releasing the stall within 10s")
         loaded.sync {}                                         // no callback outlives this pasteboard
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        loaded.sync {}
     }
-    final class ReaderBox: @unchecked Sendable { var value: String? }
+    final class ReaderBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: String?
+        var value: String? {
+            get { lock.withLock { stored } }
+            set { lock.withLock { stored = newValue } }
+        }
+    }
 }
 
 /// F1 initially has no helper to call. Check the actual controller's contract
