@@ -213,7 +213,11 @@ struct CaptureLeaseRecorderTests {
         let broker = CaptureLeaseBroker()
         let (recorder, builtin, headset) = Self.recorder("A", log, broker: broker)
         let firstBuffer = Log()
-        recorder.onFirstBuffer = { firstBuffer.append("first") }
+        let firstBufferArrived = DispatchSemaphore(value: 0)
+        recorder.onFirstBuffer = {
+            firstBuffer.append("first")
+            firstBufferArrived.signal()
+        }
         try await recorder.startAsync(device: .default)
         #expect(log.all.contains("A.headset.start uid=\(Self.headsetUID)"))
         recorder.resetCapture()
@@ -223,7 +227,10 @@ struct CaptureLeaseRecorderTests {
             if step >= 3 { headset.deliver(0.1, at: t) }           // signal from 300 ms: takeover after 150 ms
             t += 0.1
         }
-        await MainActor.run {}                                    // FIFO: the first-buffer hop to main ran before this
+        let heardFirstBuffer = await Task.detached {
+            firstBufferArrived.wait(timeout: .now() + 10) == .success
+        }.value
+        #expect(heardFirstBuffer, "T3 onFirstBuffer did not arrive within 10s")
         #expect(firstBuffer.all == ["first"])                     // the lifecycle's watchdog hears it
         _ = recorder.stop()
         #expect(recorder.stats.firstBufferMs != nil)
