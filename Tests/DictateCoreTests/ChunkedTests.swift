@@ -442,8 +442,10 @@ struct GroqChunkedTests {
 
     @Test func transcriberFinalSplitUploadsBothConcurrently() async throws {
         let transport = ChunkTransport()
+        // T2 row 30: the hedge timer runs on a clock that never moves, so a loaded suite cannot
+        // fire a wall-clock hedge while the test holds both responses (hedges must stay 0).
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" }, prompt: "",
-            firstMinimumSeconds: 7, firstMaximumSeconds: 8, finalSplitSeconds: 2.0)
+            firstMinimumSeconds: 7, firstMaximumSeconds: 8, finalSplitSeconds: 2.0, clock: ManualClock())
         let pcm = [Int16](repeating: 1000, count: 100_800) +
             [Int16](repeating: 400, count: 2_400) + [Int16](repeating: 2000, count: 40_800)
         engine.append(pcm)
