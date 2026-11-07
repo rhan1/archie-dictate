@@ -218,12 +218,35 @@ struct CaptureLeaseTests {
     }
 
     @Test func swiftConcurrencyAcquireAwaitsTheRelease() async {
-        let broker = CaptureLeaseBroker()
+        let clock = Clock()
+        let waiting = DispatchSemaphore(value: 0)
+        let broker = CaptureLeaseBroker(clock: { clock.now }, schedule: { delay, work in
+            clock.schedule(delay, work)
+            // request schedules its expiry only AFTER registering the waiter.
+            if delay == CaptureLeaseBroker.releaseWait { waiting.signal() }
+        })
         guard case .success(let old) = broker.tryAcquire(.dictation) else { Issue.record("no lease"); return }
         old.started(.headset)
         old.release()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { old.partReleased(.headset) }
-        let result = await broker.acquire(.conversation)
+        let outcomes = Box<Outcome>()
+        let acquired = DispatchSemaphore(value: 0)
+        let acquisition = Task {
+            outcomes.append(await broker.acquire(.conversation))
+            acquired.signal()
+        }
+        defer { acquisition.cancel() }
+        let registered = await Task.detached {
+            waiting.wait(timeout: .now() + 10) == .success
+        }.value
+        #expect(registered, "T3 lease acquirer did not register its waiter within 10s")
+        // Broker time, including waitedMs, is virtual. Release only after the waiter exists.
+        clock.advance(to: 0.05)
+        old.partReleased(.headset)
+        let completed = await Task.detached { acquired.wait(timeout: .now() + 10) == .success }.value
+        guard completed, let result = outcomes.all.first else {
+            Issue.record("T3 lease acquisition did not complete after release within 10s")
+            return
+        }
         guard case .success(let new) = result else { Issue.record("refused: \(result)"); return }
         #expect(new.waitedMs >= 30 && old.state == .released)
         #expect(await old.settled() == .released)
