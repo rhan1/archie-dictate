@@ -428,11 +428,21 @@ struct GroqChunkedTests {
 
     @Test(arguments: [false, true])
     func hedgeWaitsForFirstSuccess(primaryFails: Bool) async {
-        let transport = HedgeTransport(primaryFails ? .primaryFails : .duplicateFails)
+        // T2 row 31: one injected clock drives the hedge timer and both responses, so the
+        // order (hedge at 50 → the failing request → the winner) never depends on suite load.
+        let manual = ManualClock()
+        let transport = HedgeTransport(primaryFails ? .primaryFails : .duplicateFails, clock: manual)
         let engine = GroqChunkedTranscriber(transport: transport, apiKey: { "hermetic-key" },
-                                            prompt: "", hedgeAfterMs: 50)
+                                            prompt: "", hedgeAfterMs: 50, clock: manual)
         engine.submit(chunk(0, tag: 1000))
-        let result = await engine.finish()
+        let finishTask = Task { await engine.finish() }
+        #expect(await manual.waitForSleepers(2))                   // primary in flight + hedge timer
+        manual.advance(by: .milliseconds(50))                       // the hedge fires
+        #expect(await manual.waitForSleepers(2))                   // primary + duplicate in flight
+        manual.advance(by: .milliseconds(primaryFails ? 20 : 1))   // the failing request settles (70 / 51 ms)
+        #expect(await manual.waitForSleepers(1))                   // the winner is still in flight
+        manual.advance(by: .milliseconds(primaryFails ? 20 : 49))  // the winner answers (90 / 100 ms)
+        let result = await finishTask.value
         #expect(result.text == (primaryFails ? "duplicate" : "primary"))
         #expect(result.hedges == 1)
         #expect(result.hedgeWins == (primaryFails ? 1 : 0))
