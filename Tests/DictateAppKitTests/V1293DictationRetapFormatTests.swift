@@ -72,7 +72,7 @@ struct V1293DictationRetapFormatTests {
     /// Snapshots on the executor, before any failed-retap restart can mask the outcome. Failed cases stop
     /// immediately AFTER the snapshot, retaining the real restart request counter and error diagnostics.
     static func run(initial: AVAudioFormat = format(44_100), changed: AVAudioFormat,
-                    running: Bool = false, vpio: Bool = false,
+                    running: Bool = false, vpio: Bool = false, outputEqualsHardware: Bool = false,
                     keep: ((Session, Outcome, TimeInterval) throws -> Void)? = nil) async throws -> Outcome {
         let t0 = ProcessInfo.processInfo.systemUptime - 3
         let s = try start(initial: initial, at: t0, vpio: vpio)
@@ -86,6 +86,7 @@ struct V1293DictationRetapFormatTests {
             #expect(s.recorder.stats.configChanges == 0)
             engine.running = running
             s.rig.hardware = changed                         // hardware ONLY; output bus retains initial format
+            if outputEqualsHardware { engine.output = changed }   // T5-h: hardware AND output both read as `changed`
             let before = engine.output
             let starts = engine.counts.starts, successful = engine.startTimes.count
             let taps = engine.tapFormats.count, notes = s.recorder.retapDiagnostics.count
@@ -142,6 +143,8 @@ struct V1293DictationRetapFormatTests {
         print("D3 CONTROL equal hw=\(Self.show(o.hardware)) out=\(Self.show(o.before)) requested_tap=\(Self.show(o.requested))")
         #expect(o.taps.count == 1 && o.requested == nil)
         #expect(o.startError == "none" && o.result == "retapped" && o.running)
+        print("T5-h \(o.requested == nil && o.nativeStarts == 1 ? "GREEN" : "RED") valid_equal tap=\(Self.show(o.requested)) native_starts=\(o.nativeStarts)")
+        #expect(o.nativeStarts == 1)
     }
 
     @Test func runningGraphKeepsNil() async throws {
@@ -224,5 +227,20 @@ struct V1293DictationRetapFormatTests {
         Self.expectGreen(o)
         #expect(frames >= 23_000 && frames <= 25_000)
         #expect(peak > 5_000 && peak < 12_000)
+    }
+
+    // MARK: - T5-h equal invalid formats are refused too; T5-i diagnostics are per capture
+
+    @Test func equalInvalidFormatsNeverStartAndRequestExistingRecovery() async throws {
+        let invalid = AVAudioFormat()
+        let o = try await Self.run(changed: invalid, outputEqualsHardware: true)
+        #expect(invalid.sampleRate == 0 && invalid.channelCount == 0)
+        #expect(o.before.sampleRate == 0 && o.before.channelCount == 0)    // output equals hardware: not a mismatch
+        print("T5-h \(o.nativeStarts == 0 ? "GREEN" : "RED") equal_invalid native_starts=\(o.nativeStarts)")
+        #expect(o.nativeStarts == 0 && o.successfulStarts == 0)
+        #expect(o.result == "failed")
+        #expect(o.notes.contains { $0 == "config_retap_error=in_place_format:invalid_hardware" })
+        #expect(o.errors.contains { $0.domain == "dictate.in_place_format" && $0.code == 1 })
+        #expect(o.requests == 1)
     }
 }
