@@ -930,6 +930,7 @@ public final class AudioRecorder: CaptureEngine {
         let startedAt = ProcessInfo.processInfo.systemUptime
         lock.withLock {
             stats = CaptureStats()
+            retapNotes.removeAll(); retapErrors.removeAll()   // T5-i: diagnostics are per capture
             keptFrameCount = 0
             failureReported = false
             streamOverrun = false
@@ -2250,6 +2251,7 @@ public final class AudioRecorder: CaptureEngine {
         try holdLease(epoch: epoch, wait: 0)
         lock.withLock {
             stats = CaptureStats()
+            retapNotes.removeAll(); retapErrors.removeAll()   // T5-i: diagnostics are per capture
             keptFrameCount = 0
             failureReported = false
             streamOverrun = false

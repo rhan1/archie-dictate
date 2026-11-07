@@ -243,4 +243,32 @@ struct V1293DictationRetapFormatTests {
         #expect(o.errors.contains { $0.domain == "dictate.in_place_format" && $0.code == 1 })
         #expect(o.requests == 1)
     }
+
+    @Test func retapDiagnosticsAreClearedPerCapture() async throws {
+        let t0 = ProcessInfo.processInfo.systemUptime - 3
+        let s = try Self.start(initial: Self.format(44_100), at: t0)
+        let engine = s.rig.engine
+        let make: (CaptureVoiceProcessing.Unit) throws -> CaptureInputUnit = { [weak recorder = s.recorder] _ in
+            CaptureInputUnit(start: { try recorder?.offlineInstallConvertingTapAndStart() }, dispose: {})
+        }
+        func retap(to rate: Double, at time: TimeInterval) throws {
+            #expect(s.recorder.offlineConfigurationReattach(at: time, admitted: false))
+            engine.running = false
+            s.rig.hardware = Self.format(rate)
+            #expect(s.recorder.offlineConfigurationReattach(at: time + 1, completion: {}))
+        }
+        try retap(to: 16_000, at: t0)                               // capture 1: one reformat note
+        let first = s.recorder.retapDiagnostics
+        #expect(first.contains { $0.hasPrefix("bt_reattach_reformatted=1 hw=16000Hz") })
+        #expect(await D1.finish(s) == .released)
+        let t1 = ProcessInfo.processInfo.systemUptime
+        try s.recorder.offlineStartInput(at: t1, note: { _ in }, bridge: true, make: make)   // capture 2, same recorder
+        #expect(s.recorder.retapDiagnostics.isEmpty && s.recorder.retapErrorDiagnostics.isEmpty)
+        try retap(to: 24_000, at: t1)
+        let second = s.recorder.retapDiagnostics
+        print("T5-i \(second.count == 1 ? "GREEN" : "RED") second_capture_retap_notes=\(second.count)")
+        #expect(second.count == 1)
+        #expect(second.allSatisfy { !$0.contains("hw=16000Hz") } && second.first?.hasPrefix("bt_reattach_reformatted=1 hw=24000Hz") == true)
+        #expect(await D1.finish(s) == .released)
+    }
 }
