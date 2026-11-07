@@ -58,7 +58,8 @@ struct V1294StartupGraceTests {
         let policy = AudioRecorder.startupPolicy(initialStart: s.initialStart, bluetooth: s.bluetooth)
         result.policy = policy
         // configureBridge: the feed starts with the recorder's policy, then re-applies the existing boundary.
-        feed.start(defaultInput: s.bluetooth ? .bluetooth : .builtin, hasBuiltin: true, startupPolicy: policy)
+        // No built-in bridge (non-Bluetooth: `default_builtin`; Bluetooth: `no_builtin`): the headset client carries.
+        feed.start(defaultInput: s.bluetooth ? .bluetooth : .builtin, hasBuiltin: false, startupPolicy: policy)
         _ = feed.recordingStarted(at: boundary, preRoll: 0)
         feed.sourceStarted(.headset, at: boundary)
         feed.headsetStart(inFlight: true)                    // headsetStartInFlight: the native start begins
