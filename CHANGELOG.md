@@ -85,3 +85,6 @@ Raza (2026-11-05 23:5x): "pressing the two command keys isn't doing anything; it
 
 ## v1.29.3 — 2026-11-07
 - A dictation on a Bluetooth headset that re-attaches its microphone after the headset switches to call mode now starts at the headset's real rate instead of failing and giving up.
+
+## v1.29.4 — 2026-11-07
+- The first recording after Archie starts no longer gives up on the Mac's own microphone when it takes a little over two seconds to start; a microphone that is really dead is still caught.
