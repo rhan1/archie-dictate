@@ -314,10 +314,12 @@ public final class AudioRecorder: CaptureEngine {
 
     /// Runs on the headset executor, and starts the built-in unit on its own queue BEFORE the
     /// potentially blocking Bluetooth profile transition (first ⌥ tap).
-    private func configureBridge(device: MicChoice, epoch: CaptureEpoch) {
+    /// 1.29.4 (H): `initialStart` = the capture's own start (`start(device:)`), never a route apply or retry.
+    private func configureBridge(device: MicChoice, epoch: CaptureEpoch, initialStart: Bool = false) {
         guard lock.withLock({ !bridgeConfigured }) else { return }
         let eligibility = device == .default ? route.eligibility() : nil
         let bluetooth = eligibility?.0 == .bluetooth
+        let startupPolicy = Self.startupPolicy(initialStart: initialStart, bluetooth: bluetooth)
         let headset = bluetooth ? route.defaultInput() : nil
         let headsetUID = headset.flatMap(route.uid)
         // v1.13 (L2): the voice link was already up before this dictation's client started.
@@ -347,7 +349,8 @@ public final class AudioRecorder: CaptureEngine {
                 builtinWatch = CaptureExecutorWatch()
             }
             bridgeConfigured = true
-            feed.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch)
+            feed.start(defaultInput: eligibility?.0 ?? .other, hasBuiltin: eligibility?.1 ?? false, epoch: epoch,
+                       startupPolicy: startupPolicy)
             episode = BluetoothRecoveryEpisode(bluetooth: bluetooth)
             ioGuard = HeadsetIOGuard(bluetooth: bluetooth, warmRoute: warmRoute, transientRoute: startRoute == .transient)
             if warmRoute { feed.setWarmRoute() }
@@ -467,10 +470,20 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     /// v1.27 (B1): `CaptureHealth.failAfter` does not elapse while the headset's start/re-attach runs.
+    /// 1.29.4 (H): the return time (health's host clock) bounds a non-Bluetooth capture's startup grace.
     private func headsetStartInFlight<T>(epoch: CaptureEpoch, _ body: () throws -> T) rethrows -> T {
         lock.withLock { if engineEpoch === epoch { feed.headsetStart(inFlight: true) } }
-        defer { lock.withLock { if engineEpoch === epoch { feed.headsetStart(inFlight: false) } } }
+        defer {
+            let returned = ProcessInfo.processInfo.systemUptime
+            lock.withLock { if engineEpoch === epoch { feed.headsetStart(inFlight: false, at: returned) } }
+        }
         return try body()
+    }
+
+    /// 1.29.4 (H): a non-Bluetooth input's own start gets the startup grace (dictation and conversation alike);
+    /// Bluetooth keeps v1.27's rule, and a route apply/retry never gets a new one.
+    static func startupPolicy(initialStart: Bool, bluetooth: Bool) -> CaptureHealth.StartupPolicy {
+        initialStart && !bluetooth ? .nonBluetoothGrace : .standard
     }
 
 
@@ -913,7 +926,7 @@ public final class AudioRecorder: CaptureEngine {
             try rebuild()
         }
         selectedDevice = device
-        configureBridge(device: device, epoch: startEpoch)
+        configureBridge(device: device, epoch: startEpoch, initialStart: true)
         let startedAt = ProcessInfo.processInfo.systemUptime
         lock.withLock {
             stats = CaptureStats()
