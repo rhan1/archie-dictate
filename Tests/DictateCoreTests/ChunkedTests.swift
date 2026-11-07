@@ -442,7 +442,17 @@ struct GroqChunkedTests {
         manual.advance(by: .milliseconds(primaryFails ? 20 : 1))   // the failing request settles (70 / 51 ms)
         #expect(await manual.waitForSleepers(1))                   // the winner is still in flight
         manual.advance(by: .milliseconds(primaryFails ? 20 : 49))  // the winner answers (90 / 100 ms)
+        // Failure bound only, never synchronisation: a hedge that never fires leaves a request
+        // asleep on the manual clock; after 10 s wall, run the clock out so the test fails, not hangs.
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(10))
+            while !Task.isCancelled {
+                manual.advance(by: .seconds(10))
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
         let result = await finishTask.value
+        watchdog.cancel()
         #expect(result.text == (primaryFails ? "duplicate" : "primary"))
         #expect(result.hedges == 1)
         #expect(result.hedgeWins == (primaryFails ? 1 : 0))
