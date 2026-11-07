@@ -426,7 +426,7 @@ struct GroqChunkedTests {
         try await transport.waitForCancellation(2)
     }
 
-    @Test(arguments: [false, true])
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])   // a hedge that never fires hangs the manual clock: fail, never hang
     func hedgeWaitsForFirstSuccess(primaryFails: Bool) async {
         // T2 row 31: one injected clock drives the hedge timer and both responses, so the
         // order (hedge at 50 → the failing request → the winner) never depends on suite load.
@@ -450,7 +450,7 @@ struct GroqChunkedTests {
         #expect(await transport.requests.count == 2)
     }
 
-    @Test func transcriberFinalSplitUploadsBothConcurrently() async throws {
+    @Test(.timeLimit(.minutes(1))) func transcriberFinalSplitUploadsBothConcurrently() async throws {
         let transport = ChunkTransport()
         // T2 row 30: the hedge timer runs on a clock that never moves, so a loaded suite cannot
         // fire a wall-clock hedge while the test holds both responses (hedges must stay 0).
