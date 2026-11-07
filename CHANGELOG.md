@@ -88,3 +88,8 @@ Raza (2026-11-05 23:5x): "pressing the two command keys isn't doing anything; it
 
 ## v1.29.4 — 2026-11-07
 - The first recording after Archie starts no longer gives up on the Mac's own microphone when it takes a little over two seconds to start; a microphone that is really dead is still caught.
+
+## v1.29.5 — 2026-11-08
+- Starting the microphone on a device that reports no rate or no channels (0 Hz / 0 channels) is refused before the start, even when the device's format looks identical to the output's, instead of starting a broken recording.
+- Each new recording clears the previous recording's microphone-reattach notes, so one capture's notes never show up in the next one's log.
+- Test reliability only (no app behaviour change): the hedged-upload tests run on a manual clock with a one-minute limit and a 10-second watchdog, so a slow machine can no longer make them fail or hang; three microphone-lease and capture tests wait for the real signal (the release, the first buffer, the stalled read) instead of guessing a time.
