@@ -118,10 +118,26 @@ public struct CaptureHealth: Sendable {
     /// v1.27 (B1): a Bluetooth dictation waits for the headset — while its start/re-attach is in flight, or
     /// while no source has delivered a single buffer — up to `bluetoothNoInputCap` from the session start.
     /// A source that delivers only digital zeros (a dead link) keeps v1.8's deadline.
+    /// 1.29.4 (H): a non-Bluetooth capture with `.nonBluetoothGrace` waits for its first start (see StartupPolicy).
     private func deadline(_ base: TimeInterval) -> TimeInterval {
-        let nothingDelivered = builtin.firstAt == nil && headset.firstAt == nil
-        guard bluetooth, let boundary, headsetInFlight || nothingDelivered else { return base }
-        return max(base, boundary + Self.bluetoothNoInputCap)
+        guard !bluetooth else {
+            let nothingDelivered = builtin.firstAt == nil && headset.firstAt == nil
+            guard let boundary, headsetInFlight || nothingDelivered else { return base }
+            return max(base, boundary + Self.bluetoothNoInputCap)
+        }
+        guard let grace = startupGraceDeadline else { return base }
+        return max(base, grace)
+    }
+
+    /// 1.29.4 (H): the startup grace's absolute deadline (nil: none applies).
+    var startupGraceDeadline: TimeInterval? {
+        guard startupPolicy == .nonBluetoothGrace, !bluetooth, !delivered, let origin = graceBoundary else { return nil }
+        switch firstStart {
+        case .none, .returned(nil): return nil
+        case .inFlight: return origin + Self.bluetoothNoInputCap
+        case .returned(let at?):
+            return min(origin + Self.bluetoothNoInputCap, max(origin + Self.failAfter, at + Self.builtinGrace))
+        }
     }
 
     private func state(_ source: Source) -> SourceState { source == .builtin ? builtin : headset }
