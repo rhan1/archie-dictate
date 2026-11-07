@@ -32,10 +32,13 @@ struct V1292InPlaceFormatTests {
     /// Starts a Bluetooth conversation at `initial`, lets the engine stop itself, changes ONLY the headset's
     /// hardware format to `changed` (nil: unchanged), admits the route generation and runs the real public apply.
     static func run(initial: AVAudioFormat, changed: AVAudioFormat?, at time: TimeInterval = ProcessInfo.processInfo.systemUptime,
+                    rebuiltTo recovered: AVAudioFormat? = nil,
                     keep: ((V129.Session) async throws -> Void)? = nil) async throws -> Outcome {
         let rig = V129.Rig(hardware: initial)
         let s = try V129.start(rig, at: time)
         let engine = rig.engine
+        // T5-h: the rebuilt engine's input has recovered to this valid format (an equal 0 Hz pair is now refused).
+        if let recovered { rig.onNewEngine = { $0.hardware = recovered; $0.output = recovered } }
         engine.running = false                                    // the HFP bring-up stopped the engine
         if let changed { rig.hardware = changed }                 // the device moved; the client bus did not
         let outBefore = engine.output
@@ -95,11 +98,33 @@ struct V1292InPlaceFormatTests {
     @Test func invalidHardwareFormatNeverStartsNativelyAndRebuilds() async throws {
         let invalid = AVAudioFormat()                             // 0 Hz / 0 channels: what a vanished input reads
         #expect(invalid.sampleRate == 0 && invalid.channelCount == 0)
-        let o = try await Self.run(initial: Self.format(44_100), changed: invalid)
+        // T5-h: the rebuilt engine recovers to a valid 16 kHz input. Before, its equal 0 Hz/0 ch pair slipped past the
+        // refusal; the test's purpose (the in-place apply never starts natively on invalid hardware and rebuilds) is unchanged.
+        let o = try await Self.run(initial: Self.format(44_100), changed: invalid, rebuiltTo: Self.format(16_000))
         print("D2 CONTROL invalid hw=\(Int(invalid.sampleRate)) native_starts=\(o.applyStarts) gen1=\(o.gen1) rebuilds=\(o.rebuilds) note=\(o.note)")
         #expect(o.applyStarts == 0)
         #expect(o.gen1 == "rebuild" && o.rebuilds == 1)
         #expect(o.note.hasPrefix("conv_apply=rebuild reason=in_place_failed"))
+    }
+
+    /// T5-h: the rebuilt engine's input is STILL invalid (0 Hz/0 ch) and its output equals it: refused before any native start.
+    @Test func equalInvalidFormatsOnTheRebuiltEngineNeverStartNatively() async throws {
+        let invalid = AVAudioFormat()
+        let rig = V129.Rig(hardware: Self.format(44_100))
+        let s = try V129.start(rig, at: ProcessInfo.processInfo.systemUptime)
+        rig.engine.running = false
+        rig.hardware = invalid
+        s.recorder.observeConversationRoute(invalidated: true)
+        var threw = false
+        do { _ = try await s.recorder.applyPendingConversationDeviceChange() } catch { threw = true }
+        let rebuilt = try #require(rig.engines.dropFirst().first)
+        print("T5-h \(rebuilt.counts.starts == 0 ? "GREEN" : "RED") equal_invalid_rebuild native_starts=\(rebuilt.counts.starts) threw=\(threw)")
+        #expect(rebuilt.hardware.sampleRate == 0 && rebuilt.output.sampleRate == 0)
+        #expect(rebuilt.counts.starts == 0 && rebuilt.startTimes.isEmpty)
+        #expect(rig.engines.first?.counts.starts == 1)            // only the initial capture start
+        #expect(threw)
+        _ = s.recorder.stop()
+        _ = await s.recorder.awaitRelease()
     }
 
     @Test func reconciledSixteenKilohertzStreamReachesConsumeAt24kMono() async throws {
