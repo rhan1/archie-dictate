@@ -2801,6 +2801,13 @@ public final class AudioRecorder: CaptureEngine {
             soleBuiltinFirstAudio = SoleBuiltinFirstAudio()
             soleBuiltinFirstAudio.startRequested(at: now)
             feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: epoch, sole: .builtin)
+            if captureBoundary != nil {
+                // Hosts reset before starting. No unit frames exist before this request;
+                // preserve recording intent and exclude prior lease wait from its clock.
+                captureBoundary = now
+                _ = feed.recordingStarted(at: now)
+            }
+            if !builtinConversationAutomaticTimers { healthTimer?.cancel(); healthTimer = nil }
             episode = BluetoothRecoveryEpisode(bluetooth: false)
             ioGuard = HeadsetIOGuard(bluetooth: false)
             instrumentation = CaptureInstrumentation(backend: .auhal)
