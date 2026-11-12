@@ -165,15 +165,9 @@ public struct CaptureHealth: Sendable {
         failed = nil
     }
 
-    public mutating func restartInput(at time: TimeInterval, source: Source = .headset) {
-        if source == .builtin {
-            builtin = SourceState()
-            builtinReported = false
-            sourceStarted(.builtin, at: time)
-        } else {
-            headset = SourceState()
-            sourceStarted(.headset, at: time)
-        }
+    public mutating func restartInput(at time: TimeInterval) {
+        headset = SourceState()
+        sourceStarted(.headset, at: time)
         firstInputSince = time
         warned = nil
         failed = nil

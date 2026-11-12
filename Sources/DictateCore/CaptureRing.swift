@@ -189,9 +189,7 @@ public struct CaptureFeed {
     }
     /// A silent VP graph was discarded. Give plain input its own first-buffer window,
     /// preserving the recording boundary, bridge, evidence, timeline and captured frames.
-    public mutating func restartInputHealth(at time: TimeInterval, source: CaptureBridge.Source = .headset) {
-        health.restartInput(at: time, source: source)
-    }
+    public mutating func restartInputHealth(at time: TimeInterval) { health.restartInput(at: time) }
     /// v1.27 (B1): the headset client's start or re-attach was called (true) / returned (false).
     /// 1.29.4 (H): `time` = when it returned (the startup grace's first-start return).
     public mutating func headsetStart(inFlight: Bool, at time: TimeInterval? = nil) {
