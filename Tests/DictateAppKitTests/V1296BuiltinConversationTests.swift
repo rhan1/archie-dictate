@@ -116,6 +116,13 @@ struct V1296BuiltinConversationTests {
             units.value.last!.emit(Array(repeating: value, count: 2_400), at: clock.value)
         }
         func tick(_ time: Double) { clock.value = time; recorder.builtinConversationTick(at: time) }
+        func verifiedStart(_ count: Int) -> Bool {
+            let current = units.value
+            let binds = recorder.builtinConversationDiagnostics.filter { $0.hasPrefix("builtin_bind ") }
+            return current.count == count && current.last?.started == true && binds.count >= count &&
+                (binds.last?.hasPrefix("builtin_bind result=ok ") == true ||
+                 binds.last?.hasPrefix("builtin_bind result=rebound ") == true)
+        }
         func stop() async {
             _ = recorder.stop()
             #expect(await recorder.awaitRelease() == .released)
@@ -177,7 +184,7 @@ struct V1296BuiltinConversationTests {
             #expect(await Self.eventually { r.recorder.activeRouteGeneration == 1 })
             _ = try r.recorder.reconfigureConversationInput(at: r.clock.value)
         }
-        #expect(await Self.eventually { r.units.value.count == 2 && r.units.value.last!.started })
+        #expect(await Self.eventually { r.verifiedStart(2) })
         #expect(old.stops.value == 1)
         #expect(r.recorder.builtinConversationDiagnostics.contains("builtin_restart=1 reason=\(reason)"))
         let new = r.units.value.last!
@@ -328,10 +335,10 @@ struct V1296BuiltinConversationTests {
         let began = ProcessInfo.processInfo.systemUptime
         r.tick(100.1)
         old.emit(Array(repeating: 0, count: 2_400), at: 100.1)
-        #expect(await Self.eventually { r.units.value.count == 2 || !r.failures.value.isEmpty })
+        #expect(await Self.eventually { r.verifiedStart(2) || r.failures.value.first?.reason == .builtinBindFailed })
         let elapsed = ProcessInfo.processInfo.systemUptime - began
         #expect(elapsed <= AudioRecorder.builtinBindFailureLimit)
-        #expect(r.units.value.count == 2 || r.failures.value.first?.reason == .builtinBindFailed)
+        #expect(r.verifiedStart(2) || r.failures.value.first?.reason == .builtinBindFailed)
         #expect(!(r.recorder.isRunning && r.units.value.count == 1 && r.failures.value.isEmpty))
         print("D \(Self.phase) builtin_bind_drift_runs_silent=\(r.units.value.count == 1 && r.failures.value.isEmpty ? 1 : 0)")
         await r.stop()
@@ -340,7 +347,7 @@ struct V1296BuiltinConversationTests {
     func initial_wrong_or_unreadable_bind_is_rebound(readback: UInt32?) async throws {
         let first = Builtin(); first.readback.value = readback
         let r = Rig([first, Builtin()]); try await r.start()
-        #expect(await Self.eventually { r.units.value.count == 2 && r.units.value.last!.started })
+        #expect(await Self.eventually { r.verifiedStart(2) })
         r.emit(at: 100.1)
         #expect(r.chunks.value.count == 1 && r.failures.value.isEmpty)
         #expect(r.recorder.builtinConversationDiagnostics.contains("builtin_bind result=rebound from=81 to=81"))
@@ -359,7 +366,7 @@ struct V1296BuiltinConversationTests {
         r.recorder.observeConversationRoute()
         r.clock.value = 100.1
         #expect(try r.recorder.reconfigureConversationInput(at: 100.1))
-        #expect(await Self.eventually { r.units.value.count == 3 && r.units.value.last!.started })
+        #expect(await Self.eventually { r.verifiedStart(3) })
         r.emit(at: 100.2)
         #expect(r.chunks.value.count == 1 && r.failures.value.isEmpty)
         #expect(wrong.stops.value == 1)
@@ -514,7 +521,7 @@ struct V1296BuiltinConversationTests {
         r.tick(101)
         #expect(r.verdicts.value == [.noBuffer])
         gate.signal()
-        #expect(await Self.eventually { unit.started })
+        #expect(await Self.eventually { r.verifiedStart(1) })
         r.emit(at: 101.1); r.tick(102.1)
         #expect(r.verdicts.value == [.noBuffer])
         print("D GREEN first_audio_verdict case=slow_start_1.05s expected=no_buffer actual=\(r.verdicts.value.first?.rawValue ?? "nil")")
