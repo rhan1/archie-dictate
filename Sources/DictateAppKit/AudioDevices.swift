@@ -180,6 +180,17 @@ enum AudioDevices {
         guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &uid) == noErr, let uid else { return nil }
         return uid.takeRetainedValue() as String
     }
+    static func device(forUID targetUID: String) -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var uidRef = Unmanaged.passUnretained(targetUID as CFString)
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address,
+            UInt32(MemoryLayout<Unmanaged<CFString>>.size), &uidRef, &size, &deviceID)
+        if status == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown), deviceID != 0 { return deviceID }
+        return nil
+    }
     /// D-a: after CurrentDevice changes, AUHAL keeps the previous default device's
     /// client (output-scope) format, and its input element does no sample-rate
     /// conversion, so the tap guard saw 48 kHz hardware vs a 44.1 kHz client on
