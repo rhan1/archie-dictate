@@ -234,16 +234,17 @@ public enum RouteFingerprint {
         output: OutputFacts?,
         input: InputFacts?
     ) -> String {
-        let b = builtin.map {
-            "b:\($0.id):\($0.uid):\(Int($0.rate.rounded())):\($0.alive ? 1 : 0):\($0.channels)"
-        } ?? "b:none"
-        let o = output.map {
-            "o:\($0.id):\($0.uid):\($0.alive ? 1 : 0)"
-        } ?? "o:none"
-        let i = input.map {
-            "i:\($0.id):\($0.uid)"
-        } ?? "i:none"
-        return "\(b)||\(o)||\(i)"
+        // Each component is canonical JSON. UIDs can contain spaces, colons or separators;
+        // escaping them prevents one device's UID from impersonating another component.
+        func component(_ facts: [Any]?) -> String {
+            guard let facts else { return "null" }
+            let data = try! JSONSerialization.data(withJSONObject: facts, options: [.fragmentsAllowed])
+            return String(decoding: data, as: UTF8.self)
+        }
+        let b = component(builtin.map { [$0.id, $0.uid, String($0.rate), $0.alive, $0.channels] })
+        let o = component(output.map { [$0.id, $0.uid, $0.alive] })
+        let i = component(input.map { [$0.id, $0.uid] })
+        return [b, o, i].joined(separator: "\n")
     }
 
     public static func shortHash(_ fingerprint: String) -> String {
@@ -254,8 +255,8 @@ public enum RouteFingerprint {
 
     public static func changedField(from before: String?, to after: String) -> String {
         guard let before, before != after else { return "none" }
-        let bParts = before.components(separatedBy: "||")
-        let aParts = after.components(separatedBy: "||")
+        let bParts = before.components(separatedBy: "\n")
+        let aParts = after.components(separatedBy: "\n")
         guard bParts.count == 3, aParts.count == 3 else { return "builtin" }
         if bParts[0] != aParts[0] { return "builtin" }
         if bParts[1] != aParts[1] { return "output_id" }
