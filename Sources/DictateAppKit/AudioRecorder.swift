@@ -2733,6 +2733,8 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinFormatPending = false
     private var builtinRestartInFlight = false
     private var builtinBindDetectedAt: TimeInterval?
+    private var builtinBindDetectedFrom: UInt32?
+    private var builtinBindDetectedExpected: UInt32?
     private var appliedRouteFingerprint: String?
     private var builtinConversationNotes: [String] = []
     private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure", qos: .userInitiated)
@@ -2763,6 +2765,7 @@ public final class AudioRecorder: CaptureEngine {
         builtinBindVerified = false
         builtinRestartInFlight = false
         builtinBindDetectedAt = nil
+        builtinBindDetectedFrom = nil; builtinBindDetectedExpected = nil
         appliedRouteFingerprint = nil
     }
 
@@ -2793,6 +2796,7 @@ public final class AudioRecorder: CaptureEngine {
             builtinFormatPending = false
             builtinRestartInFlight = false
             builtinBindDetectedAt = nil
+            builtinBindDetectedFrom = nil; builtinBindDetectedExpected = nil
             soleBuiltinRestarts = SoleBuiltinRestartPolicy()
             soleBuiltinFirstAudio = SoleBuiltinFirstAudio()
             soleBuiltinFirstAudio.startRequested(at: now)
@@ -2900,7 +2904,11 @@ public final class AudioRecorder: CaptureEngine {
                     guard self.engineEpoch === epoch, !self.failureReported, self.builtin === unit else { return nil }
                     self.builtinBindVerified = verified
                     self.builtinRestartInFlight = false
-                    if verified { self.builtinBindDetectedAt = nil; self.builtinBindTimer?.cancel() }
+                    if verified {
+                        self.builtinBindDetectedAt = nil
+                        self.builtinBindDetectedFrom = nil; self.builtinBindDetectedExpected = nil
+                        self.builtinBindTimer?.cancel()
+                    }
                     self.feed.sourceStarted(.builtin, at: now)
                     self.stats.startFormat = "\(Int(fmt?.sampleRate ?? Self.sampleRate))Hz/\(fmt?.channels ?? 1)ch"
                     return initial ? self.soleBuiltinFirstAudio.startReturned(at: now) : nil
@@ -3062,6 +3070,11 @@ public final class AudioRecorder: CaptureEngine {
         }
         let from = unit.currentDeviceID
         let expected = unit.expectedDeviceID
+        if reason == .drift {
+            lock.withLock {
+                builtinBindDetectedFrom = from; builtinBindDetectedExpected = expected
+            }
+        }
         let replacement = lock.withLock { () -> (BuiltinCapture, DispatchQueue, BuiltinCapture, DispatchQueue)? in
             guard engineEpoch === epoch, !failureReported else { return nil }
             builtinRestartInFlight = true
@@ -3100,9 +3113,10 @@ public final class AudioRecorder: CaptureEngine {
         guard lock.withLock({ captureKind == .conversation && selectedDevice == .builtIn &&
             engineEpoch === active && !failureReported && lease?.isActive == true }) else { return }
         evaluateBuiltinFirstAudio(at: now)
-        let state = lock.withLock { (builtin, builtinRestartInFlight, builtinBindDetectedAt) }
+        let state = lock.withLock { (builtin, builtinRestartInFlight, builtinBindDetectedAt,
+                                     builtinBindDetectedFrom, builtinBindDetectedExpected) }
         if let detected = state.2, now - detected >= Self.builtinBindFailureLimit {
-            failBuiltinConversationBind(epoch: active, from: nil, expected: state.0.expectedDeviceID)
+            failBuiltinConversationBind(epoch: active, from: state.3, expected: state.4)
             return
         }
         let canReadBack = !state.1 && state.0.started
