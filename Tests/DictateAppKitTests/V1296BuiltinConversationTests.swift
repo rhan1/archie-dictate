@@ -227,6 +227,29 @@ struct V1296BuiltinConversationTests {
         await r.stop()
     }
 
+    @Test(arguments: [false, true])
+    func pending_native_start_keeps_health_deadline(restarting: Bool) async throws {
+        let blocked = Builtin(), gate = DispatchSemaphore(value: 0)
+        blocked.startGate = gate
+        let r = Rig(restarting ? [Builtin(), blocked] : [blocked])
+        try await r.start()
+        if restarting {
+            r.emit(at: 100)
+            r.tick(100 + CaptureHealth.staleAfter + 0.01)
+        }
+        #expect(await Self.eventually { blocked.starts.value == 1 })
+        #expect(!blocked.started)
+        r.tick(100 + CaptureHealth.failAfter)
+        #expect(await Self.eventually { r.failures.value.map(\.reason) == [.micDead] })
+        #expect(r.failures.value.first?.durationSeconds == CaptureHealth.failAfter)
+        let count = r.chunks.value.count
+        gate.signal()
+        #expect(await Self.eventually { blocked.stops.value > 0 })
+        #expect(r.chunks.value.count == count && !r.recorder.isRunning)
+        print("D GREEN pending_native_start_health_deadline=\(CaptureHealth.failAfter) restarting=\(restarting ? 1 : 0)")
+        await r.stop()
+    }
+
     @Test func engine_stopped_unchanged_fp_raises_generation() async throws {
         let r = Rig(); try await r.start()
         for _ in 0..<18 { r.recorder.observeConversationRoute(invalidated: true) }
