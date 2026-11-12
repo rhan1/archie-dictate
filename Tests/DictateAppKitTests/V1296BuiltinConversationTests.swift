@@ -313,6 +313,35 @@ struct V1296BuiltinConversationTests {
         print("D \(Self.phase) builtin_bind_drift_runs_silent=\(r.units.value.count == 1 && r.failures.value.isEmpty ? 1 : 0)")
         await r.stop()
     }
+    @Test(arguments: [nil, 999] as [UInt32?])
+    func initial_wrong_or_unreadable_bind_is_rebound(readback: UInt32?) async throws {
+        let first = Builtin(); first.readback.value = readback
+        let r = Rig([first, Builtin()]); try await r.start()
+        #expect(await Self.eventually { r.units.value.count == 2 && r.units.value.last!.started })
+        r.emit(at: 100.1)
+        #expect(r.chunks.value.count == 1 && r.failures.value.isEmpty)
+        #expect(r.recorder.builtinConversationDiagnostics.contains("builtin_bind result=rebound from=81 to=81"))
+        // A second mismatch in the attempt must terminate rather than grant another rebind.
+        r.units.value.last!.readback.value = 999
+        r.tick(100.2)
+        #expect(await Self.eventually { r.failures.value.map(\.reason) == [.builtinBindFailed] })
+        #expect(r.units.value.count == 2)
+        print("D GREEN initial_bind_readback=1 from=\(readback.map(String.init) ?? "unverified")")
+        await r.stop()
+    }
+    @Test func route_apply_readback_is_verified() async throws {
+        let wrong = Builtin(); wrong.readback.value = nil
+        let r = Rig([Builtin(), wrong, Builtin()]); try await r.start()
+        r.routeFacts.update { $0.1.id = 90 }
+        r.recorder.observeConversationRoute()
+        #expect(try r.recorder.reconfigureConversationInput(at: 100.1))
+        #expect(await Self.eventually { r.units.value.count == 3 && r.units.value.last!.started })
+        r.emit(at: 100.2)
+        #expect(r.chunks.value.count == 1 && r.failures.value.isEmpty)
+        #expect(wrong.stops.value == 1)
+        print("D GREEN route_apply_bind_readback=1")
+        await r.stop()
+    }
     @Test func bind_failed_does_not_wait_on_teardown() async throws {
         let old = Builtin(), next = Builtin()
         let gate = DispatchSemaphore(value: 0)
