@@ -183,7 +183,8 @@ final class ConversationRouteWatch {
             uid: AudioDevices.uid(of: device) ?? "unknown",
             rate: rate ?? 0,
             alive: (alive ?? 0) != 0,
-            channels: Int(channels)
+            inputChannels: scope == kAudioDevicePropertyScopeInput ? channels : 0,
+            outputChannels: scope == kAudioDevicePropertyScopeOutput ? channels : 0
         )
     }
 

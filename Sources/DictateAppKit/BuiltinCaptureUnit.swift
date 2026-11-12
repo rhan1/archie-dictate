@@ -297,10 +297,10 @@ final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
         if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devices, worker, devicesBlock) == noErr {
             installed.append((AudioObjectID(kAudioObjectSystemObject), devices, devicesBlock))
         }
-        if AudioObjectAddPropertyListenerBlock(id, &nominalRate, worker, rateBlock) == noErr {
+        if onFormatChange != nil, AudioObjectAddPropertyListenerBlock(id, &nominalRate, worker, rateBlock) == noErr {
             installed.append((id, nominalRate, rateBlock))
         }
-        if AudioObjectAddPropertyListenerBlock(id, &streamFormat, worker, formatBlock) == noErr {
+        if onFormatChange != nil, AudioObjectAddPropertyListenerBlock(id, &streamFormat, worker, formatBlock) == noErr {
             installed.append((id, streamFormat, formatBlock))
         }
         lock.withLock { listeners = installed }

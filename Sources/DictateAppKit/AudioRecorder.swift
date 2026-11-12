@@ -2706,12 +2706,12 @@ public final class AudioRecorder: CaptureEngine {
         if let mean { onLevel?(mean) }
     }
 
-    // MARK: - 1.29.6 (D1–D6): Sole Built-In Conversation Capture (captureKind == .conversation && selectedDevice == .builtIn)
+    // MARK: - Built-in conversation only (D1–D6)
 
     public static let builtinBindFailureLimit: TimeInterval = 0.3
-    public static let builtinFirstAudioLimit: TimeInterval = SoleBuiltinFirstAudio.limit
-
-    /// D6 (1.29.6): non-fatal first-audio verdict callback for built-in conversation capture (`ok`, `zeros`, `no_buffer`).
+    public static let builtinFirstAudioLimit = SoleBuiltinFirstAudio.limit
+    /// Once per built-in conversation attempt, on the recorder's health queue. A route apply or
+    /// resetCapture does not renew the deadline. The verdict observes Float samples before PCM encoding.
     public var onBuiltinFirstAudio: ((BuiltinFirstAudioVerdict) -> Void)? {
         get { lock.withLock { builtinFirstAudioHandler } }
         set { lock.withLock { builtinFirstAudioHandler = newValue } }
@@ -2722,11 +2722,12 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinFirstAudioTimer: DispatchSourceTimer?
     private var builtinBindTimer: DispatchSourceTimer?
     private var builtinBindVerified = false
+    private var builtinBindReattempted = false
     private var builtinRestartInFlight = false
-    private var builtinRestartStartedAt: TimeInterval?
-    private var builtinReceivedSinceRestart = false
+    private var builtinBindDetectedAt: TimeInterval?
     private var appliedRouteFingerprint: String?
     private var builtinConversationNotes: [String] = []
+    private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure")
     var builtinConversationDiagnostics: [String] { lock.withLock { builtinConversationNotes } }
     var builtinConversationClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     var hasAllocatedEngine: Bool { lock.withLock { engine != nil } }
@@ -2735,8 +2736,8 @@ public final class AudioRecorder: CaptureEngine {
     var activeAppliedRouteGeneration: UInt64 { lock.withLock { appliedRouteGeneration } }
 
     private var isBuiltinConversationRunning: Bool {
-        let (running, active, unit) = lock.withLock { (captureRunning, builtinActive, builtin) }
-        return running && active && unit.started
+        let state = lock.withLock { (captureRunning && builtinActive && !failureReported, builtin) }
+        return state.0 && state.1.started
     }
 
     private func noteBuiltinConversation(_ line: String) {
@@ -2745,154 +2746,100 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func stopBuiltinConversationTimersLocked() {
-        builtinFirstAudioTimer?.cancel()
-        builtinFirstAudioTimer = nil
-        builtinBindTimer?.cancel()
-        builtinBindTimer = nil
+        builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = nil
+        builtinBindTimer?.cancel(); builtinBindTimer = nil
         builtinBindVerified = false
         builtinRestartInFlight = false
-        builtinRestartStartedAt = nil
-        builtinReceivedSinceRestart = false
+        builtinBindDetectedAt = nil
         appliedRouteFingerprint = nil
-        soleBuiltinFirstAudio.reset()
-        soleBuiltinRestarts.reset()
     }
 
-    private func startBuiltinConversation(epoch startEpoch: CaptureEpoch) throws {
-        if lock.withLock({ engine != nil || headsetUnitActive }) {
-            teardownEngine()
-        }
-        if let obs = configObserver {
-            NotificationCenter.default.removeObserver(obs)
-            configObserver = nil
-        }
+    private func startBuiltinConversation(epoch: CaptureEpoch) throws {
+        if lock.withLock({ engine != nil || headsetUnitActive }) { teardownEngine() }
         selectedDevice = .builtIn
         let now = builtinConversationClock()
-        var abandonedMs: Int?
-        let (unit, queue): (BuiltinCapture, DispatchQueue) = try lock.withLock {
-            guard engineEpoch === startEpoch, let currentLease = lease, currentLease.isActive else {
+        try lock.withLock {
+            guard engineEpoch === epoch, let lease, lease.isActive, lease.started(.builtin) else {
                 throw CancellationError()
             }
-            if let busy = builtinWedgedMsLocked() {
-                abandonedMs = busy
-                builtin = makeBuiltin()
-                builtinQueue = DispatchQueue(label: "dictate.capture.builtin")
-                builtinWatch = CaptureExecutorWatch()
-            }
-            guard currentLease.started(.builtin) else { throw CancellationError() }
             stats = CaptureStats()
             stats.device = "built-in"
-            stats.voiceProcessing = "off"
             stats.kind = .conversation
-            retapNotes.removeAll()
-            retapErrors.removeAll()
-            builtinConversationNotes.removeAll()
+            stats.builtinBackend = builtin.backend
+            stats.voiceProcessing = "off"
             keptFrameCount = 0
             failureReported = false
             streamOverrun = false
-            routeGeneration = 0
-            appliedRouteGeneration = 0
+            routeGeneration = 0; appliedRouteGeneration = 0
             routeApplying = false
-            boundInput = nil
-            inPlaceApplies = 0
-            meter.clearBatch()
+            boundInput = nil; inPlaceApplies = 0
+            builtinConversationNotes.removeAll()
             bridgeConfigured = true
             builtinActive = true
-            builtinDriftNoted = false
-            builtinRebuilt = false
-            builtinUnreadable = false
             builtinBindVerified = false
+            builtinBindReattempted = false
             builtinRestartInFlight = false
-            builtinRestartStartedAt = nil
-            builtinReceivedSinceRestart = false
-            soleBuiltinRestarts.reset()
-            soleBuiltinFirstAudio.arm(at: now)
-            feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: startEpoch,
-                       startupPolicy: .nonBluetoothGrace, sole: .builtin)
-            if let captureBoundary { _ = feed.recordingStarted(at: captureBoundary) }
+            builtinBindDetectedAt = nil
+            soleBuiltinRestarts = SoleBuiltinRestartPolicy()
+            soleBuiltinFirstAudio = SoleBuiltinFirstAudio()
+            soleBuiltinFirstAudio.startRequested(at: now)
+            feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: epoch, sole: .builtin)
             episode = BluetoothRecoveryEpisode(bluetooth: false)
             ioGuard = HeadsetIOGuard(bluetooth: false)
             instrumentation = CaptureInstrumentation(backend: .auhal)
-            return (builtin, builtinQueue)
-        }
-        self.startedAt = DispatchTime.now()
-        if let abandonedMs { noteBuiltinConversation("bridge_abandoned=1 busy_ms=\(abandonedMs)") }
-        installBuiltinConversationRouteWatch(epoch: startEpoch)
-        armBuiltinFirstAudioTimer(epoch: startEpoch, requestedAt: now)
-        let ready = startBuiltinForConversation(unit, epoch: startEpoch, queue: queue,
-                                                isInitialStart: true, isRestart: false)
-        _ = ready.wait(timeout: .now() + CaptureLeaseBroker.releaseWait)
-        stats.engineStartMs = elapsedMs()
-        let activated = lock.withLock { () -> Bool in
-            guard engineEpoch === startEpoch, lease?.isActive == true else { return false }
             captureRunning = true
-            return true
         }
-        guard activated else { throw CancellationError() }
+        startedAt = .now()
+        installBuiltinConversationRouteWatch(epoch: epoch)
+        armBuiltinFirstAudioTimer()
+        let ready = startBuiltinForConversation(builtin, epoch: epoch, queue: builtinQueue, initial: true)
+        _ = ready.wait(timeout: .now() + Self.builtinSetupWait)
         recording = true
     }
 
-    private func armBuiltinFirstAudioTimer(epoch: CaptureEpoch, requestedAt: TimeInterval) {
-        let startMs = Int((requestedAt * 1000).rounded())
-        noteBuiltinConversation("builtin_first_audio_clock start=\(startMs)")
+    private func armBuiltinFirstAudioTimer() {
         let timer = DispatchSource.makeTimerSource(queue: healthQueue)
-        timer.schedule(deadline: .now() + Self.builtinFirstAudioLimit)
+        // Repeating until t0 + limit: start can return at any point in the first second.
+        timer.schedule(deadline: .now() + CaptureHealth.tickInterval, repeating: CaptureHealth.tickInterval)
+        let token = lock.withLock { lease?.token }
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            let now = max(self.builtinConversationClock(), requestedAt + Self.builtinFirstAudioLimit)
-            self.evaluateBuiltinFirstAudio(at: now, epoch: epoch)
+            guard let self, self.lock.withLock({ self.lease?.token === token }) else { return }
+            self.evaluateBuiltinFirstAudio(at: self.builtinConversationClock())
         }
-        lock.withLock {
-            builtinFirstAudioTimer?.cancel()
-            builtinFirstAudioTimer = timer
-        }
+        lock.withLock { builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = timer }
         timer.resume()
     }
 
-    private func evaluateBuiltinFirstAudio(at now: TimeInterval, epoch: CaptureEpoch) {
-        let (verdict, handler): (BuiltinFirstAudioVerdict?, ((BuiltinFirstAudioVerdict) -> Void)?) = lock.withLock {
-            guard engineEpoch === epoch, captureKind == .conversation, selectedDevice == .builtIn else {
-                return (nil, nil)
-            }
-            guard let v = soleBuiltinFirstAudio.evaluate(at: now) else { return (nil, nil) }
-            builtinFirstAudioTimer?.cancel()
-            builtinFirstAudioTimer = nil
-            return (v, builtinFirstAudioHandler)
+    private func evaluateBuiltinFirstAudio(at now: TimeInterval) {
+        let result = lock.withLock { () -> (BuiltinFirstAudioVerdict, ((BuiltinFirstAudioVerdict) -> Void)?)? in
+            guard !failureReported, lease?.isActive == true,
+                  let verdict = soleBuiltinFirstAudio.evaluate(at: now) else { return nil }
+            builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = nil
+            return (verdict, builtinFirstAudioHandler)
         }
-        guard let verdict else { return }
-        noteBuiltinConversation("builtin_first_audio=\(verdict.rawValue)")
-        handler?(verdict)
+        if let (verdict, callback) = result {
+            noteBuiltinConversation(verdict.note)
+            callback?(verdict)
+        }
     }
 
     private func installBuiltinConversationRouteWatch(epoch: CaptureEpoch) {
-        let leaseToken = lock.withLock { lease?.token }
+        let token = lock.withLock { lease?.token }
         let fp = route.currentBuiltinConversationRoute()
-        lock.withLock {
-            observedRoute = fp
-            appliedRouteFingerprint = fp
+        lock.withLock { observedRoute = fp; appliedRouteFingerprint = fp }
+        noteBuiltinConversation(RouteFingerprint.routeFpNote(generation: 0, before: nil, after: fp))
+        let watch = route.watchConversationRoute { [weak self] in
+            self?.onExecutor { [weak self] in self?.observeBuiltinConversationRoute(leaseToken: token) }
         }
-        noteBuiltinConversation(RouteFingerprint.routeFpNote(generation: 0, before: "none", after: fp))
-        let token = route.watchConversationRoute { [weak self] in
-            self?.onExecutor { [weak self] in
-                self?.observeBuiltinConversationRoute(leaseToken: leaseToken)
-            }
-        }
-        let old: AnyObject? = lock.withLock {
-            guard engineEpoch === epoch, lease?.token === leaseToken else { return token }
-            defer { conversationRouteWatch = token }
-            return conversationRouteWatch
-        }
-        withExtendedLifetime(old) {}
+        lock.withLock { if engineEpoch === epoch { conversationRouteWatch = watch } }
     }
 
     private func observeBuiltinConversationRoute(epoch: CaptureEpoch? = nil, leaseToken: CaptureEpoch? = nil) {
         let fingerprint = route.currentBuiltinConversationRoute()
-        let state: ConversationCaptureState? = lock.withLock {
-            guard captureKind == .conversation, selectedDevice == .builtIn,
-                  let lease, lease.isActive,
-                  epoch == nil || engineEpoch === epoch,
-                  leaseToken == nil || lease.token === leaseToken,
-                  !routeApplying else { return nil }
+        let state = lock.withLock { () -> ConversationCaptureState? in
+            guard captureKind == .conversation, selectedDevice == .builtIn, !failureReported,
+                  let lease, lease.isActive, epoch == nil || engineEpoch === epoch,
+                  leaseToken == nil || lease.token === leaseToken, !routeApplying else { return nil }
             guard fingerprint != observedRoute else { return nil }
             observedRoute = fingerprint
             guard routeGeneration == appliedRouteGeneration else { return nil }
@@ -2904,492 +2851,263 @@ public final class AudioRecorder: CaptureEngine {
         if let state { lock.withLock { conversationStateHandler }?(state) }
     }
 
-    private func startBuiltinForConversation(_ unit: BuiltinCapture, epoch: CaptureEpoch, queue: DispatchQueue,
-                                             isInitialStart: Bool, isRestart: Bool) -> DispatchSemaphore {
-        unit.onFrames = { [weak self, weak unit] chunk, time, stamped in
-            guard stamped === epoch, let unit else { return }
-            self?.acceptConverted(chunk, at: time, source: .builtin, epoch: epoch, builtinUnit: unit)
+    private func startBuiltinForConversation(_ unit: BuiltinCapture, epoch: CaptureEpoch,
+                                             queue: DispatchQueue, initial: Bool = false,
+                                             after: DispatchSemaphore? = nil) -> DispatchSemaphore {
+        unit.onFrames = { [weak self, weak unit] frames, time, stamped in
+            guard let unit, stamped === epoch else { return }
+            self?.acceptConverted(frames, at: time, source: .builtin, epoch: epoch, builtinUnit: unit)
         }
-        unit.onDeviceLost = { [weak self, weak unit] _ in
-            guard let unit else { return }
-            self?.builtinLost(unit, epoch: epoch)
+        unit.onDeviceLost = { [weak self, weak unit] stamped in
+            guard let unit, stamped === epoch else { return }
+            self?.healthQueue.async { [weak self] in self?.builtinConversationProblem(unit, reason: .lost, epoch: epoch) }
         }
         if let reporting = unit as? BuiltinFormatChangeReporting {
-            reporting.onFormatChange = { [weak self, weak unit] _ in
-                guard let unit else { return }
-                self?.builtinConversationProblem(unit, reason: .format, epoch: epoch)
+            reporting.onFormatChange = { [weak self, weak unit] stamped in
+                guard let unit, stamped === epoch else { return }
+                self?.healthQueue.async { [weak self] in self?.builtinConversationProblem(unit, reason: .format, epoch: epoch) }
             }
         }
         let ready = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
-            guard let self else { ready.signal(); return }
-            self.lock.withLock {
-                if self.builtinQueue === queue {
-                    self.builtinWatch.began(at: ProcessInfo.processInfo.systemUptime)
-                }
-            }
-            defer {
-                self.lock.withLock {
-                    if self.builtinQueue === queue {
-                        self.builtinWatch.ended()
-                    }
-                }
-            }
-            guard self.lock.withLock({ self.engineEpoch === epoch }) else { ready.signal(); return }
+            defer { ready.signal() }
+            after?.wait() // Never open a second unit while the old native unit is still stopping.
+            guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.failureReported && self.builtin === unit }) else { return }
             do {
                 try unit.start(epoch: epoch)
                 let now = self.builtinConversationClock()
                 let expected = unit.expectedDeviceID
                 let current = unit.currentDeviceID
-                let uid = (unit as? BuiltinCaptureUnit)?.deviceUID ?? expected.flatMap(self.route.uid)
+                let verified = expected != nil && expected == current
                 let fmt = (unit as? BuiltinFormatChangeReporting)?.hardwareFormatSummary
-                let bindMatches = expected != nil && current == expected
-                self.noteBuiltinConversation(BuiltinConversationDiagnostics.convCaptureNote(
-                    device: expected, uid: uid, sampleRate: fmt?.sampleRate, channels: fmt?.channels
-                ))
-                self.noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(
-                    current: current, expected: expected
-                ))
-                var d6Verdict: (BuiltinFirstAudioVerdict, ((BuiltinFirstAudioVerdict) -> Void)?)?
-                let isCurrent = self.lock.withLock { () -> Bool in
-                    guard self.engineEpoch === epoch, self.builtinActive, self.builtin === unit else { return false }
-                    self.builtinBindVerified = bindMatches
-                    if self.stats.startFormat.isEmpty {
-                        if let fmt {
-                            self.stats.startFormat = "\(Int(fmt.sampleRate))Hz/\(fmt.channels)ch"
-                        } else {
-                            self.stats.startFormat = "24000Hz/1ch"
-                        }
-                    }
+                let clockNote = self.lock.withLock { () -> String? in
+                    guard self.engineEpoch === epoch, !self.failureReported, self.builtin === unit else { return nil }
+                    self.builtinBindVerified = verified
+                    self.builtinRestartInFlight = false
+                    if verified { self.builtinBindDetectedAt = nil; self.builtinBindTimer?.cancel() }
                     self.feed.sourceStarted(.builtin, at: now)
-                    if isInitialStart {
-                        _ = self.soleBuiltinFirstAudio.startReturned(at: now)
-                        if let v = self.soleBuiltinFirstAudio.evaluate(at: now) {
-                            self.builtinFirstAudioTimer?.cancel()
-                            self.builtinFirstAudioTimer = nil
-                            d6Verdict = (v, self.builtinFirstAudioHandler)
-                        }
-                    }
-                    return true
+                    self.stats.startFormat = "\(Int(fmt?.sampleRate ?? Self.sampleRate))Hz/\(fmt?.channels ?? 1)ch"
+                    return initial ? self.soleBuiltinFirstAudio.startReturned(at: now) : nil
                 }
-                if !isCurrent {
-                    unit.stop(epoch: epoch)
-                    ready.signal()
-                    return
+                guard self.lock.withLock({ self.engineEpoch === epoch && !self.failureReported && self.builtin === unit }) else {
+                    unit.stop(epoch: epoch); return
                 }
-                if let (v, handler) = d6Verdict {
-                    self.noteBuiltinConversation("builtin_first_audio=\(v.rawValue)")
-                    handler?(v)
-                }
-                if !bindMatches {
-                    if isRestart {
-                        self.failBuiltinConversationBind(epoch: epoch, from: current, expected: expected,
-                                                         unitToStop: (unit, queue))
-                    } else {
-                        self.scheduleBuiltinBindCheck(epoch: epoch)
-                    }
+                if let clockNote { self.noteBuiltinConversation(clockNote) }
+                self.noteBuiltinConversation(BuiltinConversationDiagnostics.convCaptureNote(
+                    device: expected, sampleRate: fmt?.sampleRate ?? 0, channels: fmt?.channels ?? 0))
+                self.noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(
+                    result: verified ? (self.lock.withLock { self.builtinBindReattempted } ? "rebound" : "ok") : "failed",
+                    from: current, to: expected))
+                if !verified {
+                    self.healthQueue.async { [weak self] in self?.builtinConversationProblem(unit, reason: .drift, epoch: epoch) }
                 }
             } catch {
-                let isCurrent = self.lock.withLock { self.engineEpoch === epoch && self.builtin === unit }
-                if isCurrent {
-                    self.noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(
-                        current: nil, expected: unit.expectedDeviceID, error: "\(error)"
-                    ))
-                    self.failBuiltinConversationBind(epoch: epoch, from: nil, expected: unit.expectedDeviceID,
-                                                     unitToStop: (unit, queue))
-                } else {
-                    unit.stop(epoch: epoch)
-                }
+                self.failBuiltinConversationBind(epoch: epoch, from: nil, expected: unit.expectedDeviceID)
             }
-            ready.signal()
         }
         return ready
     }
 
-    private func scheduleBuiltinBindCheck(epoch: CaptureEpoch) {
-        let timer = DispatchSource.makeTimerSource(queue: healthQueue)
-        timer.schedule(deadline: .now() + CaptureHealth.tickInterval)
-        timer.setEventHandler { [weak self] in
-            self?.builtinConversationHealthTick(epoch: epoch)
-        }
-        lock.withLock {
-            builtinBindTimer?.cancel()
-            builtinBindTimer = timer
-        }
-        timer.resume()
-    }
-
-    private func failBuiltinConversationBind(epoch: CaptureEpoch, from: UInt32?, expected: UInt32?,
-                                             unitToStop: (BuiltinCapture, DispatchQueue)?) {
-        let now = builtinConversationClock()
-        let failure: CaptureFailure? = lock.withLock {
-            guard engineEpoch === epoch, !failureReported else { return nil }
+    private func failBuiltinConversationBind(epoch: CaptureEpoch, from: UInt32?, expected: UInt32?) {
+        let failure = lock.withLock { () -> CaptureFailure? in
+            guard engineEpoch === epoch, !failureReported, lease?.isActive == true else { return nil }
+            failureReported = true
+            captureRunning = false
             builtinBindVerified = false
-            builtinActive = false
             tapEpoch = CaptureEpoch()
-            healthTimer?.cancel()
-            healthTimer = nil
-            builtinBindTimer?.cancel()
-            builtinBindTimer = nil
-            return CaptureFailure(
-                reason: .builtinBindFailed,
-                durationSeconds: captureBoundary.map { max(0, now - $0) } ?? 0,
-                bytes: 44 + keptFrameCount * 2,
-                framesKept: keptFrameCount,
-                sources: feed.health.summary(at: now),
-                bindFrom: from,
-                bindExpected: expected
-            )
+            pendingPCM.removeAll(); delivery.discardPending()
+            healthTimer?.cancel(); healthTimer = nil
+            builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = nil
+            builtinBindTimer?.cancel(); builtinBindTimer = nil
+            return CaptureFailure(reason: .builtinBindFailed, framesKept: keptFrameCount,
+                                  bindFrom: from, bindExpected: expected)
         }
         guard let failure else { return }
-        let fromText = from.map(String.init) ?? "nil"
-        let expectedText = expected.map(String.init) ?? "nil"
-        noteBuiltinConversation("builtin_bind_failed=1 from=\(fromText) expected=\(expectedText)")
+        noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(result: "failed", from: from, to: expected))
         noteBuiltinConversation(failure.note)
-        reportBuiltinConversationFailure(failure, epoch: epoch)
-        if let (unit, queue) = unitToStop {
-            stopBuiltinUnit(unit, queue: queue, epoch: epoch)
-        }
-    }
-
-    private func reportBuiltinConversationFailure(_ failure: CaptureFailure, epoch: CaptureEpoch) {
-        let shouldReport: Bool = lock.withLock {
-            guard engineEpoch === epoch, !failureReported else { return false }
-            failureReported = true
-            return true
-        }
-        guard shouldReport else { return }
-        let initialCallback = lock.withLock { onCaptureFailure }
-        DispatchQueue.main.async { [weak self] in
+        // Failure delivery never waits for the unit's serial executor or native teardown.
+        builtinFailureQueue.async { [weak self] in
             guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
-            let callback = self.lock.withLock { self.onCaptureFailure } ?? initialCallback
-            callback?(failure)
+            self.onCaptureFailure?(failure)
         }
-    }
-
-    private func reconfigureBuiltinConversation(at time: TimeInterval? = nil) throws -> Bool {
-        let oldEpoch = lock.withLock { engineEpoch }
-        let (generation, fpBefore): (UInt64, String)? = try lock.withLock {
-            guard captureKind == .conversation else { throw RecorderError.notConversation }
-            guard lease?.isActive == true, routeGeneration != appliedRouteGeneration else { return nil }
-            routeApplying = true
-            tapEpoch = CaptureEpoch()
-            builtinBindVerified = false
-            return (routeGeneration, appliedRouteFingerprint ?? "none")
-        }
-        guard let (generation, fpBefore) else { return false }
-        defer { lock.withLock { routeApplying = false } }
-
-        let builtinStop: (BuiltinCapture, DispatchQueue)? = lock.withLock {
+        let stop = lock.withLock { () -> (BuiltinCapture, DispatchQueue)? in
             guard builtinActive else { return nil }
             builtinActive = false
             return (builtin, builtinQueue)
         }
-        if let (unit, queue) = builtinStop {
-            let done = DispatchSemaphore(value: 0)
-            queue.async { [weak self] in
-                self?.lock.withLock {
-                    if self?.builtinQueue === queue {
-                        self?.builtinWatch.began(at: ProcessInfo.processInfo.systemUptime)
-                    }
-                }
-                unit.stop(epoch: oldEpoch)
-                self?.lock.withLock {
-                    if self?.builtinQueue === queue {
-                        self?.builtinWatch.ended()
-                    }
-                }
-                done.signal()
-            }
-            guard done.wait(timeout: .now() + CaptureLeaseBroker.releaseWait) == .success else {
-                throw RecorderError.routeTeardownPending
-            }
-        }
+        if let (unit, queue) = stop { stopBuiltinUnit(unit, queue: queue, epoch: epoch) }
+    }
 
-        let freshEpoch = CaptureEpoch()
+    private func reconfigureBuiltinConversation(at time: TimeInterval?) throws -> Bool {
+        let oldEpoch = lock.withLock { engineEpoch }
+        let generation = try lock.withLock { () throws -> UInt64? in
+            guard lease?.isActive == true, !failureReported else { throw CancellationError() }
+            guard routeGeneration != appliedRouteGeneration else { return nil }
+            routeApplying = true
+            builtinBindVerified = false
+            pendingPCM.removeAll(); delivery.discardPending()
+            return routeGeneration
+        }
+        guard let generation else { return false }
+        defer { lock.withLock { routeApplying = false } }
+        let old = lock.withLock { (builtin, builtinQueue) }
+        let stopped = DispatchSemaphore(value: 0)
+        old.1.async { old.0.stop(epoch: oldEpoch); stopped.signal() }
+        guard stopped.wait(timeout: .now() + CaptureLeaseBroker.releaseWait) == .success else {
+            failBuiltinConversationBind(epoch: oldEpoch, from: nil, expected: old.0.expectedDeviceID)
+            throw RecorderError.routeTeardownPending
+        }
+        let epoch = CaptureEpoch()
         let now = time ?? builtinConversationClock()
-        let settledRoute = route.currentBuiltinConversationRoute()
-        let (newUnit, newQueue): (BuiltinCapture, DispatchQueue) = try lock.withLock {
-            guard engineEpoch === oldEpoch, let currentLease = lease, currentLease.isActive else {
-                throw CancellationError()
-            }
-            guard currentLease.started(.builtin) else { throw CancellationError() }
+        let fp = route.currentBuiltinConversationRoute()
+        let before = lock.withLock { appliedRouteFingerprint }
+        let new = try lock.withLock { () throws -> (BuiltinCapture, DispatchQueue) in
+            guard engineEpoch === oldEpoch, let lease, lease.isActive, !failureReported else { throw CancellationError() }
             retiredBuiltinQueues.append(builtinQueue)
             builtin = makeBuiltin()
             builtinQueue = DispatchQueue(label: "dictate.capture.builtin")
-            builtinWatch = CaptureExecutorWatch()
-            engineEpoch = freshEpoch
-            leaseEpoch = freshEpoch
-            bridgeConfigured = true
+            engineEpoch = epoch; leaseEpoch = epoch
             builtinActive = true
-            builtinBindVerified = false
             builtinRestartInFlight = false
-            builtinRestartStartedAt = nil
-            builtinReceivedSinceRestart = false
-            stats.voiceProcessing = "off"
-            stats.device = "built-in"
-            stats.firstBufferMs = nil
-            pendingPCM.removeAll(keepingCapacity: true)
-            delivery.discardPending()
-            feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: freshEpoch,
-                       startupPolicy: .standard, sole: .builtin)
-            feed.sourceStarted(.builtin, at: now)
-            if let boundary = captureBoundary {
-                _ = feed.recordingStarted(at: boundary)
-                feed.restartInputHealth(at: now, source: .builtin)
-            } else {
-                _ = feed.recordingStarted(at: now)
-                feed.restartInputHealth(at: now, source: .builtin)
-            }
+            feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: epoch, sole: .builtin)
+            _ = feed.recordingStarted(at: now)
             return (builtin, builtinQueue)
         }
-
-        let applyLine = BuiltinConversationDiagnostics.convApplyNote(generation: generation)
-        noteConversationApply(applyLine)
-        lock.withLock { builtinConversationNotes.append(applyLine) }
-        noteBuiltinConversation(RouteFingerprint.routeFpNote(generation: generation, before: fpBefore, after: settledRoute))
-
-        let ready = startBuiltinForConversation(newUnit, epoch: freshEpoch, queue: newQueue,
-                                                isInitialStart: false, isRestart: false)
-        _ = ready.wait(timeout: .now() + CaptureLeaseBroker.releaseWait)
-
-        let (handler, restartHealthClock): (((ConversationCaptureState) -> Void)?, Bool) = try lock.withLock {
-            guard engineEpoch === freshEpoch, lease?.isActive == true else { throw CancellationError() }
-            captureRunning = true
-            observedRoute = settledRoute
-            appliedRouteFingerprint = settledRoute
+        let line = BuiltinConversationDiagnostics.convApplyNote(generation: generation)
+        noteConversationApply(line)
+        lock.withLock { builtinConversationNotes.append(line) }
+        noteBuiltinConversation(RouteFingerprint.routeFpNote(generation: generation, before: before, after: fp))
+        let ready = startBuiltinForConversation(new.0, epoch: epoch, queue: new.1)
+        _ = ready.wait(timeout: .now() + Self.builtinSetupWait)
+        try lock.withLock {
+            guard engineEpoch === epoch, lease?.isActive == true, !failureReported else { throw CancellationError() }
+            appliedRouteFingerprint = fp
+            observedRoute = fp
             appliedRouteGeneration = generation
-            routeGeneration = generation
-            boundInput = nil
-            inPlaceApplies = 0
-            return (conversationStateHandler, healthTimer != nil)
         }
-        recording = true
-        if restartHealthClock { startHealthClock(epoch: freshEpoch) }
-        handler?(.routeSettled(generation: generation, voiceProcessing: "off"))
+        startHealthClock(epoch: epoch)
+        lock.withLock { conversationStateHandler }?(.routeSettled(generation: generation, voiceProcessing: "off"))
         return true
     }
 
     private func builtinConversationProblem(_ unit: BuiltinCapture, reason: SoleBuiltinRestartPolicy.Reason,
                                             epoch: CaptureEpoch) {
         let now = builtinConversationClock()
-        enum Action { case restart, fail(UInt32?, UInt32?, (BuiltinCapture, DispatchQueue)) }
-        let action: Action? = lock.withLock {
-            guard engineEpoch === epoch, builtin === unit, builtinActive, !builtinRestartInFlight else { return nil }
+        let action = lock.withLock { () -> SoleBuiltinRestartPolicy.Verdict? in
+            guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported else { return nil }
+            if builtinRestartInFlight { return nil }
             builtinBindVerified = false
-            tapEpoch = CaptureEpoch()
-            switch soleBuiltinRestarts.requestRestart(reason: reason, at: now) {
-            case .restart:
-                return .restart
-            case .fail:
-                return .fail(unit.currentDeviceID, unit.expectedDeviceID, (unit, builtinQueue))
+            pendingPCM.removeAll(); delivery.discardPending()
+            if reason == .drift {
+                if builtinBindReattempted { return .fail }
+                builtinBindReattempted = true
+                builtinBindDetectedAt = now
             }
+            return soleBuiltinRestarts.judge(reason: reason, at: now)
         }
         guard let action else { return }
-        switch action {
-        case .restart:
-            restartBuiltinForConversation(reason: reason, epoch: epoch, at: now)
-        case .fail(let current, let expected, let toStop):
-            failBuiltinConversationBind(epoch: epoch, from: current, expected: expected, unitToStop: toStop)
+        if action == .fail {
+            failBuiltinConversationBind(epoch: epoch, from: unit.currentDeviceID, expected: unit.expectedDeviceID)
+            return
         }
-    }
-
-    private func restartBuiltinForConversation(reason: SoleBuiltinRestartPolicy.Reason, epoch: CaptureEpoch,
-                                               at now: TimeInterval) {
-        let replacement: (old: BuiltinCapture, oldQueue: DispatchQueue, new: BuiltinCapture, newQueue: DispatchQueue)? = lock.withLock {
-            guard engineEpoch === epoch, lease?.isActive == true, !builtinRestartInFlight else { return nil }
+        let from = unit.currentDeviceID
+        let expected = unit.expectedDeviceID
+        let replacement = lock.withLock { () -> (BuiltinCapture, DispatchQueue, BuiltinCapture, DispatchQueue)? in
+            guard engineEpoch === epoch, !failureReported else { return nil }
             builtinRestartInFlight = true
-            builtinBindVerified = false
-            tapEpoch = CaptureEpoch()
-            let oldUnit = builtin
-            let oldQueue = builtinQueue
-            retiredBuiltinQueues.append(oldQueue)
+            let old = (builtin, builtinQueue)
+            retiredBuiltinQueues.append(builtinQueue)
             builtin = makeBuiltin()
             builtinQueue = DispatchQueue(label: "dictate.capture.builtin")
-            builtinWatch = CaptureExecutorWatch()
-            builtinActive = true
-            builtinRestartStartedAt = now
-            builtinReceivedSinceRestart = false
-            feed.restartInputHealth(at: now, source: .builtin)
-            return (oldUnit, oldQueue, builtin, builtinQueue)
+            feed.builtinRestarting()
+            return (old.0, old.1, builtin, builtinQueue)
         }
-        guard let replacement else { return }
-        defer { lock.withLock { builtinRestartInFlight = false } }
+        guard let (old, oldQueue, new, newQueue) = replacement else { return }
         noteBuiltinConversation(SoleBuiltinRestartPolicy.note(reason: reason))
-        if replacement.old !== replacement.new {
-            stopBuiltinUnit(replacement.old, queue: replacement.oldQueue, epoch: epoch)
+        if reason == .drift {
+            let timer = DispatchSource.makeTimerSource(queue: healthQueue)
+            timer.schedule(deadline: .now() + Self.builtinBindFailureLimit * 0.8)
+            timer.setEventHandler { [weak self] in
+                guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.builtinBindVerified }) else { return }
+                self.failBuiltinConversationBind(epoch: epoch, from: from, expected: expected)
+            }
+            lock.withLock { builtinBindTimer?.cancel(); builtinBindTimer = timer }
+            timer.resume()
         }
-        let ready = startBuiltinForConversation(replacement.new, epoch: epoch, queue: replacement.newQueue,
-                                                isInitialStart: false, isRestart: true)
-        _ = ready.wait(timeout: .now() + Self.builtinSetupWait)
+        let stopped = DispatchSemaphore(value: 0)
+        oldQueue.async { old.stop(epoch: epoch); stopped.signal() }
+        _ = startBuiltinForConversation(new, epoch: epoch, queue: newQueue, after: stopped)
     }
 
     private func builtinConversationHealthTick(epoch: CaptureEpoch) {
         builtinConversationTick(at: builtinConversationClock(), epoch: epoch)
     }
 
-    /// Deterministic and timer-driven health tick for sole built-in conversation capture (D1a, D3, D6).
+    /// Same production tick, with a monotonic clock supplied for offline tests.
     func builtinConversationTick(at time: TimeInterval? = nil, epoch: CaptureEpoch? = nil) {
         let now = time ?? builtinConversationClock()
-        let activeEpoch = epoch ?? lock.withLock { engineEpoch }
-        evaluateBuiltinFirstAudio(at: now, epoch: activeEpoch)
-
-        if lock.withLock({
-            engineEpoch !== activeEpoch || routeApplying || routeGeneration != appliedRouteGeneration || builtinRestartInFlight
-        }) {
+        let active = epoch ?? lock.withLock { engineEpoch }
+        guard lock.withLock({ captureKind == .conversation && selectedDevice == .builtIn &&
+            engineEpoch === active && !failureReported && lease?.isActive == true }) else { return }
+        evaluateBuiltinFirstAudio(at: now)
+        let state = lock.withLock { (builtin, builtinRestartInFlight, builtinBindDetectedAt) }
+        if let detected = state.2, now - detected >= Self.builtinBindFailureLimit {
+            failBuiltinConversationBind(epoch: active, from: nil, expected: state.0.expectedDeviceID)
             return
         }
-
-        let unit: BuiltinCapture? = lock.withLock {
-            builtinActive && engineEpoch === activeEpoch ? builtin : nil
-        }
-
-        // D3: per-tick read-back of currentDeviceID vs expectedDeviceID.
-        if let unit {
-            let expected = unit.expectedDeviceID
-            let current = unit.currentDeviceID
-            if expected == nil || current == nil || current != expected {
-                let decision: SoleBuiltinRestartPolicy.Decision? = lock.withLock {
-                    guard engineEpoch === activeEpoch, builtin === unit, builtinActive else { return nil }
-                    builtinBindVerified = false
-                    tapEpoch = CaptureEpoch()
-                    return soleBuiltinRestarts.requestRestart(reason: .drift, at: now)
-                }
-                guard let decision else { return }
-                noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(current: current, expected: expected))
-                switch decision {
-                case .restart:
-                    restartBuiltinForConversation(reason: .drift, epoch: activeEpoch, at: now)
-                case .fail:
-                    failBuiltinConversationBind(epoch: activeEpoch, from: current, expected: expected,
-                                                unitToStop: (unit, lock.withLock { builtinQueue }))
-                }
-                return
-            } else {
-                lock.withLock {
-                    if engineEpoch === activeEpoch, builtin === unit, builtinActive {
-                        builtinBindVerified = true
-                    }
-                }
-            }
-        }
-
-        // D1a(1) & D1a(7): stale detection (> 0.45 s after buffers began, or > 0.45 s after a restart).
-        enum StaleAction { case restart, fail(UInt32?, UInt32?, (BuiltinCapture, DispatchQueue)?) }
-        let staleAction: StaleAction? = lock.withLock {
-            guard engineEpoch === activeEpoch, feed.bridge.isRecording else { return nil }
-            let isStale = feed.health.status(.builtin, at: now) == .dead(.stale)
-            let postRestartStall = builtinRestartStartedAt.map {
-                !builtinReceivedSinceRestart && (now - $0) > CaptureHealth.staleAfter
-            } ?? false
-            guard isStale || postRestartStall else { return nil }
-            builtinBindVerified = false
-            tapEpoch = CaptureEpoch()
-            switch soleBuiltinRestarts.requestRestart(reason: .stale, at: now) {
-            case .restart:
-                return .restart
-            case .fail:
-                let stopPair: (BuiltinCapture, DispatchQueue)? = builtinActive ? (builtin, builtinQueue) : nil
-                return .fail(builtin.currentDeviceID, builtin.expectedDeviceID, stopPair)
-            }
-        }
-        if let staleAction {
-            switch staleAction {
-            case .restart:
-                restartBuiltinForConversation(reason: .stale, epoch: activeEpoch, at: now)
-            case .fail(let current, let expected, let stopPair):
-                failBuiltinConversationBind(epoch: activeEpoch, from: current, expected: expected, unitToStop: stopPair)
-            }
+        guard !state.1, state.0.started,
+              lock.withLock({ !routeApplying && routeGeneration == appliedRouteGeneration }) else { return }
+        // Read-back belongs to the recorder; a nil read after start is unverified and fences PCM.
+        let current = state.0.currentDeviceID
+        let expected = state.0.expectedDeviceID
+        if expected == nil || current != expected {
+            builtinConversationProblem(state.0, reason: .drift, epoch: active)
             return
         }
-
-        // D1a(2)–(4): 2.0 s startup silence / no_input evaluation via CaptureHealth.evaluate(at:).
-        lock.lock()
-        guard engineEpoch === activeEpoch, feed.bridge.isRecording else { lock.unlock(); return }
-        let out = feed.tick(at: now)
-        deliverLocked(out.frames)
-        var deadUnit: (BuiltinCapture, DispatchQueue)?
-        if out.stopBuiltin, builtinActive {
-            builtinActive = false
-            deadUnit = (builtin, builtinQueue)
+        if lock.withLock({ feed.health.status(.builtin, at: now) == .dead(.stale) }) {
+            builtinConversationProblem(state.0, reason: .stale, epoch: active)
+            return
         }
-        if out.failure != nil {
-            healthTimer?.cancel()
-            healthTimer = nil
+        let out = lock.withLock { () -> CaptureFeed.TickOutput in
+            let out = feed.tick(at: now)
+            deliverLocked(out.frames)
+            return out
         }
-        lock.unlock()
         delivery.drain()
         out.notes.forEach { noteBuiltinConversation($0) }
-        if let (u, q) = deadUnit { stopBuiltinUnit(u, queue: q, epoch: activeEpoch) }
-        if let failure = out.failure {
-            noteBuiltinConversation(failure.note)
-            reportBuiltinConversationFailure(failure, epoch: activeEpoch)
-        }
+        if let failure = out.failure { reportFailureOnce(failure, epoch: active) }
     }
 
-    private func acceptBuiltinConversationConverted(_ converted: [Float], at time: TimeInterval,
+    private func acceptBuiltinConversationConverted(_ frames: [Float], at time: TimeInterval,
                                                     epoch: CaptureEpoch, builtinUnit: BuiltinCapture?) {
-        let unit = builtinUnit ?? lock.withLock { builtin }
-        let currentID = unit.currentDeviceID
-        let expectedID = unit.expectedDeviceID
-        let bindMatches = expectedID != nil && currentID == expectedID
-
+        guard let unit = builtinUnit else { return }
+        // Native read-back runs after start and on the independent health queue. Never call it
+        // from the unit worker: native stop holds its unit lock while draining that worker.
         lock.lock()
-        guard engineEpoch === epoch,
-              captureRunning,
-              builtinActive,
-              unit === builtin,
-              !routeApplying,
-              routeGeneration == appliedRouteGeneration
-        else {
-            lock.unlock()
-            return
-        }
-        guard builtinBindVerified, bindMatches else {
+        guard engineEpoch === epoch, builtin === unit, captureRunning, builtinActive, !failureReported,
+              !routeApplying, routeGeneration == appliedRouteGeneration else { lock.unlock(); return }
+        guard builtinBindVerified else {
             builtinBindVerified = false
             lock.unlock()
             return
         }
-        let arrival = builtinConversationClock()
-        if !converted.isEmpty {
-            builtinReceivedSinceRestart = true
-        }
-        let d6Verdict = soleBuiltinFirstAudio.observeFrames(converted, at: arrival)
-        let d6Handler = d6Verdict != nil ? builtinFirstAudioHandler : nil
-        if d6Verdict != nil {
-            builtinFirstAudioTimer?.cancel()
-            builtinFirstAudioTimer = nil
-        }
-        var shouldFireFirstBuffer = false
-        let currentTap = tapEpoch
-        if !converted.isEmpty, stats.firstBufferMs == nil {
-            stats.firstBufferMs = max(0, elapsedMs())
-            shouldFireFirstBuffer = true
-        }
+        let now = builtinConversationClock()
+        soleBuiltinFirstAudio.observe(frames: frames, at: now)
+        let first = !frames.isEmpty && stats.firstBufferMs == nil
+        if first { stats.firstBufferMs = elapsedMs() }
         instrumentation.callback(.builtin)
-        instrumentation.frames(.builtin, converted)
-        let decision = feed.accept(converted, source: .builtin, at: time, arrivedAt: arrival, epoch: epoch)
+        instrumentation.frames(.builtin, frames)
+        let decision = feed.accept(frames, source: .builtin, at: time, arrivedAt: now, epoch: epoch)
         deliverLocked(decision.frames)
-        let firstKeptMs = decision.firstKept ? feed.bridge.firstKeptMs : nil
         lock.unlock()
-
         delivery.drain()
-        if shouldFireFirstBuffer {
+        if first {
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.lock.withLock({
-                    self.engineEpoch === epoch && self.captureRunning && self.tapEpoch === currentTap
-                }) else { return }
+                guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.failureReported }) else { return }
                 self.onFirstBuffer?()
             }
         }
-        if let d6Verdict {
-            noteBuiltinConversation("builtin_first_audio=\(d6Verdict.rawValue)")
-            d6Handler?(d6Verdict)
-        }
         decision.notes.forEach { noteBuiltinConversation($0) }
-        if let firstKeptMs {
-            noteBuiltinConversation("tap2_to_first_kept_buffer_ms=\(firstKeptMs) kept_src=builtin")
-        }
     }
 
     public enum RecorderError: Error { case noInput, builtinDrift, notConversation, routeTeardownPending }

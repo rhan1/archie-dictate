@@ -98,13 +98,13 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
         guard verdict == nil else { return false }
         if startTimedOut { return true }
         guard let due = deadline else { return false }
-        return now + 1e-9 >= due
+        return now >= due
     }
 
     /// Serialized with `evaluate(at:)`. A buffer observed at or before `t0 + limit` counts.
     public mutating func observe(frames: [Float], at time: TimeInterval) {
         guard verdict == nil, !startTimedOut, let t0 = startReturnedAt, !frames.isEmpty else { return }
-        guard time <= t0 + Self.limit + 1e-9 else { return }
+        guard time <= t0 + Self.limit else { return }
         let peak = frames.reduce(Float(0)) { max($0, abs($1)) }
         totalBuffers += 1
         if peak > maxPeak { maxPeak = peak }
@@ -123,21 +123,18 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
             return .noBuffer
         }
         guard let t0 = startReturnedAt else {
-            if let req = requestTime, now + 1e-9 >= req + Self.limit {
+            if let req = requestTime, now >= req + Self.limit {
                 startTimedOut = true
                 verdict = .noBuffer
                 return .noBuffer
             }
             return nil
         }
-        guard now + 1e-9 >= t0 + Self.limit else { return nil }
+        guard now >= t0 + Self.limit else { return nil }
         let decided: BuiltinFirstAudioVerdict
         if totalBuffers == 0 {
             decided = .noBuffer
         } else if aboveThresholdBuffers == 0 {
-            decided = .zeros
-        } else if aboveThresholdBuffers == 1 && !lastBufferAboveThreshold && totalBuffers > 1 {
-            // One startup transient/click followed by digital zeros.
             decided = .zeros
         } else {
             decided = .ok
