@@ -3081,10 +3081,8 @@ public final class AudioRecorder: CaptureEngine {
             failBuiltinConversationBind(epoch: epoch, from: from, expected: expected)
             return
         }
-        if reason == .drift {
-            lock.withLock {
-                builtinBindDetectedFrom = from; builtinBindDetectedExpected = expected
-            }
+        lock.withLock {
+            builtinBindDetectedFrom = from; builtinBindDetectedExpected = expected
         }
         let replacement = lock.withLock { () -> (BuiltinCapture, DispatchQueue, BuiltinCapture, DispatchQueue)? in
             guard engineEpoch === epoch, !failureReported else { return nil }
@@ -3154,7 +3152,15 @@ public final class AudioRecorder: CaptureEngine {
         }
         delivery.drain()
         out.notes.forEach { noteBuiltinConversation($0) }
-        if let failure = out.failure { reportFailureOnce(failure, epoch: active) }
+        if let failure = out.failure {
+            if state.1 {
+                // The attempted recovery itself never produced input. This is the sole
+                // source's second failure, so expose the typed host fallback trigger.
+                failBuiltinConversationBind(epoch: active, from: state.3, expected: state.4)
+            } else {
+                reportFailureOnce(failure, epoch: active)
+            }
+        }
     }
 
     /// Called under the state lock. Every queued chunk carries the source attempt's fence.
