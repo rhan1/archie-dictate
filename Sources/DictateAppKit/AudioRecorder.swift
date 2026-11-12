@@ -2980,7 +2980,15 @@ public final class AudioRecorder: CaptureEngine {
             return routeGeneration
         }
         guard let generation else { return false }
-        defer { lock.withLock { routeApplying = false } }
+        defer {
+            let appliedEpoch = lock.withLock { () -> CaptureEpoch in
+                routeApplying = false
+                return engineEpoch
+            }
+            // A failed start read-back can arrive on the health queue during apply.
+            // Recheck after leaving that guard even when the periodic timer is disabled.
+            healthQueue.async { [weak self] in self?.builtinConversationTick(epoch: appliedEpoch) }
+        }
         let formatRoute = route.currentBuiltinConversationRoute()
         let needsFormat = lock.withLock {
             builtinFormatPending || RouteFingerprint.builtinFormatChanged(from: appliedRouteFingerprint, to: formatRoute)

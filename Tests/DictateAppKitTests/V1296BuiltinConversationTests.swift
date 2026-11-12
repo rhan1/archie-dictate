@@ -357,6 +357,7 @@ struct V1296BuiltinConversationTests {
         let r = Rig([Builtin(), wrong, Builtin()]); try await r.start()
         r.routeFacts.update { $0.1.id = 90 }
         r.recorder.observeConversationRoute()
+        r.clock.value = 100.1
         #expect(try r.recorder.reconfigureConversationInput(at: 100.1))
         #expect(await Self.eventually { r.units.value.count == 3 && r.units.value.last!.started })
         r.emit(at: 100.2)
