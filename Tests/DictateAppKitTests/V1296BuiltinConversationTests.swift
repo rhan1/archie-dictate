@@ -606,6 +606,23 @@ struct V1296BuiltinConversationTests {
         await r.stop()
     }
 
+    @Test func builtin_conversation_then_dictation_clears_format_callback() async throws {
+        let r = Rig(); try await r.start()
+        let unit = r.units.value.last!
+        #expect(unit.onFormatChange != nil)
+        await r.stop()
+        #expect(unit.onFormatChange == nil)
+        r.recorder.kind = .dictation
+        r.clock.value = ProcessInfo.processInfo.systemUptime
+        try await r.start(device: .default)
+        r.emit(at: ProcessInfo.processInfo.systemUptime)
+        #expect(unit.onFormatChange == nil)
+        #expect(r.headset.starts == 1 && r.chunks.value.count == 1)
+        #expect(r.verdicts.value.isEmpty)
+        print("D GREEN conversation_to_dictation_reuse_control=1")
+        await r.stop()
+    }
+
     @Test func first_audio_clock_anchors_to_return_not_request() async throws {
         let unit = Builtin(), r = Rig([unit])
         unit.afterStart = { r.clock.value = 100.2 }
