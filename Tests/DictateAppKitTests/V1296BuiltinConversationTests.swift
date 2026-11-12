@@ -365,26 +365,32 @@ struct V1296BuiltinConversationTests {
         print("D GREEN route_apply_bind_readback=1")
         await r.stop()
     }
-    @Test func bind_failed_does_not_wait_on_teardown() async throws {
+    @Test(arguments: [nil, 999] as [UInt32?])
+    func bind_failed_does_not_wait_on_teardown(readback: UInt32?) async throws {
         let old = Builtin(), next = Builtin()
         let gate = DispatchSemaphore(value: 0)
         old.stopGate = gate
         let r = Rig([old, next]); try await r.start(); r.emit()
         let savedFrames = old.onFrames!, savedEpoch = old.running.value!
-        old.readback.value = nil
+        old.readback.value = readback
         let began = ProcessInfo.processInfo.systemUptime
         r.tick(100.1)
         let count = r.chunks.value.count
         old.emit(Array(repeating: 0, count: 2_400), at: 100.2)
         #expect(r.chunks.value.count == count)
+        if readback != nil { // Exercise the health-tick deadline, as well as the independent timer (nil case).
+            r.tick(100.1 + AudioRecorder.builtinBindFailureLimit + 0.01)
+        }
         #expect(await Self.eventually { !r.failures.value.isEmpty })
         let notifiedMs = ((r.failureTimes.value.first ?? ProcessInfo.processInfo.systemUptime) - began) * 1000
         #expect(notifiedMs <= AudioRecorder.builtinBindFailureLimit * 1000)
         #expect(r.failures.value.map(\.reason) == [.builtinBindFailed])
+        #expect(r.failures.value.first?.bindFrom == readback)
+        #expect(r.failures.value.first?.bindExpected == 81)
         #expect(next.starts.value == 0) // old native stop is hung: replacement must never open
         savedFrames(Array(repeating: 0.5, count: 2_400), 100.3, savedEpoch)
         #expect(!r.recorder.isRunning && r.chunks.value.count == count)
-        print("D GREEN bind_failed_does_not_wait_on_teardown=1 notified_ms=\(Int(notifiedMs.rounded()))")
+        print("D GREEN bind_failed_does_not_wait_on_teardown=1 notified_ms=\(Int(notifiedMs.rounded())) from=\(readback.map(String.init) ?? "unverified") expected=81")
         gate.signal()
         await r.stop()
     }
