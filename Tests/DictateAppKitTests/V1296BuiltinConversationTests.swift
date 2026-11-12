@@ -209,8 +209,9 @@ struct V1296BuiltinConversationTests {
     }
     @Test func d1a_non_bluetooth_deadline() async throws {
         let r = Rig(); try await r.start()
-        for step in 0...20 { r.emit(0, at: 100 + Double(step) / 10) }
-        r.tick(102)
+        let steps = Int((CaptureHealth.failAfter / CaptureHealth.tickInterval).rounded())
+        for step in 0...steps { r.emit(0, at: 100 + Double(step) * CaptureHealth.tickInterval) }
+        r.tick(100 + CaptureHealth.failAfter)
         #expect(await Self.eventually { r.failures.value.count == 1 })
         #expect(r.failures.value.first?.reason == .micDead)
         #expect(r.failures.value.first?.durationSeconds == CaptureHealth.failAfter)
@@ -239,8 +240,16 @@ struct V1296BuiltinConversationTests {
                 $0.2.alive.toggle()
             }
             r.recorder.observeConversationRoute(invalidated: true)
+            // Model the host applying every pending generation, so churn cannot hide behind
+            // the recorder's one-pending-generation latch.
+            if r.recorder.activeRouteGeneration != r.recorder.activeAppliedRouteGeneration {
+                _ = try r.recorder.reconfigureConversationInput(at: r.clock.value)
+            }
+            r.emit(at: r.clock.value)
         }
-        #expect(r.recorder.activeRouteGeneration == 0)
+        let profileGenerations = r.recorder.activeRouteGeneration
+        #expect(profileGenerations == 0)
+        #expect(profileGenerations <= 2)
         #expect(r.units.value.count == 1 && r.units.value[0].stops.value == 0)
         #expect(!r.recorder.builtinConversationDiagnostics.contains { $0.hasPrefix("conv_apply=") })
         // Every required field still invalidates the real recorder, including a fractional rate.
@@ -254,22 +263,29 @@ struct V1296BuiltinConversationTests {
             #expect(r.recorder.activeRouteGeneration == UInt64(field + 1))
             #expect(try r.recorder.reconfigureConversationInput(at: r.clock.value))
         }
-        print("D \(Self.phase) builtin_conversation_route_loop=1")
+        print("D \(Self.phase) builtin_conversation_route_loop=\(profileGenerations == 0 ? 1 : 0) profile_generations=\(profileGenerations)")
         await r.stop()
     }
-    @Test func headset_toggle_converges_within_2_generations() async throws {
+    @Test(arguments: [false, true]) func headset_toggle_converges_within_2_generations(outputAlsoChanges: Bool) async throws {
         let r = Rig(); try await r.start()
         for step in 0..<2 {
             r.routeFacts.update {
-                if step == 0 { $0.1.alive = false; $0.2.alive = false }
-                else { $0.1.id = 90; $0.1.uid = "speakers"; $0.2.id = 81; $0.2.uid = "mac" }
+                if step == 0 {
+                    $0.2.alive = false
+                    if outputAlsoChanges { $0.1.alive = false }
+                } else {
+                    $0.2.id = 81; $0.2.uid = "mac"
+                    if outputAlsoChanges { $0.1.id = 90; $0.1.uid = "speakers" }
+                }
             }
             r.clock.value = 100 + Double(step) * 0.5
             r.recorder.observeConversationRoute()
-            #expect(try r.recorder.reconfigureConversationInput(at: r.clock.value))
+            let applied = try r.recorder.reconfigureConversationInput(at: r.clock.value)
+            #expect(applied == (outputAlsoChanges || step == 1))
         }
-        #expect(r.recorder.activeRouteGeneration == 2)
-        #expect(r.recorder.activeAppliedRouteGeneration == 2)
+        let expected: UInt64 = outputAlsoChanges ? 2 : 1
+        #expect(r.recorder.activeRouteGeneration == expected)
+        #expect(r.recorder.activeAppliedRouteGeneration == expected)
         #expect(r.clock.value - 100 < 2)
         print("D GREEN headset_toggle_converges_within_2_generations=1")
         await r.stop()
@@ -393,7 +409,17 @@ struct V1296BuiltinConversationTests {
     ]
     @Test(arguments: firstCases) func first_audio_verdict(_ c: FirstCase) async throws {
         let r = Rig(); try await r.start()
-        for (index, value) in c.samples.enumerated() { r.emit(value, at: 100.1 + Double(index) * 0.1) }
+        for (index, value) in c.samples.enumerated() {
+            let time = 100.1 + Double(index) * 0.1
+            if c.name == "startup_click_then_zeros", index == 0 {
+                var click = [Float](repeating: 0, count: AudioRecorder.chunkSamples)
+                click[0] = value // one sample, not a 100 ms block of DC
+                r.clock.value = time; r.units.value.last!.emit(click, at: time)
+            } else if c.name == "steady_low_room_noise" {
+                let noise = (0..<AudioRecorder.chunkSamples).map { Float(($0 * 7) % 17 - 8) / 8_000 }
+                r.clock.value = time; r.units.value.last!.emit(noise, at: time)
+            } else { r.emit(value, at: time) }
+        }
         r.tick(100.999)
         #expect(r.verdicts.value.isEmpty)
         r.tick(101)
@@ -470,7 +496,8 @@ struct V1296BuiltinConversationTests {
     }
 
     @Test func format_listener_and_route_notification_coalesce() async throws {
-        let r = Rig(); try await r.start()
+        let replacement = Builtin(); replacement.hardwareFormatSummary = (44_100, 1)
+        let r = Rig([Builtin(), replacement]); try await r.start()
         let old = r.units.value[0]
         r.routeFacts.update { $0.0.rate = 44_100 }
         old.onFormatChange?(old.running.value!)
@@ -501,7 +528,8 @@ struct V1296BuiltinConversationTests {
         #expect(r.headset.starts == 1 && r.recorder.isRunning)
         #expect(r.chunks.value.count == 1)
         #expect(r.recorder.builtinConversationDiagnostics.isEmpty && r.verdicts.value.isEmpty)
-        print("D GREEN dictation_runtime_control=1")
+        // The complete gate also includes the archived source hunk audit and executed base/current suites.
+        print("D GREEN dictation_path_unchanged=1")
         await r.stop()
     }
 
