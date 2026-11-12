@@ -2134,6 +2134,9 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func startHealthClock(epoch: CaptureEpoch) {
+        if lock.withLock({ captureKind == .conversation && selectedDevice == .builtIn }) {
+            if !builtinConversationAutomaticTimers { return }
+        }
         let timer = DispatchSource.makeTimerSource(queue: healthQueue)
         timer.schedule(deadline: .now() + CaptureHealth.tickInterval, repeating: CaptureHealth.tickInterval)
         timer.setEventHandler { [weak self] in self?.healthTick(epoch: epoch) }
@@ -2729,6 +2732,7 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinConversationNotes: [String] = []
     private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure")
     var builtinConversationDiagnostics: [String] { lock.withLock { builtinConversationNotes } }
+    var builtinConversationAutomaticTimers = true
     var builtinConversationClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     var hasAllocatedEngine: Bool { lock.withLock { engine != nil } }
     var hasConfigurationObserver: Bool { lock.withLock { configObserver != nil } }
@@ -2798,6 +2802,7 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func armBuiltinFirstAudioTimer() {
+        guard builtinConversationAutomaticTimers else { return }
         let timer = DispatchSource.makeTimerSource(queue: healthQueue)
         // Repeating until t0 + limit: start can return at any point in the first second.
         timer.schedule(deadline: .now() + CaptureHealth.tickInterval, repeating: CaptureHealth.tickInterval)
