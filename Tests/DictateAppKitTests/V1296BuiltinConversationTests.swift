@@ -475,12 +475,13 @@ struct V1296BuiltinConversationTests {
         print("D GREEN first_audio_route_apply_and_relisten_do_not_renew=1")
         await r.stop()
     }
-    @Test(arguments: [44_100.0, 48_000.0]) func builtin_conversation_chunk_rate(hardwareRate: Double) async throws {
-        let unit = Builtin(); unit.hardwareFormatSummary = (hardwareRate, 1)
-        let r = Rig([unit]); try await r.start()
+    /// The real unit conversion and recorder feed/delivery path, without creating an AudioUnit.
+    static func checkTone(_ r: Rig, hardwareRate: Double, at time: TimeInterval) throws -> Int {
         // Execute the unit's real render-slot drain and AVAudioConverter without creating an AUHAL.
         let conversion = BuiltinCaptureUnit()
-        var start = 100.0
+        let unit = r.units.value.last!
+        let chunkOffset = r.chunks.value.count
+        var start = time
         conversion.onFrames = { frames, _, _ in
             r.clock.value = start
             unit.emit(frames, at: start)
@@ -489,7 +490,7 @@ struct V1296BuiltinConversationTests {
         let tone = (0..<Int(hardwareRate * 0.5)).map { Float(0.25 * sin(2 * Double.pi * 1_000 * Double($0) / hardwareRate)) }
         try conversion.drainOffline(monoFrames: tone, hardwareSampleRate: hardwareRate, epoch: CaptureEpoch())
         conversion.stop()
-        let chunks = r.chunks.value
+        let chunks = Array(r.chunks.value.dropFirst(chunkOffset))
         #expect(chunks.count >= 4 && chunks.count <= 5)
         #expect(chunks.allSatisfy { $0.count == AudioRecorder.chunkSamples })
         let chunk = try #require(chunks.last)
@@ -498,25 +499,35 @@ struct V1296BuiltinConversationTests {
         #expect(worstError <= 4)
         let crossings = (1..<chunk.count).filter { chunk[$0 - 1] <= 0 && chunk[$0] > 0 }.count
         #expect(abs(crossings - 100) <= 1)
-        #expect(abs((start - 100) - 0.5) < 0.01)
-        print("D GREEN builtin_conversation_chunk_rate=24000 hw_rate=\(Int(hardwareRate)) chunks=\(chunks.count) period=24")
+        #expect(abs((start - time) - 0.5) < 0.01)
+        return chunks.count
+    }
+    @Test(arguments: [44_100.0, 48_000.0]) func builtin_conversation_chunk_rate(hardwareRate: Double) async throws {
+        let unit = Builtin(); unit.hardwareFormatSummary = (hardwareRate, 1)
+        let r = Rig([unit]); try await r.start()
+        let count = try Self.checkTone(r, hardwareRate: hardwareRate, at: 100)
+        print("D GREEN builtin_conversation_chunk_rate=24000 hw_rate=\(Int(hardwareRate)) chunks=\(count) period=24")
         await r.stop()
     }
 
     @Test func format_listener_and_route_notification_coalesce() async throws {
         let replacement = Builtin(); replacement.hardwareFormatSummary = (44_100, 1)
         let r = Rig([Builtin(), replacement]); try await r.start()
+        _ = try Self.checkTone(r, hardwareRate: 48_000, at: 100)
+        r.clock.value = 100.6
         let old = r.units.value[0]
         r.routeFacts.update { $0.0.rate = 44_100 }
         old.onFormatChange?(old.running.value!)
         #expect(await Self.eventually { r.recorder.activeRouteGeneration == 1 })
         r.recorder.observeConversationRoute()
-        #expect(try r.recorder.reconfigureConversationInput(at: 100.1))
+        #expect(try r.recorder.reconfigureConversationInput(at: 100.6))
         r.recorder.observeConversationRoute()
         #expect(r.units.value.count == 2)
         #expect(r.recorder.activeRouteGeneration == 1)
         #expect(r.recorder.builtinConversationDiagnostics.filter { $0 == "builtin_restart=1 reason=format" }.count == 1)
+        _ = try Self.checkTone(r, hardwareRate: 44_100, at: 100.6)
         print("D GREEN d1a_format_notifications_coalesce=1")
+        print("D GREEN d1a_format_restart_pitch_duration=1 hw_rates=48000,44100 period=24")
         await r.stop()
     }
     @Test func default_conversation_unchanged() async throws {
