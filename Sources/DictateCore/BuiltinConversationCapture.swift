@@ -9,8 +9,8 @@ public protocol BuiltinFormatChangeReporting: BuiltinCapture {
 }
 
 /// 1.29.6 (D1a/D3): at most one built-in unit restart per 5.0 s window for a sole-builtin conversation.
-/// A second failure inside the window is declined so `CaptureHealth.failAfter` (2.0 s) or `builtin_bind_failed`
-/// terminates the capture cleanly instead of spinning.
+/// A second failure inside the window is declined so `builtin_bind_failed` terminates the capture cleanly
+/// instead of spinning.
 public struct SoleBuiltinRestartPolicy: Equatable, Sendable {
     public static let window: TimeInterval = 5.0
 
@@ -60,6 +60,7 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
 
     public private(set) var requestTime: TimeInterval?
     public private(set) var startReturnedAt: TimeInterval?
+    public private(set) var startTimedOut: Bool = false
     public private(set) var totalBuffers: Int = 0
     public private(set) var aboveThresholdBuffers: Int = 0
     public private(set) var lastBufferAboveThreshold: Bool = false
@@ -74,12 +75,12 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
     }
 
     /// Records `t0` when the unit's `start(epoch:)` returns. Returns the `builtin_first_audio_clock` note
-    /// once per attempt, or `nil` if already recorded or if start took at least `limit` (which settles as `.noBuffer`).
+    /// once per attempt, or `nil` if already recorded or if start took at least `limit` (which settles as `.noBuffer` in `evaluate`).
     @discardableResult
     public mutating func startReturned(at time: TimeInterval) -> String? {
-        guard verdict == nil, startReturnedAt == nil else { return nil }
+        guard verdict == nil, startReturnedAt == nil, !startTimedOut else { return nil }
         if let req = requestTime, time - req >= Self.limit {
-            verdict = .noBuffer
+            startTimedOut = true
             return nil
         }
         startReturnedAt = time
@@ -94,13 +95,15 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
     }
 
     public func isDue(at now: TimeInterval) -> Bool {
-        guard verdict == nil, let due = deadline else { return false }
+        guard verdict == nil else { return false }
+        if startTimedOut { return true }
+        guard let due = deadline else { return false }
         return now + 1e-9 >= due
     }
 
     /// Serialized with `evaluate(at:)`. A buffer observed at or before `t0 + limit` counts.
     public mutating func observe(frames: [Float], at time: TimeInterval) {
-        guard verdict == nil, let t0 = startReturnedAt, !frames.isEmpty else { return }
+        guard verdict == nil, !startTimedOut, let t0 = startReturnedAt, !frames.isEmpty else { return }
         guard time <= t0 + Self.limit + 1e-9 else { return }
         let peak = frames.reduce(Float(0)) { max($0, abs($1)) }
         totalBuffers += 1
@@ -115,8 +118,13 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
     @discardableResult
     public mutating func evaluate(at now: TimeInterval) -> BuiltinFirstAudioVerdict? {
         guard verdict == nil else { return nil }
+        if startTimedOut {
+            verdict = .noBuffer
+            return .noBuffer
+        }
         guard let t0 = startReturnedAt else {
             if let req = requestTime, now + 1e-9 >= req + Self.limit {
+                startTimedOut = true
                 verdict = .noBuffer
                 return .noBuffer
             }
@@ -141,7 +149,34 @@ public struct SoleBuiltinFirstAudio: Equatable, Sendable {
 
 /// 1.29.6 (D2/D4): built-in conversation route fingerprint and `route_fp` diagnostic formatting.
 /// Hashes ONLY: built-in `(id, uid, rate, alive, channels)` + default output `(id, uid, alive)` + default input `(id, uid)`.
+/// Output rate/streams and input rate/liveness/streams are excluded by construction.
 public enum RouteFingerprint {
+    /// Complete raw device snapshot before D2 field projection.
+    public struct RawDeviceFacts: Equatable, Sendable {
+        public var id: UInt32
+        public var uid: String
+        public var rate: Double
+        public var alive: Bool
+        public var inputChannels: UInt32
+        public var outputChannels: UInt32
+
+        public init(
+            id: UInt32,
+            uid: String,
+            rate: Double = 48_000,
+            alive: Bool = true,
+            inputChannels: UInt32 = 0,
+            outputChannels: UInt32 = 0
+        ) {
+            self.id = id
+            self.uid = uid
+            self.rate = rate
+            self.alive = alive
+            self.inputChannels = inputChannels
+            self.outputChannels = outputChannels
+        }
+    }
+
     public struct BuiltinFacts: Equatable, Sendable {
         public var id: UInt32
         public var uid: String
@@ -180,16 +215,21 @@ public enum RouteFingerprint {
         }
     }
 
-    public struct BuiltinConversationSnapshot: Equatable, Sendable {
-        public var builtin: BuiltinFacts?
-        public var output: OutputFacts?
-        public var input: InputFacts?
-
-        public init(builtin: BuiltinFacts?, output: OutputFacts?, input: InputFacts?) {
-            self.builtin = builtin
-            self.output = output
-            self.input = input
+    public static func builtinConversation(
+        rawBuiltin: RawDeviceFacts?,
+        rawOutput: RawDeviceFacts?,
+        rawInput: RawDeviceFacts?
+    ) -> String {
+        let b = rawBuiltin.map {
+            BuiltinFacts(id: $0.id, uid: $0.uid, rate: $0.rate, alive: $0.alive, channels: $0.inputChannels)
         }
+        let o = rawOutput.map {
+            OutputFacts(id: $0.id, uid: $0.uid, alive: $0.alive)
+        }
+        let i = rawInput.map {
+            InputFacts(id: $0.id, uid: $0.uid)
+        }
+        return builtinConversation(builtin: b, output: o, input: i)
     }
 
     public static func builtinConversation(
@@ -231,5 +271,28 @@ public enum RouteFingerprint {
         let afterHash = shortHash(after)
         let changed = changedField(from: before, to: after)
         return "route_fp gen=\(generation) before=\(beforeHash) after=\(afterHash) changed=\(changed)"
+    }
+}
+
+/// 1.29.6 (D4): exact diagnostic lines for built-in conversation capture.
+public enum BuiltinConversationDiagnostics {
+    public static func convCaptureNote(
+        backend: String = "auhal",
+        device: UInt32?,
+        sampleRate: Double,
+        channels: Int
+    ) -> String {
+        let dev = device.map(String.init) ?? "0"
+        return "conv_capture backend=\(backend) device=\(dev) hw_rate=\(Int(sampleRate.rounded())) hw_ch=\(channels) session_kind=conversation"
+    }
+
+    public static func builtinBindNote(result: String, from: UInt32?, to: UInt32?) -> String {
+        let fromStr = from.map(String.init) ?? "unverified"
+        let toStr = to.map(String.init) ?? "0"
+        return "builtin_bind result=\(result) from=\(fromStr) to=\(toStr)"
+    }
+
+    public static func convApplyNote(generation: UInt64) -> String {
+        "conv_apply=rebuild reason=builtin_auhal gen=\(generation)"
     }
 }

@@ -177,10 +177,10 @@ public struct CaptureFeed {
         alignNote = nil
         extraNotes = []
         health = CaptureHealth(startupPolicy: startupPolicy)
-        health.bluetooth = defaultInput == .bluetooth
+        health.bluetooth = sole == nil && defaultInput == .bluetooth
         evidence = CaptureEvidence()
         timeline = SourceTimeline()
-        timeline.headsetLabel = defaultInput == .bluetooth ? "headset" : "default_input"
+        timeline.headsetLabel = sole == nil && defaultInput == .bluetooth ? "headset" : "default_input"
     }
 
     /// The owner asked a source's hardware to start (its startup grace runs from here).

@@ -13,10 +13,14 @@ import Synchronization
 ///
 /// The IO callback only renders into preallocated slots (no allocation, no locks); a worker
 /// drains them every 10 ms, converts to 24 kHz mono Float and hands them to `onFrames`.
-final class BuiltinCaptureUnit: BuiltinCapture {
+final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
+    static let uidOverrideDefaultsKey = "DictateBuiltinCaptureUIDOverride"
+
     var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
     var onDeviceLost: ((CaptureEpoch) -> Void)?
+    var onFormatChange: ((CaptureEpoch) -> Void)?
     let backend = "auhal"
+    var defaults: UserDefaults = .standard
 
     private let lock = NSLock()
     /// Held across every call on the opaque unit from another thread (read-back) and across its
@@ -31,6 +35,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
     private var device: AudioDeviceID?
     private var converter: AVAudioConverter?
     private var hardwareFormat: AVAudioFormat?
+    private var currentHardwareSummary: (sampleRate: Double, channels: Int)?
     private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var lastArrival: TimeInterval?
     private var retained: [BuiltinRenderContext] = []
@@ -38,6 +43,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
     /// v1.27 (B1): set on the unit's queue when `start(epoch:)` returned; cleared by `stop()`.
     private var isStarted = false
     var started: Bool { lock.withLock { isStarted } }
+    var hardwareFormatSummary: (sampleRate: Double, channels: Int)? { lock.withLock { currentHardwareSummary } }
     private let targetFormat = try? NativePCM.format(.pcmFormatFloat32, rate: AudioRecorder.sampleRate,
                                              channels: 1, interleaved: false)
     /// Notes for the recorder's timeline (start step errors, teardown errors, render errors).
@@ -62,12 +68,32 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         var errorDescription: String? { description }
     }
 
+    /// D5 (1.29.6): resolves `DictateBuiltinCaptureUIDOverride` when set on `defaults`, logging
+    /// `builtin_override=1 uid=<uid>`. When unset or empty, resolves the physical built-in input with no log line.
+    static func resolveDevice(
+        defaults: UserDefaults = .standard,
+        lookupUID: (String) -> AudioDeviceID? = AudioDevices.device(forUID:),
+        builtIn: () throws -> AudioDeviceID = AudioDevices.builtInInput,
+        note: (String) -> Void
+    ) throws -> (id: AudioDeviceID, overrideUID: String?) {
+        if let raw = defaults.string(forKey: Self.uidOverrideDefaultsKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            guard let id = lookupUID(raw) else {
+                throw StartError(step: "override_uid", status: -1)
+            }
+            note("builtin_override=1 uid=\(raw)")
+            return (id, raw)
+        }
+        return (try builtIn(), nil)
+    }
+
     func start(epoch token: CaptureEpoch) throws {
         guard let targetFormat else { throw StartError(step: "target_format", status: -1) }
         stop()
-        let id = try AudioDevices.builtInInput()
-        let uid = AudioDevices.uid(of: id)
-        lock.withLock { epoch = token; device = id; deviceUID = uid; lastArrival = nil }
+        let resolved = try Self.resolveDevice(defaults: defaults, note: note)
+        let id = resolved.id
+        let uid = resolved.overrideUID ?? AudioDevices.uid(of: id)
+        lock.withLock { epoch = token; device = id; deviceUID = uid; lastArrival = nil; currentHardwareSummary = nil }
         var description = AudioComponentDescription(componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput, componentManufacturer: kAudioUnitManufacturer_Apple,
             componentFlags: 0, componentFlagsMask: 0)
@@ -112,6 +138,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
             lock.withLock {
                 self.context = context
                 hardwareFormat = mono
+                currentHardwareSummary = (hardware.mSampleRate, Int(hardware.mChannelsPerFrame))
                 converter = preparedConverter
             }
             try check(AudioUnitInitialize(unit), "initialize")
@@ -123,6 +150,29 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         listen(device: id, epoch: token)
         startWorker()
         lock.withLock { isStarted = true }
+    }
+
+    /// Offline conversion entry point for tests: configures the unit's real `BuiltinRenderContext`,
+    /// `AVAudioFormat` and `AVAudioConverter` without opening a hardware AudioUnit, writes mono
+    /// frames into the slot ring, and runs the unit's real `drain()` into `onFrames`.
+    func drainOffline(monoFrames: [Float], hardwareSampleRate: Double, channels: Int = 1, epoch token: CaptureEpoch) throws {
+        guard let targetFormat else { throw StartError(step: "target_format", status: -1) }
+        guard let mono = try? NativePCM.format(.pcmFormatFloat32, rate: hardwareSampleRate,
+                                               channels: 1, interleaved: false) else {
+            throw StartError(step: "mono_format", status: -1)
+        }
+        let preparedConverter = try NativePCM.converter(from: mono, to: targetFormat)
+        let offlineContext = BuiltinRenderContext(unit: nil, channels: channels)
+        offlineContext.storeMonoSlot(monoFrames, hostTime: 0)
+        lock.withLock {
+            self.epoch = token
+            self.context = offlineContext
+            self.hardwareFormat = mono
+            self.currentHardwareSummary = (hardwareSampleRate, channels)
+            self.converter = preparedConverter
+            self.isStarted = true
+        }
+        drain()
     }
 
     func stop(epoch token: CaptureEpoch) {
@@ -166,6 +216,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
             context = nil
             converter = nil
             hardwareFormat = nil
+            currentHardwareSummary = nil
         }
     }
 
@@ -217,24 +268,40 @@ final class BuiltinCaptureUnit: BuiltinCapture {
         }
     }
 
-    /// Device gone or no longer alive → `onDeviceLost`.
+    /// Device gone or no longer alive → `onDeviceLost`; sample-rate or input-format change → `onFormatChange`.
     private func listen(device id: AudioDeviceID, epoch token: CaptureEpoch) {
         let lost: () -> Void = { [weak self] in
             guard let self, self.lock.withLock({ self.epoch === token }) else { return }
             if !AudioDevices.isAlive(id) { self.onDeviceLost?(token) }
         }
+        let formatChanged: () -> Void = { [weak self] in
+            guard let self, self.lock.withLock({ self.epoch === token }) else { return }
+            if AudioDevices.isAlive(id) { self.onFormatChange?(token) }
+        }
         var alive = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsAlive,
             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         var devices = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var nominalRate = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var streamFormat = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
         let aliveBlock: AudioObjectPropertyListenerBlock = { _, _ in lost() }
         let devicesBlock: AudioObjectPropertyListenerBlock = { _, _ in lost() }
+        let rateBlock: AudioObjectPropertyListenerBlock = { _, _ in formatChanged() }
+        let formatBlock: AudioObjectPropertyListenerBlock = { _, _ in formatChanged() }
         var installed: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
         if AudioObjectAddPropertyListenerBlock(id, &alive, worker, aliveBlock) == noErr {
             installed.append((id, alive, aliveBlock))
         }
         if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &devices, worker, devicesBlock) == noErr {
             installed.append((AudioObjectID(kAudioObjectSystemObject), devices, devicesBlock))
+        }
+        if AudioObjectAddPropertyListenerBlock(id, &nominalRate, worker, rateBlock) == noErr {
+            installed.append((id, nominalRate, rateBlock))
+        }
+        if AudioObjectAddPropertyListenerBlock(id, &streamFormat, worker, formatBlock) == noErr {
+            installed.append((id, streamFormat, formatBlock))
         }
         lock.withLock { listeners = installed }
     }
@@ -248,7 +315,7 @@ final class BuiltinCaptureUnit: BuiltinCapture {
 final class BuiltinRenderContext: @unchecked Sendable {
     static let slots = 64
     static let maxFrames = 4_096
-    let unit: AudioUnit
+    let unit: AudioUnit?
     let channels: Int
     private let bufferList: UnsafeMutableAudioBufferListPointer
     private let channelData: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
@@ -261,7 +328,7 @@ final class BuiltinRenderContext: @unchecked Sendable {
     let renderErrors = Atomic<Int>(0)
     let lastStatus = Atomic<Int32>(0)
 
-    init(unit: AudioUnit, channels: Int) {
+    init(unit: AudioUnit?, channels: Int) {
         self.unit = unit
         self.channels = max(1, channels)
         bufferList = AudioBufferList.allocate(maximumBuffers: self.channels)
@@ -292,6 +359,7 @@ final class BuiltinRenderContext: @unchecked Sendable {
     /// Real-time thread: render, mix to mono into the next free slot. No allocation, no locks.
     func render(_ flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ time: UnsafePointer<AudioTimeStamp>,
                 _ bus: UInt32, _ frames: UInt32) -> OSStatus {
+        guard let unit else { return -1 }
         let count = Int(frames)
         guard count > 0, count <= Self.maxFrames else { dropped.wrappingAdd(1, ordering: .relaxed); return noErr }
         for index in 0..<channels {
@@ -326,6 +394,25 @@ final class BuiltinRenderContext: @unchecked Sendable {
         slotHostTimes[slot] = valid ? time.pointee.mHostTime : 0
         written.store(w + 1, ordering: .releasing)
         return noErr
+    }
+
+    /// Offline test helper: stores mono frames into the slot ring in `maxFrames` chunks.
+    func storeMonoSlot(_ frames: [Float], hostTime: UInt64 = 0) {
+        var offset = 0
+        while offset < frames.count {
+            let count = min(Self.maxFrames, frames.count - offset)
+            let w = written.load(ordering: .relaxed)
+            guard w - read.load(ordering: .acquiring) < Self.slots else { break }
+            let slot = w % Self.slots
+            let destination = slotFrames + slot * Self.maxFrames
+            frames.withUnsafeBufferPointer { ptr in
+                destination.update(from: ptr.baseAddress! + offset, count: count)
+            }
+            slotCounts[slot] = count
+            slotHostTimes[slot] = hostTime
+            written.store(w + 1, ordering: .releasing)
+            offset += count
+        }
     }
 
     /// Worker: the oldest filled slot, copied out by `copy`; nil when empty.

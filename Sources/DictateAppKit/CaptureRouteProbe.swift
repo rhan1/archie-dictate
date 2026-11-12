@@ -27,7 +27,13 @@ struct CaptureRouteProbe {
     var watchDefaultInput: (@escaping (AudioDeviceID?) -> Void) -> AnyObject? = { _ in nil }
 
     var effectiveRoute: () -> String = { "fixture" }
+    /// D2 (1.29.6): built-in conversation route fingerprint (nil falls back to `effectiveRoute`).
+    var builtinConversationRoute: (() -> String)? = nil
     var watchConversationRoute: (@escaping () -> Void) -> AnyObject? = { _ in nil }
+
+    func currentBuiltinConversationRoute() -> String {
+        builtinConversationRoute?() ?? effectiveRoute()
+    }
 
     static let system = CaptureRouteProbe(
         eligibility: { try? AudioDevices.bridgeEligibility() },
@@ -40,6 +46,7 @@ struct CaptureRouteProbe {
         outputIsBluetooth: { AudioDevices.outputIsBluetooth() },
         watchDefaultInput: { DefaultInputWatch($0) },
         effectiveRoute: { ConversationRouteWatch.fingerprint() },
+        builtinConversationRoute: { ConversationRouteWatch.builtinConversationFingerprint() },
         watchConversationRoute: { ConversationRouteWatch($0) })
 }
 
@@ -93,6 +100,11 @@ final class ConversationRouteWatch {
             add(device, kAudioDevicePropertyNominalSampleRate)
             add(device, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput)
             add(device, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeOutput)
+        }
+        if let builtIn = try? AudioDevices.builtInInput() {
+            add(builtIn, kAudioDevicePropertyDeviceIsAlive)
+            add(builtIn, kAudioDevicePropertyNominalSampleRate)
+            add(builtIn, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput)
         }
     }
 
@@ -149,6 +161,47 @@ final class ConversationRouteWatch {
             }
             return "\(device):\(AudioDevices.uid(of: device) ?? "unknown"):\(rate ?? 0):\(alive ?? 0):\(channels)"
         }.joined(separator: "|")
+    }
+
+    static func rawDeviceFacts(_ device: AudioDeviceID, scope: AudioObjectPropertyScope) -> RouteFingerprint.RawDeviceFacts {
+        let rate: Double? = read(device, kAudioDevicePropertyNominalSampleRate)
+        let alive: UInt32? = read(device, kAudioDevicePropertyDeviceIsAlive)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        var channels: UInt32 = 0
+        if AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr, size > 0 {
+            let bytes = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+            defer { bytes.deallocate() }
+            if AudioObjectGetPropertyData(device, &address, 0, nil, &size, bytes) == noErr {
+                let list = UnsafeMutableAudioBufferListPointer(bytes.assumingMemoryBound(to: AudioBufferList.self))
+                channels = list.reduce(0) { $0 + $1.mNumberChannels }
+            }
+        }
+        return RouteFingerprint.RawDeviceFacts(
+            id: device,
+            uid: AudioDevices.uid(of: device) ?? "unknown",
+            rate: rate ?? 0,
+            alive: (alive ?? 0) != 0,
+            channels: Int(channels)
+        )
+    }
+
+    /// D2 (1.29.6): built-in conversation fingerprint excluding output/default-input format churn.
+    static func builtinConversationFingerprint() -> String {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        let builtIn = (try? AudioDevices.builtInInput()).map { rawDeviceFacts($0, scope: kAudioDevicePropertyScopeInput) }
+        let defaultOutput = read(system, kAudioHardwarePropertyDefaultOutputDevice).map {
+            rawDeviceFacts($0, scope: kAudioDevicePropertyScopeOutput)
+        }
+        let defaultInput = read(system, kAudioHardwarePropertyDefaultInputDevice).map {
+            rawDeviceFacts($0, scope: kAudioDevicePropertyScopeInput)
+        }
+        return RouteFingerprint.builtinConversation(
+            rawBuiltin: builtIn,
+            rawOutput: defaultOutput,
+            rawInput: defaultInput
+        )
     }
 
     deinit {
