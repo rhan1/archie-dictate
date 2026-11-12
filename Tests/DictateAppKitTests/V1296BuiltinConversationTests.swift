@@ -344,5 +344,28 @@ struct V1296BuiltinConversationTests {
         print("D GREEN builtin_diagnostics_parser_safe=1")
         await r.stop()
     }
+    @Test func uid_override_uses_only_an_injected_defaults_suite() throws {
+        let suite = "V1296BuiltinConversation.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notes = Box<[String]>([]), lookups = Box<[String]>([]), fallbackCalls = Box(0)
+        func resolve() throws -> (id: UInt32, overrideUID: String?) {
+            try BuiltinCaptureUnit.resolveDevice(defaults: defaults, lookupUID: { uid in
+                lookups.update { $0.append(uid) }; return uid == "override input" ? 92 : nil
+            }, builtIn: { fallbackCalls.update { $0 += 1 }; return 81 }, note: { line in notes.update { $0.append(line) } })
+        }
+        #expect(try resolve().id == 81)
+        #expect(notes.value.isEmpty && lookups.value.isEmpty && fallbackCalls.value == 1)
+        defaults.set("override input", forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
+        #expect(try resolve().id == 92)
+        #expect(lookups.value == ["override input"] && fallbackCalls.value == 1)
+        #expect(notes.value == ["builtin_override=1 uid=override input"])
+        defaults.set("", forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
+        #expect(throws: BuiltinCaptureUnit.StartError.self) { try resolve() }
+        #expect(fallbackCalls.value == 1)
+        defaults.removeObject(forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
+        #expect(try resolve().id == 81)
+        print("D GREEN builtin_uid_override=1")
+    }
 
 }
