@@ -247,13 +247,14 @@ struct V1296BuiltinConversationTests {
         #expect(await Self.eventually { blocked.starts.value == 1 })
         #expect(!blocked.started)
         r.tick(100 + CaptureHealth.failAfter)
-        #expect(await Self.eventually { r.failures.value.map(\.reason) == [.micDead] })
+        let expected: CaptureFailure.Reason = restarting ? .builtinBindFailed : .micDead
+        #expect(await Self.eventually { r.failures.value.map(\.reason) == [expected] })
         #expect(r.failures.value.first?.durationSeconds == CaptureHealth.failAfter)
         let count = r.chunks.value.count
         gate.signal()
         #expect(await Self.eventually { blocked.stops.value > 0 })
         #expect(r.chunks.value.count == count && !r.recorder.isRunning)
-        print("D GREEN pending_native_start_health_deadline=\(CaptureHealth.failAfter) restarting=\(restarting ? 1 : 0)")
+        print("D GREEN pending_native_start_health_deadline=\(CaptureHealth.failAfter) restarting=\(restarting ? 1 : 0) failure=\(expected.rawValue)")
         await r.stop()
     }
 
