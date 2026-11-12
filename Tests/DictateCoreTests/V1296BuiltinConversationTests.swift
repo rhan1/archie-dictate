@@ -9,6 +9,7 @@ struct V1296BuiltinCoreTests {
         #expect(policy.judge(reason: .stale, at: 10) == .restart(.stale))
         #expect(policy.judge(reason: .format, at: 14.999) == .fail)
         #expect(policy.judge(reason: .lost, at: 15) == .restart(.lost))
+        print("D GREEN restart_budget_sliding_window=1")
     }
     @Test func first_audio_clock_starts_when_start_returns() {
         var first = SoleBuiltinFirstAudio()
@@ -18,6 +19,7 @@ struct V1296BuiltinCoreTests {
         first.observe(frames: [CaptureBridge.silencePeak.nextUp], at: 101.2)
         #expect(first.evaluate(at: 101.2) == .ok)
         #expect(first.evaluate(at: 200) == nil)
+        print("D GREEN first_audio_core_deadline=1")
     }
     @Test func sole_source_has_no_bridge_arbitration_and_default_is_unchanged() {
         var sole = CaptureFeed()
@@ -36,5 +38,6 @@ struct V1296BuiltinCoreTests {
             #expect(legacy.bridge.state == explicitDefault.bridge.state)
             #expect(legacy.health.bluetooth == explicitDefault.health.bluetooth)
         }
+        print("D GREEN sole_feed_and_default_parameter_control=1")
     }
 }
