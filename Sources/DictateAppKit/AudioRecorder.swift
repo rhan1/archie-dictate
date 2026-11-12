@@ -2730,6 +2730,7 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinBindTimer: DispatchSourceTimer?
     private var builtinBindVerified = false
     private var builtinBindReattempted = false
+    private var builtinFormatPending = false
     private var builtinRestartInFlight = false
     private var builtinBindDetectedAt: TimeInterval?
     private var appliedRouteFingerprint: String?
@@ -2786,6 +2787,7 @@ public final class AudioRecorder: CaptureEngine {
             builtinActive = true
             builtinBindVerified = false
             builtinBindReattempted = false
+            builtinFormatPending = false
             builtinRestartInFlight = false
             builtinBindDetectedAt = nil
             soleBuiltinRestarts = SoleBuiltinRestartPolicy()
@@ -2967,6 +2969,18 @@ public final class AudioRecorder: CaptureEngine {
         }
         guard let generation else { return false }
         defer { lock.withLock { routeApplying = false } }
+        let formatRoute = route.currentBuiltinConversationRoute()
+        let needsFormat = lock.withLock {
+            builtinFormatPending || RouteFingerprint.builtinFormatChanged(from: appliedRouteFingerprint, to: formatRoute)
+        }
+        if needsFormat {
+            let decision = lock.withLock { soleBuiltinRestarts.judge(reason: .format, at: time ?? builtinConversationClock()) }
+            if decision == .fail {
+                failBuiltinConversationBind(epoch: oldEpoch, from: nil, expected: lock.withLock { builtin.expectedDeviceID })
+                throw CancellationError()
+            }
+            noteBuiltinConversation(SoleBuiltinRestartPolicy.note(reason: .format))
+        }
         let old = lock.withLock { (builtin, builtinQueue) }
         let stopped = DispatchSemaphore(value: 0)
         old.1.async { old.0.stop(epoch: oldEpoch); stopped.signal() }
@@ -3000,6 +3014,7 @@ public final class AudioRecorder: CaptureEngine {
             guard engineEpoch === epoch, lease?.isActive == true, !failureReported else { throw CancellationError() }
             appliedRouteFingerprint = fp
             observedRoute = fp
+            builtinFormatPending = false
             appliedRouteGeneration = generation
         }
         startHealthClock(epoch: epoch)
@@ -3009,10 +3024,23 @@ public final class AudioRecorder: CaptureEngine {
 
     private func builtinConversationProblem(_ unit: BuiltinCapture, reason: SoleBuiltinRestartPolicy.Reason,
                                             epoch: CaptureEpoch) {
+        if reason == .format {
+            let state = lock.withLock { () -> ConversationCaptureState? in
+                guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported, !routeApplying else { return nil }
+                builtinFormatPending = true
+                guard routeGeneration == appliedRouteGeneration else { return nil }
+                routeGeneration += 1
+                tapEpoch = CaptureEpoch()
+                builtinBindVerified = false
+                return .routeChangePending(generation: routeGeneration)
+            }
+            if let state { lock.withLock { conversationStateHandler }?(state) }
+            return
+        }
         let detectedDeadline = DispatchTime.now() + Self.builtinBindFailureLimit / 2
         let now = builtinConversationClock()
         let action = lock.withLock { () -> SoleBuiltinRestartPolicy.Verdict? in
-            guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported else { return nil }
+            guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported, !routeApplying else { return nil }
             if builtinRestartInFlight { return nil }
             builtinBindVerified = false
             tapEpoch = CaptureEpoch()

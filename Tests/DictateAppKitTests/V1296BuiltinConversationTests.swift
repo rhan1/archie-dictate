@@ -65,6 +65,7 @@ struct V1296BuiltinConversationTests {
         let broker = CaptureLeaseBroker()
         let recorder: AudioRecorder
         let failures = Box<[CaptureFailure]>([])
+        let failureTimes = Box<[TimeInterval]>([])
         let verdicts = Box<[BuiltinFirstAudioVerdict]>([])
         let states = Box<[ConversationCaptureState]>([])
         let chunks = Box<[[Int16]]>([])
@@ -91,7 +92,10 @@ struct V1296BuiltinConversationTests {
             recorder.kind = kind
             recorder.builtinConversationAutomaticTimers = false
             recorder.builtinConversationClock = { [clock] in clock.value }
-            recorder.onCaptureFailure = { [failures] failure in failures.update { $0.append(failure) } }
+            recorder.onCaptureFailure = { [failures, failureTimes] failure in
+                failureTimes.update { $0.append(ProcessInfo.processInfo.systemUptime) }
+                failures.update { $0.append(failure) }
+            }
             recorder.onBuiltinFirstAudio = { [verdicts] verdict in verdicts.update { $0.append(verdict) } }
             recorder.onConversationCaptureState = { [states] state in states.update { $0.append(state) } }
             recorder.onPCMChunk = { [chunks] frames in chunks.update { $0.append(frames) } }
@@ -160,7 +164,10 @@ struct V1296BuiltinConversationTests {
         case "stale": r.tick(100 + CaptureHealth.staleAfter + 0.01)
         case "drift": old.readback.value = 999; r.tick(100.1)
         case "lost": old.onDeviceLost?(old.running.value!)
-        default: old.onFormatChange?(old.running.value!)
+        default:
+            old.onFormatChange?(old.running.value!)
+            #expect(await Self.eventually { r.recorder.activeRouteGeneration == 1 })
+            _ = try r.recorder.reconfigureConversationInput(at: r.clock.value)
         }
         #expect(await Self.eventually { r.units.value.count == 2 && r.units.value.last!.started })
         #expect(old.stops.value == 1)
@@ -171,7 +178,10 @@ struct V1296BuiltinConversationTests {
         case "stale": r.tick(101 + CaptureHealth.staleAfter + 0.01)
         case "drift": new.readback.value = 999; r.tick(101.1)
         case "lost": new.onDeviceLost?(new.running.value!)
-        default: new.onFormatChange?(new.running.value!)
+        default:
+            new.onFormatChange?(new.running.value!)
+            #expect(await Self.eventually { r.recorder.activeRouteGeneration == 2 })
+            _ = try? r.recorder.reconfigureConversationInput(at: r.clock.value)
         }
         #expect(await Self.eventually { r.failures.value.map(\.reason) == [.builtinBindFailed] })
         #expect(r.units.value.count == 2)
@@ -292,12 +302,13 @@ struct V1296BuiltinConversationTests {
         old.emit(Array(repeating: 0, count: 2_400), at: 100.2)
         #expect(r.chunks.value.count == count)
         #expect(await Self.eventually { !r.failures.value.isEmpty })
-        #expect(ProcessInfo.processInfo.systemUptime - began <= AudioRecorder.builtinBindFailureLimit)
+        let notifiedMs = ((r.failureTimes.value.first ?? ProcessInfo.processInfo.systemUptime) - began) * 1000
+        #expect(notifiedMs <= AudioRecorder.builtinBindFailureLimit * 1000)
         #expect(r.failures.value.map(\.reason) == [.builtinBindFailed])
         #expect(next.starts.value == 0) // old native stop is hung: replacement must never open
         savedFrames(Array(repeating: 0.5, count: 2_400), 100.3, savedEpoch)
         #expect(!r.recorder.isRunning && r.chunks.value.count == count)
-        print("D GREEN bind_failed_does_not_wait_on_teardown=1")
+        print("D GREEN bind_failed_does_not_wait_on_teardown=1 notified_ms=\(Int(notifiedMs.rounded()))")
         gate.signal()
         await r.stop()
     }
@@ -455,6 +466,56 @@ struct V1296BuiltinConversationTests {
         #expect(abs(crossings - 100) <= 1)
         #expect(abs((start - 100) - 0.5) < 0.01)
         print("D GREEN builtin_conversation_chunk_rate=24000 hw_rate=\(Int(hardwareRate)) chunks=\(chunks.count) period=24")
+        await r.stop()
+    }
+
+    @Test func format_listener_and_route_notification_coalesce() async throws {
+        let r = Rig(); try await r.start()
+        let old = r.units.value[0]
+        r.routeFacts.update { $0.0.rate = 44_100 }
+        old.onFormatChange?(old.running.value!)
+        #expect(await Self.eventually { r.recorder.activeRouteGeneration == 1 })
+        r.recorder.observeConversationRoute()
+        #expect(try r.recorder.reconfigureConversationInput(at: 100.1))
+        r.recorder.observeConversationRoute()
+        #expect(r.units.value.count == 2)
+        #expect(r.recorder.activeRouteGeneration == 1)
+        #expect(r.recorder.builtinConversationDiagnostics.filter { $0 == "builtin_restart=1 reason=format" }.count == 1)
+        print("D GREEN d1a_format_notifications_coalesce=1")
+        await r.stop()
+    }
+    @Test func default_conversation_unchanged() async throws {
+        let r = Rig(); r.clock.value = ProcessInfo.processInfo.systemUptime
+        try await r.start(device: .default)
+        r.emit(at: ProcessInfo.processInfo.systemUptime)
+        #expect(r.headset.starts == 1 && r.recorder.isRunning)
+        #expect(r.chunks.value.count == 1)
+        #expect(r.recorder.builtinConversationDiagnostics.isEmpty && r.verdicts.value.isEmpty)
+        print("D GREEN default_conversation_unchanged=1")
+        await r.stop()
+    }
+    @Test func dictation_path_unchanged() async throws {
+        let r = Rig(kind: .dictation); r.clock.value = ProcessInfo.processInfo.systemUptime
+        try await r.start(device: .default)
+        r.emit(at: ProcessInfo.processInfo.systemUptime)
+        #expect(r.headset.starts == 1 && r.recorder.isRunning)
+        #expect(r.chunks.value.count == 1)
+        #expect(r.recorder.builtinConversationDiagnostics.isEmpty && r.verdicts.value.isEmpty)
+        print("D GREEN dictation_runtime_control=1")
+        await r.stop()
+    }
+
+    @Test func first_audio_clock_anchors_to_return_not_request() async throws {
+        let unit = Builtin(), r = Rig([unit])
+        unit.afterStart = { r.clock.value = 100.2 }
+        try await r.start()
+        r.emit(0, at: 100.3)
+        r.tick(101)
+        #expect(r.verdicts.value.isEmpty)
+        r.tick(101.2)
+        #expect(r.verdicts.value == [.zeros])
+        #expect(r.recorder.builtinConversationDiagnostics.contains("builtin_first_audio_clock start=100200"))
+        print("D GREEN first_audio_clock_anchors_to_return=1")
         await r.stop()
     }
 
