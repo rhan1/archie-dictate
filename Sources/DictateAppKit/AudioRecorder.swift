@@ -2926,7 +2926,8 @@ public final class AudioRecorder: CaptureEngine {
                     result: verified ? (self.lock.withLock { self.builtinBindReattempted } ? "rebound" : "ok") : "failed",
                     from: current, to: expected))
                 if !verified {
-                    self.healthQueue.async { [weak self] in self?.builtinConversationProblem(unit, reason: .drift, epoch: epoch) }
+                    self.healthQueue.async { [weak self] in self?.builtinConversationProblem(unit, reason: .drift, epoch: epoch,
+                        bindReadback: (current, expected)) }
                 }
             } catch {
                 self.failBuiltinConversationBind(epoch: epoch, from: nil, expected: unit.expectedDeviceID)
@@ -3034,7 +3035,8 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func builtinConversationProblem(_ unit: BuiltinCapture, reason: SoleBuiltinRestartPolicy.Reason,
-                                            epoch: CaptureEpoch) {
+                                            epoch: CaptureEpoch,
+                                            bindReadback: (UInt32?, UInt32?)? = nil) {
         if reason == .format {
             let state = lock.withLock { () -> ConversationCaptureState? in
                 guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported, !routeApplying else { return nil }
@@ -3064,12 +3066,13 @@ public final class AudioRecorder: CaptureEngine {
             return soleBuiltinRestarts.judge(reason: reason, at: now)
         }
         guard let action else { return }
+        // Keep the actual read that detected drift; a second native read can differ or block.
+        let evidence = bindReadback ?? (unit.currentDeviceID, unit.expectedDeviceID)
+        let (from, expected) = evidence
         if action == .fail {
-            failBuiltinConversationBind(epoch: epoch, from: unit.currentDeviceID, expected: unit.expectedDeviceID)
+            failBuiltinConversationBind(epoch: epoch, from: from, expected: expected)
             return
         }
-        let from = unit.currentDeviceID
-        let expected = unit.expectedDeviceID
         if reason == .drift {
             lock.withLock {
                 builtinBindDetectedFrom = from; builtinBindDetectedExpected = expected
@@ -3125,7 +3128,7 @@ public final class AudioRecorder: CaptureEngine {
             let current = state.0.currentDeviceID
             let expected = state.0.expectedDeviceID
             if expected == nil || current != expected {
-                builtinConversationProblem(state.0, reason: .drift, epoch: active)
+                builtinConversationProblem(state.0, reason: .drift, epoch: active, bindReadback: (current, expected))
                 return
             }
         }
