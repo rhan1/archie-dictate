@@ -10,7 +10,7 @@ public struct CaptureBridge {
     public enum Source: Sendable { case builtin, headset }
     public enum DefaultInput: Sendable { case builtin, bluetooth, other }
     /// `fallback`: the built-in carries the rest of the dictation; headset frames are ignored.
-    public enum State: Equatable, Sendable { case off, builtinOnly, switched, fallback }
+    public enum State: Equatable, Sendable { case off, builtinOnly, switched, fallback, builtinSole }
     public enum Event: Equatable, Sendable {
         /// No headset signal within `fallbackAfter` of its first buffer.
         case fallback
@@ -159,9 +159,18 @@ public struct CaptureBridge {
     }
 
     public mutating func start(defaultInput: DefaultInput, hasBuiltin: Bool,
-                               epoch token: CaptureEpoch = CaptureEpoch()) {
+                               epoch token: CaptureEpoch = CaptureEpoch(),
+                               sole: Source? = nil) {
         self = CaptureBridge()
         epoch = token
+        if sole == .builtin {
+            state = .builtinSole
+            bridgeSource = "builtin"
+            skipReason = "sole_builtin"
+            bluetooth = false
+            builtinAlive = true
+            return
+        }
         if defaultInput == .builtin { skipReason = "default_builtin" }
         else if defaultInput != .bluetooth { skipReason = "not_bluetooth" }
         else if !hasBuiltin { skipReason = "no_builtin" }
@@ -189,7 +198,7 @@ public struct CaptureBridge {
     private var carrier: String? {
         switch state {
         case .off: return nil
-        case .builtinOnly, .fallback: return "builtin"
+        case .builtinOnly, .fallback, .builtinSole: return "builtin"
         case .switched: return bluetooth ? "headset" : "default_input"
         }
     }
@@ -299,7 +308,7 @@ public struct CaptureBridge {
             staleSwitchback = true
             return result    // the owner replays this buffer from standby, after the frames it missed
         }
-        let feeds = (source == .builtin && (state == .builtinOnly || state == .fallback)) ||
+        let feeds = (source == .builtin && (state == .builtinOnly || state == .fallback || state == .builtinSole)) ||
                     (source == .headset && state == .switched)
         guard feeds else { return result }
         // Trim all samples before the recording boundary or already delivered by
@@ -408,7 +417,7 @@ public struct CaptureBridge {
             fallBack(&result)
         case .switched: switchBack(&result, reason: "headset_engine_failed")
         case .fallback: return .fallback
-        case .off: return nil
+        case .off, .builtinSole: return nil
         }
         return result.event
     }
@@ -465,7 +474,7 @@ public struct CaptureBridge {
 
     /// Returns the release effect only if the bridge still owns the built-in input.
     @discardableResult public mutating func cancel() -> Bool {
-        let release = state == .builtinOnly || state == .fallback
+        let release = state == .builtinOnly || state == .fallback || state == .builtinSole
         state = .off
         epoch = CaptureEpoch()
         recordingStart = nil
