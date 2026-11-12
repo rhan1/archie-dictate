@@ -165,9 +165,15 @@ public struct CaptureHealth: Sendable {
         failed = nil
     }
 
-    public mutating func restartInput(at time: TimeInterval) {
-        headset = SourceState()
-        sourceStarted(.headset, at: time)
+    public mutating func restartInput(at time: TimeInterval, source: Source = .headset) {
+        if source == .builtin {
+            builtin = SourceState()
+            builtinReported = false
+            sourceStarted(.builtin, at: time)
+        } else {
+            headset = SourceState()
+            sourceStarted(.headset, at: time)
+        }
         firstInputSince = time
         warned = nil
         failed = nil
@@ -319,6 +325,8 @@ public struct CaptureFailure: Equatable, Sendable {
         case micDead = "mic_dead"
         /// An engine failed for good with nothing else carrying (today's `mic_start`).
         case engine
+        /// 1.29.6 (D3): built-in AUHAL device read-back stayed wrong or unverified after one re-bind attempt.
+        case builtinBindFailed = "builtin_bind_failed"
     }
     public var reason: Reason
     public var health: CaptureHealth.Reason?
@@ -327,15 +335,22 @@ public struct CaptureFailure: Equatable, Sendable {
     public var framesKept: Int
     public var lastDeliveryMs: Int?
     public var sources: String
+    public var bindFrom: UInt32?
+    public var bindExpected: UInt32?
     public init(reason: Reason, health: CaptureHealth.Reason? = nil, durationSeconds: Double = 0, bytes: Int = 0,
-                framesKept: Int = 0, lastDeliveryMs: Int? = nil, sources: String = "") {
+                framesKept: Int = 0, lastDeliveryMs: Int? = nil, sources: String = "",
+                bindFrom: UInt32? = nil, bindExpected: UInt32? = nil) {
         self.reason = reason; self.health = health; self.durationSeconds = durationSeconds; self.bytes = bytes
         self.framesKept = framesKept; self.lastDeliveryMs = lastDeliveryMs; self.sources = sources
+        self.bindFrom = bindFrom; self.bindExpected = bindExpected
     }
     public var keptMs: Int { Int((Double(framesKept) / 24.0).rounded()) }
     /// `fail reason=mic_dead kept_ms=… last_delivery_ms=… sources=builtin:dead,headset:zeros`
     public var note: String {
         var line = "fail reason=\(reason.rawValue)"
+        if reason == .builtinBindFailed || bindFrom != nil || bindExpected != nil {
+            line += " from=\(bindFrom.map(String.init) ?? "unverified") expected=\(bindExpected.map(String.init) ?? "?")"
+        }
         if let health { line += " health=\(health.rawValue)" }
         line += " kept_ms=\(keptMs) last_delivery_ms=\(lastDeliveryMs.map(String.init) ?? "none")"
         line += " duration_ms=\(Int((durationSeconds * 1000).rounded())) bytes=\(bytes)"
