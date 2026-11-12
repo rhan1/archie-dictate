@@ -2755,6 +2755,9 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func stopBuiltinConversationTimersLocked() {
+        // The recorder can next be used for dictation. Do not carry this mode's optional
+        // format listener into the shared BuiltinCaptureUnit's next legacy start.
+        (builtin as? BuiltinFormatChangeReporting)?.onFormatChange = nil
         builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = nil
         builtinBindTimer?.cancel(); builtinBindTimer = nil
         builtinBindVerified = false
