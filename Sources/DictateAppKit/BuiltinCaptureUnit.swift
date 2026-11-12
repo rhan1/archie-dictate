@@ -18,7 +18,11 @@ final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
 
     var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
     var onDeviceLost: ((CaptureEpoch) -> Void)?
-    var onFormatChange: ((CaptureEpoch) -> Void)?
+    private var formatChangeHandler: ((CaptureEpoch) -> Void)?
+    var onFormatChange: ((CaptureEpoch) -> Void)? {
+        get { lock.withLock { formatChangeHandler } }
+        set { lock.withLock { formatChangeHandler = newValue } }
+    }
     let backend = "auhal"
     private let defaults: UserDefaults
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
