@@ -20,7 +20,8 @@ final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
     var onDeviceLost: ((CaptureEpoch) -> Void)?
     var onFormatChange: ((CaptureEpoch) -> Void)?
     let backend = "auhal"
-    var defaults: UserDefaults = .standard
+    private let defaults: UserDefaults
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
     private let lock = NSLock()
     /// Held across every call on the opaque unit from another thread (read-back) and across its
@@ -69,19 +70,19 @@ final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
     }
 
     /// D5 (1.29.6): resolves `DictateBuiltinCaptureUIDOverride` when set on `defaults`, logging
-    /// `builtin_override=1 uid=<uid>`. When unset or empty, resolves the physical built-in input with no log line.
+    /// `builtin_override=1 uid=<uid>`. When absent, resolves the physical built-in input with no log line. An invalid override fails closed.
     static func resolveDevice(
         defaults: UserDefaults = .standard,
         lookupUID: (String) -> AudioDeviceID? = AudioDevices.device(forUID:),
         builtIn: () throws -> AudioDeviceID = AudioDevices.builtInInput,
         note: (String) -> Void
     ) throws -> (id: AudioDeviceID, overrideUID: String?) {
-        if let raw = defaults.string(forKey: Self.uidOverrideDefaultsKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !raw.isEmpty {
+        if let value = defaults.object(forKey: Self.uidOverrideDefaultsKey) {
+            guard let raw = value as? String else { throw StartError(step: "override_uid_type", status: -1) }
+            note("builtin_override=1 uid=\(raw)")
             guard let id = lookupUID(raw) else {
                 throw StartError(step: "override_uid", status: -1)
             }
-            note("builtin_override=1 uid=\(raw)")
             return (id, raw)
         }
         return (try builtIn(), nil)
