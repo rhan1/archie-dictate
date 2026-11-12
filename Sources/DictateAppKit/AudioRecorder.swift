@@ -2685,6 +2685,10 @@ public final class AudioRecorder: CaptureEngine {
             while pendingPCM.count >= Self.chunkSamples {
                 let pcm = Array(pendingPCM.prefix(Self.chunkSamples))
                 pendingPCM.removeFirst(Self.chunkSamples)
+                if captureKind == .conversation && selectedDevice == .builtIn {
+                    enqueueBuiltinConversationPCM(pcm, callback: callback)
+                    continue
+                }
                 let epoch = engineEpoch
                 delivery.enqueue(pcm) { [weak self] frames in
                     guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.streamOverrun }) else { return }
@@ -2730,7 +2734,7 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinBindDetectedAt: TimeInterval?
     private var appliedRouteFingerprint: String?
     private var builtinConversationNotes: [String] = []
-    private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure")
+    private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure", qos: .userInitiated)
     var builtinConversationDiagnostics: [String] { lock.withLock { builtinConversationNotes } }
     var builtinConversationAutomaticTimers = true
     var builtinConversationClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
@@ -2924,17 +2928,20 @@ public final class AudioRecorder: CaptureEngine {
             healthTimer?.cancel(); healthTimer = nil
             builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = nil
             builtinBindTimer?.cancel(); builtinBindTimer = nil
-            return CaptureFailure(reason: .builtinBindFailed, framesKept: keptFrameCount,
-                                  bindFrom: from, bindExpected: expected)
+            let now = builtinConversationClock()
+            return CaptureFailure(reason: .builtinBindFailed,
+                                  durationSeconds: captureBoundary.map { max(0, now - $0) } ?? 0,
+                                  bytes: 44 + keptFrameCount * 2, framesKept: keptFrameCount,
+                                  sources: feed.health.summary(at: now), bindFrom: from, bindExpected: expected)
         }
         guard let failure else { return }
-        noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(result: "failed", from: from, to: expected))
-        noteBuiltinConversation(failure.note)
         // Failure delivery never waits for the unit's serial executor or native teardown.
         builtinFailureQueue.async { [weak self] in
             guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
             self.onCaptureFailure?(failure)
         }
+        noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(result: "failed", from: from, to: expected))
+        noteBuiltinConversation(failure.note)
         let stop = lock.withLock { () -> (BuiltinCapture, DispatchQueue)? in
             guard builtinActive else { return nil }
             builtinActive = false
@@ -2997,11 +3004,13 @@ public final class AudioRecorder: CaptureEngine {
 
     private func builtinConversationProblem(_ unit: BuiltinCapture, reason: SoleBuiltinRestartPolicy.Reason,
                                             epoch: CaptureEpoch) {
+        let detectedDeadline = DispatchTime.now() + Self.builtinBindFailureLimit / 2
         let now = builtinConversationClock()
         let action = lock.withLock { () -> SoleBuiltinRestartPolicy.Verdict? in
             guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported else { return nil }
             if builtinRestartInFlight { return nil }
             builtinBindVerified = false
+            tapEpoch = CaptureEpoch()
             pendingPCM.removeAll(); delivery.discardPending()
             if reason == .drift {
                 if builtinBindReattempted { return .fail }
@@ -3028,10 +3037,9 @@ public final class AudioRecorder: CaptureEngine {
             return (old.0, old.1, builtin, builtinQueue)
         }
         guard let (old, oldQueue, new, newQueue) = replacement else { return }
-        noteBuiltinConversation(SoleBuiltinRestartPolicy.note(reason: reason))
         if reason == .drift {
-            let timer = DispatchSource.makeTimerSource(queue: healthQueue)
-            timer.schedule(deadline: .now() + Self.builtinBindFailureLimit * 0.8)
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+            timer.schedule(deadline: detectedDeadline)
             timer.setEventHandler { [weak self] in
                 guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.builtinBindVerified }) else { return }
                 self.failBuiltinConversationBind(epoch: epoch, from: from, expected: expected)
@@ -3039,6 +3047,7 @@ public final class AudioRecorder: CaptureEngine {
             lock.withLock { builtinBindTimer?.cancel(); builtinBindTimer = timer }
             timer.resume()
         }
+        noteBuiltinConversation(SoleBuiltinRestartPolicy.note(reason: reason))
         let stopped = DispatchSemaphore(value: 0)
         oldQueue.async { old.stop(epoch: epoch); stopped.signal() }
         _ = startBuiltinForConversation(new, epoch: epoch, queue: newQueue, after: stopped)
@@ -3060,8 +3069,7 @@ public final class AudioRecorder: CaptureEngine {
             failBuiltinConversationBind(epoch: active, from: nil, expected: state.0.expectedDeviceID)
             return
         }
-        guard !state.1, state.0.started,
-              lock.withLock({ !routeApplying && routeGeneration == appliedRouteGeneration }) else { return }
+        guard !state.1, state.0.started else { return }
         // Read-back belongs to the recorder; a nil read after start is unverified and fences PCM.
         let current = state.0.currentDeviceID
         let expected = state.0.expectedDeviceID
@@ -3069,6 +3077,7 @@ public final class AudioRecorder: CaptureEngine {
             builtinConversationProblem(state.0, reason: .drift, epoch: active)
             return
         }
+        guard lock.withLock({ !routeApplying && routeGeneration == appliedRouteGeneration }) else { return }
         if lock.withLock({ feed.health.status(.builtin, at: now) == .dead(.stale) }) {
             builtinConversationProblem(state.0, reason: .stale, epoch: active)
             return
@@ -3081,6 +3090,16 @@ public final class AudioRecorder: CaptureEngine {
         delivery.drain()
         out.notes.forEach { noteBuiltinConversation($0) }
         if let failure = out.failure { reportFailureOnce(failure, epoch: active) }
+    }
+
+    /// Called under the state lock. Every queued chunk carries the source attempt's fence.
+    private func enqueueBuiltinConversationPCM(_ pcm: [Int16], callback: @escaping ([Int16]) -> Void) {
+        let epoch = engineEpoch, token = tapEpoch
+        delivery.enqueue(pcm) { [weak self] frames in
+            guard let self, self.lock.withLock({ self.engineEpoch === epoch && self.tapEpoch === token &&
+                self.builtinBindVerified && !self.failureReported && !self.streamOverrun }) else { return }
+            callback(frames)
+        }
     }
 
     private func acceptBuiltinConversationConverted(_ frames: [Float], at time: TimeInterval,
