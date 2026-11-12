@@ -1013,6 +1013,11 @@ public final class AudioRecorder: CaptureEngine {
     /// Serial background execution keeps Bluetooth engine startup off the main thread.
     /// stop() replaces the epoch immediately; a late start is torn down before returning.
     public func startAsync(device: MicChoice) async throws {
+        if lock.withLock({ captureKind == .conversation }) && device == .builtIn {
+            // A pre-start reset may already have armed health. While waiting for a lease,
+            // use the requested mode's inactive-lease guard rather than legacy input health.
+            lock.withLock { if lease?.isActive != true { selectedDevice = .builtIn } }
+        }
         let epoch = lock.withLock { engineEpoch }
         // v1.12 (L1): a previous session's hardware release is awaited here (bounded), never on
         // the executor; a live owner elsewhere in the process refuses this start.
