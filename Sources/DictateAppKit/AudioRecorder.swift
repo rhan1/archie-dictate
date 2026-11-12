@@ -2807,13 +2807,15 @@ public final class AudioRecorder: CaptureEngine {
 
     private func armBuiltinFirstAudioTimer() {
         guard builtinConversationAutomaticTimers else { return }
+        let state = lock.withLock { (soleBuiltinFirstAudio.deadline, soleBuiltinFirstAudio.verdict, lease?.token) }
+        guard let deadline = state.0, state.1 == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: healthQueue)
-        // Repeating until t0 + limit: start can return at any point in the first second.
-        timer.schedule(deadline: .now() + CaptureHealth.tickInterval, repeating: CaptureHealth.tickInterval)
-        let token = lock.withLock { lease?.token }
+        timer.schedule(deadline: .now() + max(0, deadline - builtinConversationClock()))
         timer.setEventHandler { [weak self] in
-            guard let self, self.lock.withLock({ self.lease?.token === token }) else { return }
+            guard let self, self.lock.withLock({ self.lease?.token === state.2 }) else { return }
             self.evaluateBuiltinFirstAudio(at: self.builtinConversationClock())
+            // start may have returned since this timer was armed; use its actual t0 deadline.
+            self.armBuiltinFirstAudioTimer()
         }
         lock.withLock { builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = timer }
         timer.resume()
@@ -2901,7 +2903,10 @@ public final class AudioRecorder: CaptureEngine {
                 guard self.lock.withLock({ self.engineEpoch === epoch && !self.failureReported && self.builtin === unit }) else {
                     unit.stop(epoch: epoch); return
                 }
-                if let clockNote { self.noteBuiltinConversation(clockNote) }
+                if initial {
+                    self.noteBuiltinConversation(clockNote ?? "builtin_first_audio_clock start=\(Int((now * 1000).rounded()))")
+                    self.armBuiltinFirstAudioTimer()
+                }
                 self.noteBuiltinConversation(BuiltinConversationDiagnostics.convCaptureNote(
                     device: expected, sampleRate: fmt?.sampleRate ?? 0, channels: fmt?.channels ?? 0))
                 self.noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(

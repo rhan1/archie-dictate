@@ -367,5 +367,95 @@ struct V1296BuiltinConversationTests {
         #expect(try resolve().id == 81)
         print("D GREEN builtin_uid_override=1")
     }
+    struct FirstCase: Sendable {
+        let name: String
+        let samples: [Float]
+        let expected: BuiltinFirstAudioVerdict
+    }
+    static let firstCases: [FirstCase] = [
+        .init(name: "exact_zeros", samples: [0, 0], expected: .zeros),
+        .init(name: "below_threshold", samples: [CaptureBridge.silencePeak.nextDown], expected: .zeros),
+        .init(name: "above_threshold", samples: [CaptureBridge.silencePeak.nextUp], expected: .ok),
+        .init(name: "startup_click_then_zeros", samples: [0.5, 0, 0, 0], expected: .ok),
+        .init(name: "steady_low_room_noise", samples: [0.001, 0.001, 0.001], expected: .ok),
+        .init(name: "no_buffer", samples: [], expected: .noBuffer)
+    ]
+    @Test(arguments: firstCases) func first_audio_verdict(_ c: FirstCase) async throws {
+        let r = Rig(); try await r.start()
+        for (index, value) in c.samples.enumerated() { r.emit(value, at: 100.1 + Double(index) * 0.1) }
+        r.tick(100.999)
+        #expect(r.verdicts.value.isEmpty)
+        r.tick(101)
+        #expect(r.verdicts.value == [c.expected])
+        r.tick(101.1)
+        #expect(r.verdicts.value.count == 1)
+        print("D GREEN first_audio_verdict case=\(c.name) expected=\(c.expected.rawValue) actual=\(r.verdicts.value.first?.rawValue ?? "nil")")
+        await r.stop()
+    }
+    @Test func first_audio_buffer_at_deadline_counts() async throws {
+        let r = Rig(); try await r.start()
+        r.emit(CaptureBridge.silencePeak.nextUp, at: 101)
+        r.tick(101)
+        #expect(r.verdicts.value == [.ok])
+        print("D GREEN first_audio_verdict case=buffer_at_deadline expected=ok actual=\(r.verdicts.value.first?.rawValue ?? "nil")")
+        await r.stop()
+    }
+    @Test func first_audio_slow_start_1050ms() async throws {
+        let unit = Builtin(), gate = DispatchSemaphore(value: 0)
+        unit.startGate = gate
+        let r = Rig([unit])
+        unit.afterStart = { r.clock.value = 101.05 }
+        try await r.start()
+        #expect(!unit.started)
+        r.tick(101)
+        #expect(r.verdicts.value == [.noBuffer])
+        gate.signal()
+        #expect(await Self.eventually { unit.started })
+        r.emit(at: 101.1); r.tick(102.1)
+        #expect(r.verdicts.value == [.noBuffer])
+        print("D GREEN first_audio_verdict case=slow_start_1.05s expected=no_buffer actual=\(r.verdicts.value.first?.rawValue ?? "nil")")
+        await r.stop()
+    }
+    @Test func first_audio_route_apply_and_relisten_do_not_renew() async throws {
+        let r = Rig(); try await r.start(); r.emit(0, at: 100.1)
+        r.clock.value = 100.3
+        r.routeFacts.update { $0.1.id = 90 }
+        r.recorder.observeConversationRoute()
+        #expect(try r.recorder.reconfigureConversationInput(at: 100.3))
+        r.clock.value = 100.5; r.recorder.resetCapture()
+        r.tick(101)
+        #expect(r.verdicts.value == [.zeros])
+        r.emit(at: 101.1); r.tick(101.5)
+        #expect(r.verdicts.value == [.zeros])
+        print("D GREEN first_audio_route_apply_and_relisten_do_not_renew=1")
+        await r.stop()
+    }
+    @Test(arguments: [44_100.0, 48_000.0]) func builtin_conversation_chunk_rate(hardwareRate: Double) async throws {
+        let unit = Builtin(); unit.hardwareFormatSummary = (hardwareRate, 1)
+        let r = Rig([unit]); try await r.start()
+        // Execute the unit's real render-slot drain and AVAudioConverter without creating an AUHAL.
+        let conversion = BuiltinCaptureUnit()
+        var start = 100.0
+        conversion.onFrames = { frames, _, _ in
+            r.clock.value = start
+            unit.emit(frames, at: start)
+            start += Double(frames.count) / AudioRecorder.sampleRate
+        }
+        let tone = (0..<Int(hardwareRate * 0.5)).map { Float(0.25 * sin(2 * Double.pi * 1_000 * Double($0) / hardwareRate)) }
+        try conversion.drainOffline(monoFrames: tone, hardwareSampleRate: hardwareRate, epoch: CaptureEpoch())
+        conversion.stop()
+        let chunks = r.chunks.value
+        #expect(chunks.count >= 4 && chunks.count <= 5)
+        #expect(chunks.allSatisfy { $0.count == AudioRecorder.chunkSamples })
+        let chunk = try #require(chunks.last)
+        #expect(chunk.map { abs(Int($0)) }.max()! > 1_000)
+        let worstError = (100..<(chunk.count - 24)).map { abs(Int(chunk[$0]) - Int(chunk[$0 + 24])) }.max()!
+        #expect(worstError <= 4)
+        let crossings = (1..<chunk.count).filter { chunk[$0 - 1] <= 0 && chunk[$0] > 0 }.count
+        #expect(abs(crossings - 100) <= 1)
+        #expect(abs((start - 100) - 0.5) < 0.01)
+        print("D GREEN builtin_conversation_chunk_rate=24000 hw_rate=\(Int(hardwareRate)) chunks=\(chunks.count) period=24")
+        await r.stop()
+    }
 
 }
