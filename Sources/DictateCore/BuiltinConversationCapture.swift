@@ -247,6 +247,18 @@ public enum RouteFingerprint {
         return [b, o, i].joined(separator: "\n")
     }
 
+    /// A nominal-rate or channel change needs a new converter; identity/liveness changes do not imply format.
+    public static func builtinFormatChanged(from before: String?, to after: String) -> Bool {
+        func format(_ fp: String?) -> [String]? {
+            guard let head = fp?.components(separatedBy: "\n").first,
+                  let data = head.data(using: .utf8),
+                  let facts = (try? JSONSerialization.jsonObject(with: data)) as? [Any], facts.count == 5 else { return nil }
+            return [String(describing: facts[2]), String(describing: facts[4])]
+        }
+        guard let lhs = format(before), let rhs = format(after) else { return false }
+        return lhs != rhs
+    }
+
     public static func shortHash(_ fingerprint: String) -> String {
         let digest = Array(Insecure.SHA1.hash(data: Data(fingerprint.utf8)))
         guard digest.count >= 4 else { return "00000000" }

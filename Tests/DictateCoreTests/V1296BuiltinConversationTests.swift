@@ -14,8 +14,8 @@ struct V1296BuiltinCoreTests {
         var first = SoleBuiltinFirstAudio()
         first.startRequested(at: 100)
         _ = first.startReturned(at: 100.2)
-        first.observe(frames: [CaptureBridge.silencePeak.nextUp], at: 101.2)
         #expect(first.evaluate(at: 101.199) == nil)
+        first.observe(frames: [CaptureBridge.silencePeak.nextUp], at: 101.2)
         #expect(first.evaluate(at: 101.2) == .ok)
         #expect(first.evaluate(at: 200) == nil)
     }
