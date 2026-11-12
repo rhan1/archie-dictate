@@ -2841,7 +2841,7 @@ public final class AudioRecorder: CaptureEngine {
         let fp = route.currentBuiltinConversationRoute()
         lock.withLock { observedRoute = fp; appliedRouteFingerprint = fp }
         noteBuiltinConversation(RouteFingerprint.routeFpNote(generation: 0, before: nil, after: fp))
-        let watch = route.watchConversationRoute { [weak self] in
+        let watch = (route.watchBuiltinConversationRoute ?? route.watchConversationRoute) { [weak self] in
             self?.onExecutor { [weak self] in self?.observeBuiltinConversationRoute(leaseToken: token) }
         }
         lock.withLock { if engineEpoch === epoch { conversationRouteWatch = watch } }

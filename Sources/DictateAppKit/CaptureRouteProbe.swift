@@ -30,6 +30,8 @@ struct CaptureRouteProbe {
     /// D2 (1.29.6): built-in conversation route fingerprint (nil falls back to `effectiveRoute`).
     var builtinConversationRoute: (() -> String)? = nil
     var watchConversationRoute: (@escaping () -> Void) -> AnyObject? = { _ in nil }
+    /// Only the sole-built-in branch opts into additional built-in device listeners.
+    var watchBuiltinConversationRoute: ((@escaping () -> Void) -> AnyObject?)? = nil
 
     func currentBuiltinConversationRoute() -> String {
         builtinConversationRoute?() ?? effectiveRoute()
@@ -47,7 +49,8 @@ struct CaptureRouteProbe {
         watchDefaultInput: { DefaultInputWatch($0) },
         effectiveRoute: { ConversationRouteWatch.fingerprint() },
         builtinConversationRoute: { ConversationRouteWatch.builtinConversationFingerprint() },
-        watchConversationRoute: { ConversationRouteWatch($0) })
+        watchConversationRoute: { ConversationRouteWatch($0) },
+        watchBuiltinConversationRoute: { ConversationRouteWatch($0, includeBuiltin: true) })
 }
 
 /// BT1: a `kAudioHardwarePropertyDefaultInputDevice` listener on the system object for one dictation;
@@ -77,9 +80,11 @@ final class ConversationRouteWatch {
     private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var powerObservers: [NSObjectProtocol] = []
     private let changed: () -> Void
+    private let includeBuiltin: Bool
 
-    init(_ changed: @escaping () -> Void) {
+    init(_ changed: @escaping () -> Void, includeBuiltin: Bool = false) {
         self.changed = changed
+        self.includeBuiltin = includeBuiltin
         rebind()
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
                      NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification] {
@@ -101,7 +106,7 @@ final class ConversationRouteWatch {
             add(device, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput)
             add(device, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeOutput)
         }
-        if let builtIn = try? AudioDevices.builtInInput() {
+        if includeBuiltin, let builtIn = try? AudioDevices.builtInInput() {
             add(builtIn, kAudioDevicePropertyDeviceIsAlive)
             add(builtIn, kAudioDevicePropertyNominalSampleRate)
             add(builtIn, kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput)

@@ -69,6 +69,7 @@ struct V1296BuiltinConversationTests {
         let verdicts = Box<[BuiltinFirstAudioVerdict]>([])
         let states = Box<[ConversationCaptureState]>([])
         let chunks = Box<[[Int16]]>([])
+        let routeWatches = Box<[String]>([])
         let routeFacts = Box((
             RouteFingerprint.RawDeviceFacts(id: 81, uid: "mac", inputChannels: 1),
             RouteFingerprint.RawDeviceFacts(id: 77, uid: "xm-out", outputChannels: 2),
@@ -83,6 +84,12 @@ struct V1296BuiltinConversationTests {
                 return RouteFingerprint.builtinConversation(rawBuiltin: f.0, rawOutput: f.1, rawInput: f.2)
             }
             probe.effectiveRoute = { "legacy:\(facts.value)" }
+            probe.watchConversationRoute = { [routeWatches] _ in
+                routeWatches.update { $0.append("legacy") }; return nil
+            }
+            probe.watchBuiltinConversationRoute = { [routeWatches] _ in
+                routeWatches.update { $0.append("builtin") }; return nil
+            }
             recorder = AudioRecorder(builtin: {
                 let index = units.value.count
                 let unit = index < supplied.count ? supplied[index] : Builtin()
@@ -135,6 +142,7 @@ struct V1296BuiltinConversationTests {
     @Test func builtin_conversation_registers_no_engine_observer() async throws {
         let r = Rig(); try await r.start()
         #expect(!r.recorder.hasConfigurationObserver)
+        #expect(r.routeWatches.value == ["builtin"])
         print("D GREEN builtin_conversation_registers_no_engine_observer=1")
         await r.stop()
     }
@@ -518,6 +526,7 @@ struct V1296BuiltinConversationTests {
         #expect(r.headset.starts == 1 && r.recorder.isRunning)
         #expect(r.chunks.value.count == 1)
         #expect(r.recorder.builtinConversationDiagnostics.isEmpty && r.verdicts.value.isEmpty)
+        #expect(r.routeWatches.value == ["legacy"])
         print("D GREEN default_conversation_unchanged=1")
         await r.stop()
     }
@@ -528,6 +537,7 @@ struct V1296BuiltinConversationTests {
         #expect(r.headset.starts == 1 && r.recorder.isRunning)
         #expect(r.chunks.value.count == 1)
         #expect(r.recorder.builtinConversationDiagnostics.isEmpty && r.verdicts.value.isEmpty)
+        #expect(r.routeWatches.value.isEmpty)
         // The complete gate also includes the archived source hunk audit and executed base/current suites.
         print("D GREEN dictation_path_unchanged=1")
         await r.stop()
