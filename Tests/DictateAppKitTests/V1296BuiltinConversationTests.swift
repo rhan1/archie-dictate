@@ -108,8 +108,8 @@ struct V1296BuiltinConversationTests {
             recorder.onPCMChunk = { [chunks] frames in chunks.update { $0.append(frames) } }
         }
         func start(device: MicChoice = .builtIn) async throws {
+            recorder.resetCapture() // Same order as the conversation host.
             try await recorder.startAsync(device: device)
-            recorder.resetCapture()
         }
         func emit(_ value: Float = 0.1, at time: Double? = nil) {
             if let time { clock.value = time }
@@ -153,6 +153,24 @@ struct V1296BuiltinConversationTests {
         print("D GREEN builtin_conversation_registers_no_engine_observer=1")
         await r.stop()
     }
+    @Test(arguments: [false, true])
+    func capture_boundary_before_start(resetBeforeStart: Bool) async throws {
+        let r = Rig()
+        if resetBeforeStart { r.recorder.resetCapture() } // Host conversation order.
+        try await r.recorder.startAsync(device: .builtIn)
+        r.emit(at: 100.1); r.emit(at: 100.2)
+        let before = r.chunks.value.count
+        #expect(before == (resetBeforeStart ? 2 : 0))
+        if !resetBeforeStart {
+            // No reset means prewarm only. A later recording boundary must open delivery.
+            r.recorder.resetCapture()
+            r.emit(at: 100.3)
+            #expect(r.chunks.value.count >= 1)
+        }
+        print("D \(Self.phase) prestart_capture_boundary reset_before_start=\(resetBeforeStart ? 1 : 0) expected_chunks=\(resetBeforeStart ? 2 : 0) actual_chunks=\(before)")
+        await r.stop()
+    }
+
     @Test func d1a_first_buffer_running_and_pipeline() async throws {
         let r = Rig()
         let first = Box(0), levels = Box(0)
