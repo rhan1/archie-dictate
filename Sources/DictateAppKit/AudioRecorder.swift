@@ -2776,12 +2776,12 @@ public final class AudioRecorder: CaptureEngine {
 
     private func startBuiltinConversation(epoch: CaptureEpoch) throws {
         if lock.withLock({ engine != nil || headsetUnitActive }) { teardownEngine() }
-        selectedDevice = .builtIn
         let now = builtinConversationClock()
         try lock.withLock {
             guard engineEpoch === epoch, let lease, lease.isActive, lease.started(.builtin) else {
                 throw CancellationError()
             }
+            selectedDevice = .builtIn
             stats = CaptureStats()
             stats.device = "built-in"
             stats.kind = .conversation
@@ -3132,7 +3132,7 @@ public final class AudioRecorder: CaptureEngine {
         let now = time ?? builtinConversationClock()
         let active = epoch ?? lock.withLock { engineEpoch }
         guard lock.withLock({ captureKind == .conversation && selectedDevice == .builtIn &&
-            engineEpoch === active && !failureReported && lease?.isActive == true }) else { return }
+            engineEpoch === active && captureRunning && !failureReported && lease?.isActive == true }) else { return }
         evaluateBuiltinFirstAudio(at: now)
         let state = lock.withLock { (builtin, builtinRestartInFlight, builtinBindDetectedAt,
                                      builtinBindDetectedFrom, builtinBindDetectedExpected) }
