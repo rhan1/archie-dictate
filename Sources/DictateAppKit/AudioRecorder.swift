@@ -3102,16 +3102,20 @@ public final class AudioRecorder: CaptureEngine {
             failBuiltinConversationBind(epoch: active, from: nil, expected: state.0.expectedDeviceID)
             return
         }
-        guard !state.1, state.0.started else { return }
-        // Read-back belongs to the recorder; a nil read after start is unverified and fences PCM.
-        let current = state.0.currentDeviceID
-        let expected = state.0.expectedDeviceID
-        if expected == nil || current != expected {
-            builtinConversationProblem(state.0, reason: .drift, epoch: active)
-            return
+        let canReadBack = !state.1 && state.0.started
+        if canReadBack {
+            // Read-back belongs to the recorder; nil after start is unverified and fences PCM.
+            let current = state.0.currentDeviceID
+            let expected = state.0.expectedDeviceID
+            if expected == nil || current != expected {
+                builtinConversationProblem(state.0, reason: .drift, epoch: active)
+                return
+            }
         }
         guard lock.withLock({ !routeApplying && routeGeneration == appliedRouteGeneration }) else { return }
-        if lock.withLock({ feed.health.status(.builtin, at: now) == .dead(.stale) }) {
+        // Native start/restart may still be blocked. Its absence of frames must not pause
+        // the non-Bluetooth health deadline; only native read-back/stale restart waits for return.
+        if canReadBack, lock.withLock({ feed.health.status(.builtin, at: now) == .dead(.stale) }) {
             builtinConversationProblem(state.0, reason: .stale, epoch: active)
             return
         }
