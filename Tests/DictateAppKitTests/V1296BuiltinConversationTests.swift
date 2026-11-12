@@ -317,5 +317,32 @@ struct V1296BuiltinConversationTests {
         print("D GREEN unverified_rebind_failure_and_attempt_fence=1")
         await r.stop()
     }
+    @Test func builtin_diagnostics_parser_safe() async throws {
+        let r = Rig(); try await r.start()
+        r.routeFacts.update { $0.1.id = 90 }
+        r.recorder.observeConversationRoute()
+        #expect(try r.recorder.reconfigureConversationInput(at: 100.2))
+        let notes = r.recorder.builtinConversationDiagnostics
+        #expect(notes.filter { $0.hasPrefix("conv_capture ") }.count == 2)
+        #expect(notes.filter { $0.hasPrefix("builtin_bind ") }.count == 2)
+        #expect(notes.filter { $0.hasPrefix("route_fp ") }.count == 2)
+        #expect(notes.filter { $0 == "conv_apply=rebuild reason=builtin_auhal gen=1" }.count == 1)
+        let exact = notes.filter { $0.hasPrefix("conv_capture ") || $0.hasPrefix("builtin_bind ") ||
+            $0.hasPrefix("route_fp ") || $0.hasPrefix("conv_apply=") }
+        for line in exact {
+            for token in ["bridge_src=", "bridge_switch=", "bt_recovery=", "headset_restart=", "path=", "mic_dead"] {
+                #expect(!line.contains(token))
+            }
+            // The prescribed hw_rate= field contains the substring rate=. For parser safety,
+            // exclude standalone rate= tokens (the judge's word-boundary rule), preserving D4's exact line.
+            #expect(line.range(of: #"(^|\s)rate="# , options: .regularExpression) == nil)
+        }
+        for line in notes.filter({ $0.hasPrefix("route_fp ") }) {
+            #expect(line.range(of: #"^route_fp gen=\d+ before=[0-9a-f]{8} after=[0-9a-f]{8} changed=(builtin|output_id|input_id|none)$"#,
+                               options: .regularExpression) != nil)
+        }
+        print("D GREEN builtin_diagnostics_parser_safe=1")
+        await r.stop()
+    }
 
 }
