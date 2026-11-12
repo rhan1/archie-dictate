@@ -110,6 +110,7 @@ struct V1296BuiltinConversationTests {
             #expect(await recorder.awaitRelease() == .released)
         }
     }
+    static var phase: String { ProcessInfo.processInfo.environment["D_V1296_RED"] == "1" ? "RED" : "GREEN" }
     static func eventually(_ check: () -> Bool) async -> Bool {
         for _ in 0..<300 {
             if check() { return true }
@@ -124,7 +125,7 @@ struct V1296BuiltinConversationTests {
         #expect(r.headset.starts == 0)
         #expect(r.units.value[0].starts.value == 1)
         #expect(r.recorder.currentLease != nil)
-        print("D GREEN builtin_conversation_creates_engine=0")
+        print("D \(Self.phase) builtin_conversation_creates_engine=\(r.recorder.hasAllocatedEngine ? 1 : 0)")
         await r.stop()
     }
     @Test func builtin_conversation_registers_no_engine_observer() async throws {
@@ -212,7 +213,7 @@ struct V1296BuiltinConversationTests {
         for _ in 0..<18 { r.recorder.observeConversationRoute(invalidated: true) }
         #expect(r.recorder.activeRouteGeneration == 0)
         #expect(r.states.value.isEmpty)
-        print("D GREEN engine_stopped_unchanged_fp_raises_generation=0")
+        print("D \(Self.phase) engine_stopped_unchanged_fp_raises_generation=\(r.recorder.activeRouteGeneration)")
         await r.stop()
     }
     @Test func builtin_conversation_route_loop() async throws {
@@ -243,7 +244,7 @@ struct V1296BuiltinConversationTests {
             #expect(r.recorder.activeRouteGeneration == UInt64(field + 1))
             #expect(try r.recorder.reconfigureConversationInput(at: r.clock.value))
         }
-        print("D GREEN builtin_conversation_route_loop=1")
+        print("D \(Self.phase) builtin_conversation_route_loop=1")
         await r.stop()
     }
     @Test func headset_toggle_converges_within_2_generations() async throws {
@@ -261,6 +262,59 @@ struct V1296BuiltinConversationTests {
         #expect(r.recorder.activeAppliedRouteGeneration == 2)
         #expect(r.clock.value - 100 < 2)
         print("D GREEN headset_toggle_converges_within_2_generations=1")
+        await r.stop()
+    }
+    @Test func builtin_bind_drift_runs_silent() async throws {
+        let r = Rig(); try await r.start(); r.emit()
+        let old = r.units.value[0]
+        old.readback.value = 999
+        let began = ProcessInfo.processInfo.systemUptime
+        r.tick(100.1)
+        old.emit(Array(repeating: 0, count: 2_400), at: 100.1)
+        #expect(await Self.eventually { r.units.value.count == 2 || !r.failures.value.isEmpty })
+        let elapsed = ProcessInfo.processInfo.systemUptime - began
+        #expect(elapsed <= AudioRecorder.builtinBindFailureLimit)
+        #expect(r.units.value.count == 2 || r.failures.value.first?.reason == .builtinBindFailed)
+        #expect(!(r.recorder.isRunning && r.units.value.count == 1 && r.failures.value.isEmpty))
+        print("D \(Self.phase) builtin_bind_drift_runs_silent=\(r.units.value.count == 1 && r.failures.value.isEmpty ? 1 : 0)")
+        await r.stop()
+    }
+    @Test func bind_failed_does_not_wait_on_teardown() async throws {
+        let old = Builtin(), next = Builtin()
+        let gate = DispatchSemaphore(value: 0)
+        old.stopGate = gate
+        let r = Rig([old, next]); try await r.start(); r.emit()
+        let savedFrames = old.onFrames!, savedEpoch = old.running.value!
+        old.readback.value = nil
+        let began = ProcessInfo.processInfo.systemUptime
+        r.tick(100.1)
+        let count = r.chunks.value.count
+        old.emit(Array(repeating: 0, count: 2_400), at: 100.2)
+        #expect(r.chunks.value.count == count)
+        #expect(await Self.eventually { !r.failures.value.isEmpty })
+        #expect(ProcessInfo.processInfo.systemUptime - began <= AudioRecorder.builtinBindFailureLimit)
+        #expect(r.failures.value.map(\.reason) == [.builtinBindFailed])
+        #expect(next.starts.value == 0) // old native stop is hung: replacement must never open
+        savedFrames(Array(repeating: 0.5, count: 2_400), 100.3, savedEpoch)
+        #expect(!r.recorder.isRunning && r.chunks.value.count == count)
+        print("D GREEN bind_failed_does_not_wait_on_teardown=1")
+        gate.signal()
+        await r.stop()
+    }
+    @Test func unverified_rebind_failure_and_attempt_fence() async throws {
+        let first = Builtin(), second = Builtin()
+        second.readback.value = nil
+        let r = Rig([first, second]); try await r.start(); r.emit()
+        first.readback.value = nil
+        r.tick(100.1)
+        #expect(await Self.eventually { r.failures.value.count == 1 })
+        #expect(r.failures.value.first?.reason == .builtinBindFailed)
+        #expect(r.units.value.count == 2)
+        let count = r.chunks.value.count
+        second.readback.value = 81
+        second.emit(Array(repeating: 0.5, count: 2_400), at: 100.2)
+        #expect(r.chunks.value.count == count)
+        print("D GREEN unverified_rebind_failure_and_attempt_fence=1")
         await r.stop()
     }
 
