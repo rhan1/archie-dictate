@@ -132,4 +132,47 @@ struct V1296FR1BaseComparableTests {
         #expect(r.states.value.last == .routeChangePending(generation: 2))
         await r.stop()
     }
+
+    // MARK: V-F6 — the production timers and the real clock decide the first-audio verdict
+
+    @Test(arguments: ["silent", "silent_first_audio_timer_only", "healthy"])
+    func real_timer_first_audio(_ c: String) async throws {
+        let r = Rig()
+        let recorder = r.recorder
+        recorder.builtinConversationAutomaticTimers = true
+        recorder.builtinConversationClock = { ProcessInfo.processInfo.systemUptime }
+        let verdict = V.Box<(BuiltinFirstAudioVerdict, TimeInterval)?>(nil)
+        recorder.onBuiltinFirstAudio = { v in
+            let now = ProcessInfo.processInfo.systemUptime
+            verdict.update { if $0 == nil { $0 = (v, now) } }
+        }
+        if c == "silent_first_audio_timer_only" {
+            try await recorder.startAsync(device: .builtIn) // no resetCapture: no health timer, only the first-audio timer
+        } else {
+            try await r.start() // host order: resetCapture (health clock) then start
+        }
+        let value: Float = c == "healthy" ? 0.1 : 0
+        let feeder = Task {
+            for _ in 0..<25 {
+                if Task.isCancelled { break }
+                r.units.value.last!.emit(Array(repeating: value, count: 2_400), at: ProcessInfo.processInfo.systemUptime)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        #expect(await Self.waitUntil(3) { verdict.value != nil })
+        feeder.cancel()
+        let clockNote = recorder.builtinConversationDiagnostics.first { $0.hasPrefix("builtin_first_audio_clock start=") }
+        let t0 = Double(clockNote?.split(separator: "=").last ?? "0") ?? 0
+        let (v, at) = try #require(verdict.value)
+        let ms = Int((at * 1000 - t0).rounded())
+        if c == "healthy" {
+            print("D GREEN real_timer_first_audio_healthy=1 verdict=\(v.rawValue) at_ms=\(ms)")
+            #expect(v == .ok)
+        } else {
+            print("D GREEN real_timer_first_audio=1 zeros_at_ms=\(ms) case=\(c) verdict=\(v.rawValue)")
+            #expect(v == .zeros)
+            #expect(ms >= 1_000 && ms <= 1_300)
+        }
+        await r.stop()
+    }
 }
