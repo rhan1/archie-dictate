@@ -2913,6 +2913,8 @@ public final class AudioRecorder: CaptureEngine {
             defer { ready.signal() }
             after?.wait() // Never open a second unit while the old native unit is still stopping.
             guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.failureReported && self.builtin === unit }) else { return }
+            // FR1 U4: only this sole built-in conversation start may read the D5 seam (dictation never marks it).
+            (unit as? BuiltinConversationSeamGated)?.allowConversationSeamForNextStart()
             do {
                 try unit.start(epoch: epoch)
                 let now = self.builtinConversationClock()
