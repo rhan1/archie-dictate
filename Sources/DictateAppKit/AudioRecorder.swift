@@ -2749,6 +2749,8 @@ public final class AudioRecorder: CaptureEngine {
     /// FR1 U2: the sole built-in bind failure not yet handed to the host. Exactly one of the async
     /// `onCaptureFailure` delivery or a throwing route apply takes it (raised during an apply: only the apply).
     private var heldBindFailure: CaptureFailure?
+    /// FR1 U8 (V-F10): the conversation's first native start has been requested and has not returned yet.
+    private var builtinFirstStartPending = false
     private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure", qos: .userInitiated)
     var builtinConversationDiagnostics: [String] { lock.withLock { builtinConversationNotes } }
     var builtinConversationAutomaticTimers = true
@@ -2780,6 +2782,7 @@ public final class AudioRecorder: CaptureEngine {
         builtinBindDetectedAt = nil
         builtinBindDetectedFrom = nil; builtinBindDetectedExpected = nil
         appliedRouteFingerprint = nil
+        builtinFirstStartPending = false
     }
 
     private func startBuiltinConversation(epoch: CaptureEpoch) throws {
@@ -2813,6 +2816,7 @@ public final class AudioRecorder: CaptureEngine {
             soleBuiltinRestarts = SoleBuiltinRestartPolicy()
             soleBuiltinFirstAudio = SoleBuiltinFirstAudio()
             soleBuiltinFirstAudio.startRequested(at: now)
+            builtinFirstStartPending = true
             feed.start(defaultInput: .builtin, hasBuiltin: true, epoch: epoch, sole: .builtin)
             if captureBoundary != nil {
                 // Hosts reset before starting. No unit frames exist before this request;
@@ -2917,6 +2921,9 @@ public final class AudioRecorder: CaptureEngine {
         let ready = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
             defer { ready.signal() }
+            defer {
+                if initial, let self { self.lock.withLock { if self.engineEpoch === epoch { self.builtinFirstStartPending = false } } }
+            }
             after?.wait() // Never open a second unit while the old native unit is still stopping.
             guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.failureReported && self.builtin === unit }) else { return }
             // FR1 U4: only this sole built-in conversation start may read the D5 seam (dictation never marks it).
@@ -2950,10 +2957,12 @@ public final class AudioRecorder: CaptureEngine {
                 }
                 self.noteBuiltinConversation(BuiltinConversationDiagnostics.convCaptureNote(
                     device: expected, sampleRate: fmt?.sampleRate ?? 0, channels: fmt?.channels ?? 0))
-                self.noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(
-                    result: verified ? (self.lock.withLock { self.builtinBindReattempted } ? "rebound" : "ok") : "failed",
-                    from: current, to: expected))
-                if !verified {
+                if verified {
+                    self.noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(
+                        result: self.lock.withLock { self.builtinBindReattempted } ? "rebound" : "ok",
+                        from: current, to: expected))
+                } else {
+                    // FR1 U8 (V-F9): the drift handler logs it (`drift` on first detection, `failed` if the re-bind fails).
                     self.healthQueue.async { [weak self] in self?.builtinConversationProblem(unit, reason: .drift, epoch: epoch,
                         bindReadback: (current, expected)) }
                 }
@@ -3023,7 +3032,11 @@ public final class AudioRecorder: CaptureEngine {
         // Recheck after leaving that guard even when the periodic timer is disabled.
         healthQueue.async { [weak self] in self?.builtinConversationTick(epoch: appliedEpoch) }
         if let failure { throw RecorderError.builtinBindFailed(failure) }
-        return try result.get()
+        let applied = try result.get()
+        // FR1 U8 (V-F11): observations during the apply were dropped and `fp` was read before the new unit
+        // started; a change that landed meanwhile raises the next generation now.
+        if applied { observeBuiltinConversationRoute() }
+        return applied
     }
 
     private func applySoleBuiltinRoute(at time: TimeInterval?) throws -> Bool {
@@ -3106,8 +3119,10 @@ public final class AudioRecorder: CaptureEngine {
             if let state { lock.withLock { conversationStateHandler }?(state) }
             return
         }
-        let detectedDeadline = DispatchTime.now() + Self.builtinBindFailureLimit / 2
+        // FR1 U8 (V-F9): the re-bind owns the full limit, measured from this detection.
+        let detectedDeadline = DispatchTime.now() + Self.builtinBindFailureLimit
         let now = builtinConversationClock()
+        var firstDetection = false
         let action = lock.withLock { () -> SoleBuiltinRestartPolicy.Verdict? in
             guard engineEpoch === epoch, builtin === unit, builtinActive, !failureReported, !routeApplying else { return nil }
             if builtinRestartInFlight { return nil }
@@ -3117,6 +3132,7 @@ public final class AudioRecorder: CaptureEngine {
             if reason == .drift {
                 if builtinBindReattempted { return .fail }
                 builtinBindReattempted = true
+                firstDetection = true
                 builtinBindDetectedAt = now
             }
             return soleBuiltinRestarts.judge(reason: reason, at: now)
@@ -3125,6 +3141,9 @@ public final class AudioRecorder: CaptureEngine {
         // Keep the actual read that detected drift; a second native read can differ or block.
         let evidence = bindReadback ?? (unit.currentDeviceID, unit.expectedDeviceID)
         let (from, expected) = evidence
+        if firstDetection {
+            noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(result: "drift", from: from, to: expected))
+        }
         if action == .fail {
             failBuiltinConversationBind(epoch: epoch, from: from, expected: expected)
             return
@@ -3193,13 +3212,14 @@ public final class AudioRecorder: CaptureEngine {
             builtinConversationProblem(state.0, reason: .stale, epoch: active)
             return
         }
-        let out = lock.withLock { () -> CaptureFeed.TickOutput in
+        let (out, firstStartPending) = lock.withLock { () -> (CaptureFeed.TickOutput, Bool) in
             let out = feed.tick(at: now)
             deliverLocked(out.frames)
-            return out
+            return (out, builtinFirstStartPending)
         }
         delivery.drain()
-        out.notes.forEach { noteBuiltinConversation($0) }
+        // FR1 U8 (V-F10): the unit has not started yet, so "no input" is not news; the deadline still runs.
+        out.notes.filter { !(firstStartPending && $0 == "health=warn reason=no_input") }.forEach { noteBuiltinConversation($0) }
         if let failure = out.failure {
             if state.1 {
                 // The attempted recovery itself never produced input. This is the sole
