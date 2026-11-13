@@ -2,7 +2,14 @@ import AudioToolbox
 import AVFoundation
 import CoreAudio
 import DictateCore
+import os
 import Synchronization
+
+/// FR1 U4: the recorder marks the next start of a unit as a sole built-in CONVERSATION start. Only that start
+/// may read the D5 seam; dictation (the bridge arm) never sets it, so it never reads the key.
+protocol BuiltinConversationSeamGated: AnyObject {
+    func allowConversationSeamForNextStart()
+}
 
 /// v1.8 (L1): the bridge's built-in microphone as a raw AUHAL (Apple TN2091): HAL output unit,
 /// input element 1 enabled, output element 0 disabled, `CurrentDevice` = the physical built-in
@@ -13,8 +20,12 @@ import Synchronization
 ///
 /// The IO callback only renders into preallocated slots (no allocation, no locks); a worker
 /// drains them every 10 ms, converts to 24 kHz mono Float and hands them to `onFrames`.
-final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
+final class BuiltinCaptureUnit: BuiltinFormatChangeReporting, BuiltinConversationSeamGated {
     static let uidOverrideDefaultsKey = "DictateBuiltinCaptureUIDOverride"
+    /// FR1 U4: `<uid>|<unix-epoch-seconds expiry>`, honoured only while `now < expiry <= now + 900`.
+    static let uidOverrideMaxLifetime: TimeInterval = 900
+    /// FR1 V-G5: the seam line also goes to the unified log directly (subsystem = the host app's bundle id).
+    static let unifiedLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.razakhan.dictate", category: "capture")
 
     var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
     var onDeviceLost: ((CaptureEpoch) -> Void)?
@@ -25,7 +36,18 @@ final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
     }
     let backend = "auhal"
     private let defaults: UserDefaults
-    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    private let lookupUID: (String) -> AudioDeviceID?
+    private let builtInDevice: () throws -> AudioDeviceID
+    private var conversationSeamAllowed = false
+    init(defaults: UserDefaults = .standard,
+         lookupUID: @escaping (String) -> AudioDeviceID? = AudioDevices.device(forUID:),
+         builtIn: @escaping () throws -> AudioDeviceID = AudioDevices.builtInInput) {
+        self.defaults = defaults
+        self.lookupUID = lookupUID
+        self.builtInDevice = builtIn
+    }
+
+    func allowConversationSeamForNextStart() { lock.withLock { conversationSeamAllowed = true } }
 
     private let lock = NSLock()
     /// Held across every call on the opaque unit from another thread (read-back) and across its
@@ -73,29 +95,67 @@ final class BuiltinCaptureUnit: BuiltinFormatChangeReporting {
         var errorDescription: String? { description }
     }
 
-    /// D5 (1.29.6): resolves `DictateBuiltinCaptureUIDOverride` when set on `defaults`, logging
-    /// `builtin_override=1 uid=<uid>`. When absent, resolves the physical built-in input with no log line. An invalid override fails closed.
+    /// D5 (1.29.6) + FR1 U4: resolves `DictateBuiltinCaptureUIDOverride` = `<uid>|<epoch expiry>` only for a
+    /// conversation start and only while `now < expiry <= now + 900`, logging `builtin_override=1 uid=<uid>` (also to
+    /// the unified log). A dictation start never reads the key. An expired or malformed value is ignored and deleted
+    /// (no log line). A valid value whose UID does not resolve fails closed. Otherwise the physical built-in input.
     static func resolveDevice(
         defaults: UserDefaults = .standard,
+        conversation: Bool,
+        now: Date = Date(),
         lookupUID: (String) -> AudioDeviceID? = AudioDevices.device(forUID:),
         builtIn: () throws -> AudioDeviceID = AudioDevices.builtInInput,
         note: (String) -> Void
     ) throws -> (id: AudioDeviceID, overrideUID: String?) {
-        if let value = defaults.object(forKey: Self.uidOverrideDefaultsKey) {
-            guard let raw = value as? String else { throw StartError(step: "override_uid_type", status: -1) }
-            note("builtin_override=1 uid=\(raw)")
-            guard let id = lookupUID(raw) else {
-                throw StartError(step: "override_uid", status: -1)
-            }
-            return (id, raw)
+        guard conversation, let value = defaults.object(forKey: Self.uidOverrideDefaultsKey) else {
+            return (try builtIn(), nil)
         }
-        return (try builtIn(), nil)
+        guard let uid = Self.liveOverrideUID(value, now: now) else {
+            defaults.removeObject(forKey: Self.uidOverrideDefaultsKey)
+            return (try builtIn(), nil)
+        }
+        let line = "builtin_override=1 uid=\(uid)"
+        Self.unifiedLog.notice("\(line, privacy: .public)")
+        note(line)
+        guard let id = lookupUID(uid) else {
+            throw StartError(step: "override_uid", status: -1)
+        }
+        return (id, uid)
+    }
+
+    /// The UID of a well-formed, unexpired seam value; nil otherwise.
+    static func liveOverrideUID(_ value: Any, now: Date) -> String? {
+        guard let raw = value as? String, let bar = raw.lastIndex(of: "|") else { return nil }
+        let uid = String(raw[..<bar])
+        guard !uid.isEmpty, let expiry = TimeInterval(raw[raw.index(after: bar)...]), expiry.isFinite else { return nil }
+        let t = now.timeIntervalSince1970
+        guard t < expiry, expiry <= t + uidOverrideMaxLifetime else { return nil }
+        return uid
+    }
+
+    /// Every start consumes the mark first, whatever happens next (a thrown start never leaves it for dictation).
+    private func takeConversationMark() -> Bool {
+        lock.withLock {
+            defer { conversationSeamAllowed = false }
+            return conversationSeamAllowed
+        }
+    }
+
+    private func resolveDevice(conversation: Bool, now: Date) throws -> (id: AudioDeviceID, overrideUID: String?) {
+        try Self.resolveDevice(defaults: defaults, conversation: conversation, now: now,
+                               lookupUID: lookupUID, builtIn: builtInDevice, note: note)
+    }
+
+    /// Hardware-free: exactly `start(epoch:)`'s device resolution (mark consumed, then resolved), without the AUHAL.
+    func resolveStartDevice(now: Date = Date()) throws -> (id: AudioDeviceID, overrideUID: String?) {
+        try resolveDevice(conversation: takeConversationMark(), now: now)
     }
 
     func start(epoch token: CaptureEpoch) throws {
+        let conversation = takeConversationMark()
         guard let targetFormat else { throw StartError(step: "target_format", status: -1) }
         stop()
-        let resolved = try Self.resolveDevice(defaults: defaults, note: note)
+        let resolved = try resolveDevice(conversation: conversation, now: Date())
         let id = resolved.id
         let uid = resolved.overrideUID ?? AudioDevices.uid(of: id)
         lock.withLock { epoch = token; device = id; deviceUID = uid; lastArrival = nil; currentHardwareSummary = nil }

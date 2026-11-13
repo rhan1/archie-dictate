@@ -14,7 +14,7 @@ struct V1296BuiltinConversationTests {
         var value: T { get { lock.withLock { storage } } set { lock.withLock { storage = newValue } } }
         func update(_ body: (inout T) -> Void) { lock.withLock { body(&storage) } }
     }
-    final class Builtin: BuiltinFormatChangeReporting, @unchecked Sendable {
+    final class Builtin: BuiltinFormatChangeReporting, BuiltinConversationSeamGated, @unchecked Sendable {
         var onFrames: (([Float], TimeInterval, CaptureEpoch) -> Void)?
         var onDeviceLost: ((CaptureEpoch) -> Void)?
         var onFormatChange: ((CaptureEpoch) -> Void)?
@@ -26,6 +26,13 @@ struct V1296BuiltinConversationTests {
         var stopGate: DispatchSemaphore?
         var afterStart: (() -> Void)?
         var startError: Error?
+        /// FR1 U4: the recorder's per-start conversation mark, and an optional hook running the production
+        /// seam resolution with that mark (the native bind itself stays faked: device 81).
+        let seamMarks = Box<[Bool]>([])
+        private let marked = Box(false)
+        var resolve: ((Bool) throws -> UInt32)?
+        let resolved = Box<[UInt32]>([])
+        func allowConversationSeamForNextStart() { marked.value = true }
         var hardwareFormatSummary: (sampleRate: Double, channels: Int)? = (48_000, 1)
         var expectedDeviceID: UInt32? { 81 }
         var currentDeviceID: UInt32? { readback.value }
@@ -34,6 +41,10 @@ struct V1296BuiltinConversationTests {
         var lastBufferTime: TimeInterval? { nil }
         let backend = "auhal"
         func start(epoch: CaptureEpoch) throws {
+            let mark = marked.value
+            marked.value = false
+            seamMarks.update { $0.append(mark) }
+            if let resolve { let id = try resolve(mark); resolved.update { $0.append(id) } }
             starts.update { $0 += 1 }
             startGate?.wait()
             if let startError { throw startError }
@@ -481,18 +492,22 @@ struct V1296BuiltinConversationTests {
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let notes = Box<[String]>([]), lookups = Box<[String]>([]), fallbackCalls = Box(0)
+        // FR1 U4 (ruling wins, test rewritten): the value is `<uid>|<epoch expiry>` and only a conversation
+        // start reads it. Before: a bare "override input" was honoured and "" failed closed; now a bare UID or ""
+        // is malformed (ignored and deleted: V1296FR1) and an unresolvable live UID fails closed.
         func resolve() throws -> (id: UInt32, overrideUID: String?) {
-            try BuiltinCaptureUnit.resolveDevice(defaults: defaults, lookupUID: { uid in
+            try BuiltinCaptureUnit.resolveDevice(defaults: defaults, conversation: true, lookupUID: { uid in
                 lookups.update { $0.append(uid) }; return uid == "override input" ? 92 : nil
             }, builtIn: { fallbackCalls.update { $0 += 1 }; return 81 }, note: { line in notes.update { $0.append(line) } })
         }
+        let expiry = Int(Date().timeIntervalSince1970) + 300
         #expect(try resolve().id == 81)
         #expect(notes.value.isEmpty && lookups.value.isEmpty && fallbackCalls.value == 1)
-        defaults.set("override input", forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
+        defaults.set("override input|\(expiry)", forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
         #expect(try resolve().id == 92)
         #expect(lookups.value == ["override input"] && fallbackCalls.value == 1)
         #expect(notes.value == ["builtin_override=1 uid=override input"])
-        defaults.set("", forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
+        defaults.set("missing input|\(expiry)", forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
         #expect(throws: BuiltinCaptureUnit.StartError.self) { try resolve() }
         #expect(fallbackCalls.value == 1)
         defaults.removeObject(forKey: BuiltinCaptureUnit.uidOverrideDefaultsKey)
