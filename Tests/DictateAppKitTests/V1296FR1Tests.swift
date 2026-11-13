@@ -63,4 +63,22 @@ struct V1296FR1Tests {
         print("D GREEN bind_failure_outside_apply_callbacks=\(r.failures.value.count)")
         await r.stop()
     }
+
+    // MARK: V-F16 — stop() leaves a reusable recorder on the default input
+
+    @Test func stop_resets_selected_device() async throws {
+        let r = Rig(); try await r.start()
+        #expect(r.recorder.activeInputChoice == .builtIn)
+        await r.stop()
+        let reset = r.recorder.activeInputChoice == .default
+        #expect(reset)
+        // The same recorder's next `.default` conversation takes the legacy branch from its first call.
+        r.clock.value = ProcessInfo.processInfo.systemUptime
+        try await r.start(device: .default)
+        r.emit(at: ProcessInfo.processInfo.systemUptime)
+        #expect(r.headset.starts == 1 && r.recorder.isRunning)
+        #expect(r.routeWatches.value == ["builtin", "legacy"])
+        print("D GREEN stop_resets_selected_device=\(reset ? 1 : 0)")
+        await r.stop()
+    }
 }
