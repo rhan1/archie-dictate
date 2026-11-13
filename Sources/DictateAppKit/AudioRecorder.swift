@@ -2836,12 +2836,18 @@ public final class AudioRecorder: CaptureEngine {
 
     private func armBuiltinFirstAudioTimer() {
         guard builtinConversationAutomaticTimers else { return }
-        let state = lock.withLock { (soleBuiltinFirstAudio.deadline, soleBuiltinFirstAudio.verdict, lease?.token) }
-        guard let deadline = state.0, state.1 == nil else { return }
+        // FR1 U7 (V-F8): armed only for a live lease, before a verdict and before a reported failure. A handler
+        // that lost its lease (stop() between its check and its evaluation) therefore never re-arms itself.
+        let state = lock.withLock { () -> (TimeInterval, CaptureEpoch)? in
+            guard let deadline = soleBuiltinFirstAudio.deadline, soleBuiltinFirstAudio.verdict == nil,
+                  !failureReported, let lease, lease.isActive else { return nil }
+            return (deadline, lease.token)
+        }
+        guard let (deadline, token) = state else { return }
         let timer = DispatchSource.makeTimerSource(queue: healthQueue)
         timer.schedule(deadline: .now() + max(0, deadline - builtinConversationClock()))
         timer.setEventHandler { [weak self] in
-            guard let self, self.lock.withLock({ self.lease?.token === state.2 }) else { return }
+            guard let self, self.lock.withLock({ self.lease?.isActive == true && self.lease?.token === token }) else { return }
             self.evaluateBuiltinFirstAudio(at: self.builtinConversationClock())
             // start may have returned since this timer was armed; use its actual t0 deadline.
             self.armBuiltinFirstAudioTimer()
