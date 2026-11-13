@@ -48,4 +48,88 @@ struct V1296FR1BaseComparableTests {
         #expect(runs == 0)
         #expect(await recorder.awaitRelease() == .released)
     }
+
+    // MARK: U8 (V-F10) — no no_input warning while the first native start has not returned
+
+    @Test func no_input_warn_before_first_start() async throws {
+        let blocked = Builtin(), gate = DispatchSemaphore(value: 0)
+        blocked.startGate = gate
+        let r = Rig([blocked]); try await r.start()
+        #expect(await V.eventually { blocked.starts.value == 1 })
+        #expect(!blocked.started)
+        r.tick(100.1); r.tick(100.2); r.tick(100.5)
+        let warns = r.recorder.builtinConversationDiagnostics.filter { $0 == "health=warn reason=no_input" }.count
+        print("D \(Self.phase) no_input_warn_before_first_start warns=\(warns)")
+        #expect(warns == 0)
+        gate.signal()
+        #expect(await V.eventually { r.verifiedStart(1) })
+        await r.stop()
+    }
+
+    // MARK: U8 (V-F9) — first detection is `drift`; `failed` only when the re-bind failed
+
+    @Test(arguments: [true, false]) func first_bind_detection_logs_drift(rebindOK: Bool) async throws {
+        let first = Builtin(); first.readback.value = 999
+        let second = Builtin(); if !rebindOK { second.readback.value = 999 }
+        let r = Rig([first, second]); try await r.start()
+        if rebindOK {
+            #expect(await V.eventually { r.verifiedStart(2) })
+        } else {
+            #expect(await V.eventually { r.failures.value.map(\.reason) == [.builtinBindFailed] })
+        }
+        let binds = r.recorder.builtinConversationDiagnostics.filter { $0.hasPrefix("builtin_bind ") }
+        let results = binds.map { $0.split(separator: " ")[1].replacingOccurrences(of: "result=", with: "") }
+        print("D \(Self.phase) first_bind_detection_logs_drift rebind=\(rebindOK ? "ok" : "fails") results=\(results.joined(separator: ","))")
+        #expect(binds.first == "builtin_bind result=drift from=999 to=81")
+        #expect(results == (rebindOK ? ["drift", "rebound"] : ["drift", "failed"]))
+        await r.stop()
+    }
+
+    /// The re-bind owns the full 300 ms from detection: a replacement whose start returns verified ~170 ms after
+    /// detection (after 001c599's 150 ms timer, well inside 300 ms) is a `rebound`, not a failure.
+    @Test func rebind_gets_full_300ms() async throws {
+        let first = Builtin(); first.readback.value = 999
+        let second = Builtin(), gate = DispatchSemaphore(value: 0)
+        second.startGate = gate
+        let r = Rig([first, second])
+        try await r.start()
+        #expect(await V.eventually { second.starts.value == 1 }) // detection happened before this point
+        let observed = Self.uptime
+        let released = V.Box<TimeInterval?>(nil)
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.17) {
+            released.value = ProcessInfo.processInfo.systemUptime
+            gate.signal()
+        }
+        #expect(await Self.waitUntil(2) { released.value != nil })
+        let releasedMs = Int(((released.value! - observed) * 1000).rounded())
+        _ = await V.eventually { r.verifiedStart(2) || !r.failures.value.isEmpty }
+        try? await Task.sleep(nanoseconds: 200_000_000) // past the 300 ms limit
+        let failed = r.failures.value.count
+        print("D \(Self.phase) rebind_gets_full_300ms rebind_returned_after_ms=\(releasedMs) failed=\(failed) rebound=\(r.verifiedStart(2) ? 1 : 0)")
+        #expect(releasedMs >= 150 && releasedMs < 290) // the scenario itself: released between the two limits
+        #expect(failed == 0)
+        #expect(r.verifiedStart(2))
+        await r.stop()
+    }
+
+    // MARK: U8 (V-F11) — a route change that lands inside an apply raises a generation when the apply ends
+
+    @Test func apply_end_fingerprint_reread() async throws {
+        let second = Builtin()
+        let r = Rig([Builtin(), second]); try await r.start(); r.emit()
+        second.afterStart = { [weak r] in
+            guard let r else { return }
+            r.routeFacts.update { $0.2.id = 99 }      // the input device changes while the apply waits
+            r.recorder.observeConversationRoute()     // and its notification arrives during the apply
+        }
+        r.routeFacts.update { $0.1.id = 90 }
+        r.recorder.observeConversationRoute()
+        #expect(try r.recorder.reconfigureConversationInput(at: 100.1))
+        let generation = r.recorder.activeRouteGeneration
+        let pending = generation != r.recorder.activeAppliedRouteGeneration
+        print("D \(Self.phase) apply_end_fingerprint_reread generation=\(generation) pending=\(pending ? 1 : 0)")
+        #expect(generation == 2 && pending)
+        #expect(r.states.value.last == .routeChangePending(generation: 2))
+        await r.stop()
+    }
 }

@@ -433,7 +433,9 @@ struct V1296BuiltinConversationTests {
         }
         #expect(await Self.eventually { !r.failures.value.isEmpty })
         let notifiedMs = ((r.failureTimes.value.first ?? ProcessInfo.processInfo.systemUptime) - began) * 1000
-        #expect(notifiedMs <= AudioRecorder.builtinBindFailureLimit * 1000)
+        // FR1 U8 (V-F9, ruling wins): the re-bind now owns the full 300 ms from detection (was a 150 ms timer), so the
+        // host hears the failure at the limit plus delivery latency. Before: <= limit. After: <= limit + 200 ms.
+        #expect(notifiedMs <= (AudioRecorder.builtinBindFailureLimit + 0.2) * 1000)
         #expect(r.failures.value.map(\.reason) == [.builtinBindFailed])
         #expect(r.failures.value.first?.bindFrom == readback)
         #expect(r.failures.value.first?.bindExpected == 81)
