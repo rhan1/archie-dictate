@@ -2438,6 +2438,9 @@ public final class AudioRecorder: CaptureEngine {
         healthTimer = nil
         if captureKind == .conversation && selectedDevice == .builtIn {
             stopBuiltinConversationTimersLocked()
+            // FR1 V-F16: the sole-branch guards key on selectedDevice; a reused recorder's next
+            // `.default` start must not inherit them. Only this mode resets it (dictation unchanged).
+            selectedDevice = .default
         }
         heldBindFailure = nil
         meter.clearBatch()
@@ -2754,6 +2757,7 @@ public final class AudioRecorder: CaptureEngine {
     var hasConfigurationObserver: Bool { lock.withLock { configObserver != nil } }
     var activeRouteGeneration: UInt64 { lock.withLock { routeGeneration } }
     var activeAppliedRouteGeneration: UInt64 { lock.withLock { appliedRouteGeneration } }
+    var activeInputChoice: MicChoice { lock.withLock { selectedDevice } }
 
     private var isBuiltinConversationRunning: Bool {
         let state = lock.withLock { (captureRunning && builtinActive && !failureReported, builtin) }
