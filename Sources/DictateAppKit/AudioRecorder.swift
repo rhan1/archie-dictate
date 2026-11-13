@@ -2439,6 +2439,7 @@ public final class AudioRecorder: CaptureEngine {
         if captureKind == .conversation && selectedDevice == .builtIn {
             stopBuiltinConversationTimersLocked()
         }
+        heldBindFailure = nil
         meter.clearBatch()
         let stopUnit: (BuiltinCapture, DispatchQueue)? = builtinActive ? (builtin, builtinQueue) : nil
         // Any earlier stop of the unit (health clock, failed start) is queued here too: the
@@ -2742,6 +2743,9 @@ public final class AudioRecorder: CaptureEngine {
     private var builtinBindDetectedExpected: UInt32?
     private var appliedRouteFingerprint: String?
     private var builtinConversationNotes: [String] = []
+    /// FR1 U2: the sole built-in bind failure not yet handed to the host. Exactly one of the async
+    /// `onCaptureFailure` delivery or a throwing route apply takes it (raised during an apply: only the apply).
+    private var heldBindFailure: CaptureFailure?
     private let builtinFailureQueue = DispatchQueue(label: "dictate.builtin.failure", qos: .userInitiated)
     var builtinConversationDiagnostics: [String] { lock.withLock { builtinConversationNotes } }
     var builtinConversationAutomaticTimers = true
@@ -2949,7 +2953,7 @@ public final class AudioRecorder: CaptureEngine {
     }
 
     private func failBuiltinConversationBind(epoch: CaptureEpoch, from: UInt32?, expected: UInt32?) {
-        let failure = lock.withLock { () -> CaptureFailure? in
+        let held = lock.withLock { () -> (failure: CaptureFailure, applying: Bool)? in
             guard engineEpoch === epoch, !failureReported, lease?.isActive == true else { return nil }
             failureReported = true
             captureRunning = false
@@ -2960,16 +2964,26 @@ public final class AudioRecorder: CaptureEngine {
             builtinFirstAudioTimer?.cancel(); builtinFirstAudioTimer = nil
             builtinBindTimer?.cancel(); builtinBindTimer = nil
             let now = builtinConversationClock()
-            return CaptureFailure(reason: .builtinBindFailed,
+            let failure = CaptureFailure(reason: .builtinBindFailed,
                                   durationSeconds: captureBoundary.map { max(0, now - $0) } ?? 0,
                                   bytes: 44 + keptFrameCount * 2, framesKept: keptFrameCount,
                                   sources: feed.health.summary(at: now), bindFrom: from, bindExpected: expected)
+            heldBindFailure = failure
+            return (failure, routeApplying)
         }
-        guard let failure else { return }
-        // Failure delivery never waits for the unit's serial executor or native teardown.
-        builtinFailureQueue.async { [weak self] in
-            guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
-            self.onCaptureFailure?(failure)
+        guard let (failure, applying) = held else { return }
+        if !applying {
+            // Failure delivery never waits for the unit's serial executor or native teardown.
+            // An apply that starts before this runs takes the failure instead (never both).
+            builtinFailureQueue.async { [weak self] in
+                guard let self else { return }
+                let deliver = self.lock.withLock { () -> Bool in
+                    guard self.engineEpoch === epoch, self.heldBindFailure != nil else { return false }
+                    self.heldBindFailure = nil
+                    return true
+                }
+                if deliver { self.onCaptureFailure?(failure) }
+            }
         }
         noteBuiltinConversation(BuiltinConversationDiagnostics.builtinBindNote(result: "failed", from: from, to: expected))
         noteBuiltinConversation(failure.note)
@@ -2981,7 +2995,26 @@ public final class AudioRecorder: CaptureEngine {
         if let (unit, queue) = stop { stopBuiltinUnit(unit, queue: queue, epoch: epoch) }
     }
 
+    /// FR1 U2: a bind failure raised while the apply runs (second format restart inside 5 s, old unit stop
+    /// unacknowledged for 2 s, replacement start failed) or raised before it and not yet delivered is THROWN as
+    /// `RecorderError.builtinBindFailed` and never also delivered to `onCaptureFailure`: the host sees it before
+    /// `applyPendingConversationDeviceChange`'s generic stop can drop an asynchronous callback.
     private func reconfigureBuiltinConversation(at time: TimeInterval?) throws -> Bool {
+        let result: Result<Bool, Error>
+        do { result = .success(try applySoleBuiltinRoute(at: time)) } catch { result = .failure(error) }
+        let (appliedEpoch, failure) = lock.withLock { () -> (CaptureEpoch, CaptureFailure?) in
+            routeApplying = false
+            defer { heldBindFailure = nil }
+            return (engineEpoch, heldBindFailure)
+        }
+        // A failed start read-back can arrive on the health queue during apply.
+        // Recheck after leaving that guard even when the periodic timer is disabled.
+        healthQueue.async { [weak self] in self?.builtinConversationTick(epoch: appliedEpoch) }
+        if let failure { throw RecorderError.builtinBindFailed(failure) }
+        return try result.get()
+    }
+
+    private func applySoleBuiltinRoute(at time: TimeInterval?) throws -> Bool {
         let oldEpoch = lock.withLock { engineEpoch }
         let generation = try lock.withLock { () throws -> UInt64? in
             guard lease?.isActive == true, !failureReported else { throw CancellationError() }
@@ -2992,15 +3025,6 @@ public final class AudioRecorder: CaptureEngine {
             return routeGeneration
         }
         guard let generation else { return false }
-        defer {
-            let appliedEpoch = lock.withLock { () -> CaptureEpoch in
-                routeApplying = false
-                return engineEpoch
-            }
-            // A failed start read-back can arrive on the health queue during apply.
-            // Recheck after leaving that guard even when the periodic timer is disabled.
-            healthQueue.async { [weak self] in self?.builtinConversationTick(epoch: appliedEpoch) }
-        }
         let formatRoute = route.currentBuiltinConversationRoute()
         let needsFormat = lock.withLock {
             builtinFormatPending || RouteFingerprint.builtinFormatChanged(from: appliedRouteFingerprint, to: formatRoute)
@@ -3009,7 +3033,7 @@ public final class AudioRecorder: CaptureEngine {
             let decision = lock.withLock { soleBuiltinRestarts.judge(reason: .format, at: time ?? builtinConversationClock()) }
             if decision == .fail {
                 failBuiltinConversationBind(epoch: oldEpoch, from: nil, expected: lock.withLock { builtin.expectedDeviceID })
-                throw CancellationError()
+                throw CancellationError() // rethrown as the held builtinBindFailed
             }
             noteBuiltinConversation(SoleBuiltinRestartPolicy.note(reason: .format))
         }
@@ -3018,7 +3042,7 @@ public final class AudioRecorder: CaptureEngine {
         old.1.async { old.0.stop(epoch: oldEpoch); stopped.signal() }
         guard stopped.wait(timeout: .now() + CaptureLeaseBroker.releaseWait) == .success else {
             failBuiltinConversationBind(epoch: oldEpoch, from: nil, expected: old.0.expectedDeviceID)
-            throw RecorderError.routeTeardownPending
+            throw RecorderError.routeTeardownPending // rethrown as the held builtinBindFailed
         }
         let epoch = CaptureEpoch()
         let now = time ?? builtinConversationClock()
@@ -3217,5 +3241,10 @@ public final class AudioRecorder: CaptureEngine {
         decision.notes.forEach { noteBuiltinConversation($0) }
     }
 
-    public enum RecorderError: Error { case noInput, builtinDrift, notConversation, routeTeardownPending }
+    public enum RecorderError: Error, Equatable {
+        case noInput, builtinDrift, notConversation, routeTeardownPending
+        /// FR1 U2: a sole built-in conversation's bind failure raised during a route apply (see
+        /// `applyPendingConversationDeviceChange`). The recorder has stopped; `onCaptureFailure` is not called for it.
+        case builtinBindFailed(CaptureFailure)
+    }
 }

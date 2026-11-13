@@ -25,6 +25,7 @@ struct V1296BuiltinConversationTests {
         var startGate: DispatchSemaphore?
         var stopGate: DispatchSemaphore?
         var afterStart: (() -> Void)?
+        var startError: Error?
         var hardwareFormatSummary: (sampleRate: Double, channels: Int)? = (48_000, 1)
         var expectedDeviceID: UInt32? { 81 }
         var currentDeviceID: UInt32? { readback.value }
@@ -35,6 +36,7 @@ struct V1296BuiltinConversationTests {
         func start(epoch: CaptureEpoch) throws {
             starts.update { $0 += 1 }
             startGate?.wait()
+            if let startError { throw startError }
             running.value = epoch
             afterStart?()
         }
@@ -207,6 +209,7 @@ struct V1296BuiltinConversationTests {
         #expect(r.recorder.builtinConversationDiagnostics.contains("builtin_restart=1 reason=\(reason)"))
         let new = r.units.value.last!
         r.emit(at: 101)
+        var thrown: CaptureFailure?
         switch reason {
         case "stale": r.tick(101 + CaptureHealth.staleAfter + 0.01)
         case "drift": new.readback.value = 999; r.tick(101.1)
@@ -214,9 +217,18 @@ struct V1296BuiltinConversationTests {
         default:
             new.onFormatChange?(new.running.value!)
             #expect(await Self.eventually { r.recorder.activeRouteGeneration == 2 })
-            _ = try? r.recorder.reconfigureConversationInput(at: r.clock.value)
+            do { _ = try r.recorder.reconfigureConversationInput(at: r.clock.value) }
+            catch AudioRecorder.RecorderError.builtinBindFailed(let failure) { thrown = failure }
         }
-        #expect(await Self.eventually { r.failures.value.map(\.reason) == [.builtinBindFailed] })
+        if reason == "format" {
+            // FR1 U2 (ruling wins, test rewritten): a failure raised inside the apply is thrown typed, never also
+            // delivered to onCaptureFailure. Before: `try?` + one onCaptureFailure(.builtinBindFailed).
+            #expect(thrown?.reason == .builtinBindFailed)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            #expect(r.failures.value.isEmpty)
+        } else {
+            #expect(await Self.eventually { r.failures.value.map(\.reason) == [.builtinBindFailed] })
+        }
         #expect(r.units.value.count == 2)
         #expect(!r.recorder.isRunning)
         print("D GREEN d1a_restart_once_then_fail reason=\(reason)=1")
