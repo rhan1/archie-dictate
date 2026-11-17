@@ -77,16 +77,18 @@ struct V1298DictationAfterConversationTests {
 
     struct Outcome {
         let ready: Bool, samples: [Float], recordingMs: Int, intervals: String, carrier: String, notes: [String]
+        var release: CaptureLease.State? = nil, leaseFree = false
         /// What the host's outcome would be: no kept voice → `error:silence` (dict_levels max=0).
         var outcome: String { samples.contains { $0 != 0 } ? "pasted" : "error:silence" }
         var voiceMs: Int { samples.filter { $0 != 0 }.count / 24 }
         var line: String {
             "outcome=\(outcome) voice_ms=\(voiceMs) recording_ms=\(recordingMs) capture_intervals=\(intervals) carrier=\(carrier)"
+                + " release=\(release.map { "\($0)" } ?? "nil") lease_free=\(leaseFree)"
         }
     }
 
     /// Path (b), XM6: a conversation's lease is released, then the dictation starts at once (the host's order).
-    @MainActor static func xm6(failFirst: Int, seconds: TimeInterval = 3.0) async throws -> Outcome {
+    @MainActor static func xm6(failFirst: Int, seconds: TimeInterval = 3.0, cancelInWait: Bool = false) async throws -> Outcome {
         let broker = CaptureLeaseBroker()
         let route = CaptureLeaseRecorderTests.route                    // Bluetooth default input + a built-in
         let log = CaptureLeaseRecorderTests.Log()
@@ -113,15 +115,22 @@ struct V1298DictationAfterConversationTests {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
         }
+        final class Flag: @unchecked Sendable { var on = false }
+        let cancelled = Flag()
         let ready = await lifecycle.beginRecordingAsync(at: now(),
             start: { try await recorder.startAsync(device: $0) }, rebuild: { try await recorder.rebuildAsync() },
-            wait: { s in try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }, isCancelled: { false })
-        await speaking.value
-        let samples = lifecycle.end(.finished(.ok))
-        _ = await recorder.awaitRelease()
+            wait: { s in try? await Task.sleep(nanoseconds: UInt64(s * 1e9)); if cancelInWait { cancelled.on = true } },
+            isCancelled: { cancelled.on })
+        if !cancelInWait { await speaking.value }
+        let samples = lifecycle.end(cancelInWait ? .cancel : .finished(.ok))   // the host's Esc / finish tap
+        if cancelInWait { speaking.cancel() }
+        let release = await recorder.awaitRelease()
+        let next = broker.tryAcquire(.conversation)                          // the next ⌘⌘ gets the microphone
+        let free = (try? next.get()) != nil
+        if case .success(let lease) = next { lease.release() }
         let s = recorder.stats
         return Outcome(ready: ready, samples: samples, recordingMs: s.recordingMs, intervals: s.captureIntervals,
-                       carrier: s.carrier, notes: notes.all)
+                       carrier: s.carrier, notes: notes.all, release: release, leaseFree: free)
     }
 
     /// Path (a), no headset: the Mac mic is the default input (the engine arm on the offline fake engine) and its
@@ -188,6 +197,14 @@ struct V1298DictationAfterConversationTests {
         #expect(r.outcome == "pasted")
         #expect(r.voiceMs >= 2_500)                       // nothing he said in the first 3 s is lost (≤ 0.5 s slack)
         #expect(r.recordingMs > 0 && r.intervals != "none")
+        #expect(r.release == .released && r.leaseFree)    // the kept session still ends: lease + built-in released
+    }
+
+    /// Fable 2 (archie-6273 read): Esc during the retry wait still releases everything the kept session held.
+    @Test @MainActor func cancel_during_retry_wait_releases() async throws {
+        let r = try await Self.xm6(failFirst: 1, cancelInWait: true)
+        print("F1 LITERAL cancel_during_retry_wait ready=\(r.ready) \(r.line)")
+        #expect(!r.ready && r.release == .released && r.leaseFree)
     }
 
     @Test @MainActor func dictation_right_after_conversation_mac_mic() async throws {
