@@ -62,6 +62,8 @@ public final class AudioRecorder: CaptureEngine {
     }
     /// 1.29 test seam: nil in production (this recorder's AVAudioEngine).
     var offlineConversationEngine: OfflineConversationEngine?
+    /// 1.29.8 test seam (false in production): the engine arm's `start(device:)` runs on the offline fake, whose running state is `isRunning`.
+    var offlineEngineArmStarts = false
     private var failureReported = false
     private var keptFrameCount = 0
     /// Eight queued 100 ms callbacks plus one partial batch. 62.7.1 B3 F2: an overflow drops the OLDEST
@@ -181,6 +183,7 @@ public final class AudioRecorder: CaptureEngine {
                                      headsetUnitActive ? headsetUnit : nil) }
         if state.2 { return true }    // H2: this dictation's headset restart is in flight
         if let unit = state.3 { return state.0 && unit.isRunning }
+        if offlineEngineArmStarts, let offline = offlineConversationEngine { return state.0 && offline.native().isRunning() == true }
         return state.0 && ((try? captureObjC { state.1?.isRunning ?? false }) ?? false)
     }
     public var isAllocated: Bool { lock.withLock { engine != nil || builtinActive || headsetUnitActive } }
@@ -1098,7 +1101,11 @@ public final class AudioRecorder: CaptureEngine {
                 // v1.12 (L1): a start that failed for this session ends it — the built-in unit is
                 // stopped and the lease released — so a host that does not call stop() after a
                 // thrown startAsync cannot leave the microphone owned forever.
-                if lock.withLock({ engineEpoch === epoch && lease != nil }) { _ = stop() }
+                // 1.29.8 (62.7.3 Fix 1): a dictation the host already opened (resetCapture set its boundary) belongs to
+                // the host's start chain, which retries and ends it; ending it here dropped the boundary and the built-in
+                // bridge already carrying his voice, so the retry captured into nothing (−10868 after a conversation).
+                if lock.withLock({ engineEpoch === epoch && lease != nil
+                    && (captureKind == .conversation || captureBoundary == nil) }) { _ = stop() }
                 completion(.failure(error))
             }
         }
