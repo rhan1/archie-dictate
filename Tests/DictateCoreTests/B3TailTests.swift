@@ -75,11 +75,13 @@ struct B3TailTests {
         // His last spoken word region (windows 82–100 at 50 ms, -37…-44 dBFS on the Mac mic), 0.95 s.
         let word = Array(all[(82 * 1_200)..<(82 * 1_200 + 22_800)])
         let speech = Array(all.prefix(82 * 1_200))
-        let result = await run([(speech, .init(text: "Can you check whether the build passed?", segment: nil)),
-                                (word, .init(text: "Send it now.", segment: (0.00, 0.80, 0.02, -0.30, 0.60)))])
-        let kept = result.text.hasSuffix("Send it now.")
-        print("B3 GREEN short_real_final_word_kept=\(kept ? 1 : 0) word_s=0.95 text_chars=\(result.text.count)")
-        #expect(kept)
+        for said in ["Send it now.", "Thank you."] {   // a real spoken "Thank you." at speech level is kept too (Fable read F1)
+            let result = await run([(speech, .init(text: "Can you check whether the build passed?", segment: nil)),
+                                    (word, .init(text: said, segment: (0.00, 0.80, 0.02, -0.30, 0.60)))])
+            let kept = result.text.hasSuffix(said)
+            print("B3 GREEN short_real_final_word_kept=\(kept ? 1 : 0) said=\"\(said)\" word_s=0.95 text_chars=\(result.text.count)")
+            #expect(kept)
+        }
     }
 }
 
@@ -92,5 +94,29 @@ extension B3TailTests {
                                 (tail, .init(text: "Okay.", segment: nil))])
         print("B3 GREEN quiet_tail_silent_dropped=\(result.text == "Check the build." ? 1 : 0) silent_chunks=\(result.droppedSilentChunks)")
         #expect(result.text == "Check the build." && result.droppedSilentChunks == 1)
+    }
+}
+
+/// Committed, always-run twin of the fixture tests (Codex read F3): synthetic levels matching the incident —
+/// loud speech (−15 dBFS RMS) then a 0.9 s tail at −34 dBFS, above the −40 dBFS absolute speech line.
+extension B3TailTests {
+    static func tone(_ seconds: Double, amplitude: Double) -> [Int16] {
+        (0..<Int(seconds * 24_000)).map { Int16((amplitude * sin(2 * .pi * 220 * Double($0) / 24_000)).rounded()) }
+    }
+    @Test func syntheticLoudRoomTailThankYouIsNotPasted() async {
+        let speech = Self.tone(2.0, amplitude: 8_000), tail = Self.tone(0.9, amplitude: 900)
+        let result = await run([(speech, .init(text: "Check the build.", segment: nil)),
+                                (tail, .init(text: "Thank you.", segment: (0.00, 0.74, 0.00, -0.54, 0.58)))])
+        let pasted = result.text.contains("Thank you")
+        print("B3 \(pasted ? "RED" : "GREEN") synthetic_tail_thank_you_pasted=\(pasted ? 1 : 0) tail_dbfs=-34 speech_dbfs=-15")
+        #expect(!pasted)
+    }
+    @Test func syntheticSpokenThankYouIsKept() async {
+        let speech = Self.tone(2.0, amplitude: 8_000), said = Self.tone(0.9, amplitude: 6_000)
+        let result = await run([(speech, .init(text: "Check the build.", segment: nil)),
+                                (said, .init(text: "Thank you.", segment: (0.00, 0.80, 0.02, -0.30, 0.60)))])
+        let kept = result.text == "Check the build. Thank you."
+        print("B3 GREEN synthetic_spoken_thank_you_kept=\(kept ? 1 : 0)")
+        #expect(kept)
     }
 }
