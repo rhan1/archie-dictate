@@ -105,4 +105,4 @@ Raza (2026-11-05 23:5x): "pressing the two command keys isn't doing anything; it
 
 ## v1.29.7 — 2026-11-17
 - A capture overflow no longer ends the capture: more than 0.9 s of undelivered audio drops the OLDEST queued audio and capture continues (`capture_overrun_dropped_ms=<n>`); `capture_overrun` is no longer reported as a failure (it ended Archie conversations as "mic dead" after a headset→Mac-mic bridge replay). New `OrderedDelivery.dropOldest(upTo:)`.
-- A made-up "Thank you." on a short final tail is dropped: a residual final chunk under 1.5 s whose only sentences are Whisper's known silence phrases (`EdgeSentenceGuard.artifacts`) is emptied (counted as `stt_dropped_artifact`), whatever its level. Real words in a short tail keep the existing audio rule.
+- A made-up "Thank you." on a short final tail is dropped: a residual final chunk under 1.5 s whose only sentences are Whisper's known silence phrases (`EdgeSentenceGuard.artifacts`) and whose loudest window stays 6 dB under the dictation's own speech level is emptied (counted as `stt_dropped_artifact`). A spoken "Thank you." at speech level, and real words in a short tail, are kept.

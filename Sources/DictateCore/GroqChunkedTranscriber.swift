@@ -656,10 +656,14 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         guard let text = texts[index], !text.isEmpty, let windows = windowsByIndex[index],
               !(index == openingIndex && !openingDrops.isEmpty) else { return nil }
         // 62.7.1 B3 F4 (trace c2e38997): a short residual final tail that is only Whisper's silence phrases
-        // ("Thank you.") goes whatever its level. A loud Mac-mic dictation's room tail clears the speech floor,
-        // and a tail under 1.5 s can never hold the 1 s of quiet the audio rule below needs.
+        // ("Thank you.") and never reaches the dictation's own speech level (its loudest window stays
+        // `minContrastDB` under the dictation's 95th-percentile window) goes. A loud Mac-mic dictation's room
+        // tail clears the speech floor, and a tail under 1.5 s can never hold the 1 s of quiet the rule below needs.
         let sentences = EdgeSentenceGuard.sentences(in: text)
+        let reference = referenceWindowsLocked.sorted()
+        let speechLevel = reference.isEmpty ? 0 : reference[Int(Double(reference.count - 1) * 0.95)]
         if ownChunk, index > 0, Double(windows.count * CaptureEvidence.windowFrames) / CaptureEvidence.rate < Self.shortFinalSeconds,
+           (windows.max() ?? 0) < speechLevel * pow(10, -CaptureEvidence.minContrastDB / 20),
            sentences.count <= EdgeSentenceGuard.maxDrops,
            sentences.allSatisfy({ EdgeSentenceGuard.artifacts.contains(EdgeSentenceGuard.normalized($0)) }) {
             texts[index] = ""
