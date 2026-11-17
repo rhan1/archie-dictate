@@ -651,9 +651,21 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private func tailLocked() -> (Int, String)? {
         guard edgeGuard, !cancelled, !tailJudged, var index = windowsByIndex.keys.max() else { return nil }
         tailJudged = true
+        let ownChunk = !rejoined.contains(index)    // B3 F4: a rejoined pair is not a short residual tail
         while rejoined.contains(index) { index -= 1 }
         guard let text = texts[index], !text.isEmpty, let windows = windowsByIndex[index],
               !(index == openingIndex && !openingDrops.isEmpty) else { return nil }
+        // 62.7.1 B3 F4 (trace c2e38997): a short residual final tail that is only Whisper's silence phrases
+        // ("Thank you.") goes whatever its level. A loud Mac-mic dictation's room tail clears the speech floor,
+        // and a tail under 1.5 s can never hold the 1 s of quiet the audio rule below needs.
+        let sentences = EdgeSentenceGuard.sentences(in: text)
+        if ownChunk, index > 0, Double(windows.count * CaptureEvidence.windowFrames) / CaptureEvidence.rate < Self.shortFinalSeconds,
+           sentences.count <= EdgeSentenceGuard.maxDrops,
+           sentences.allSatisfy({ EdgeSentenceGuard.artifacts.contains(EdgeSentenceGuard.normalized($0)) }) {
+            texts[index] = ""
+            tailDrops = sentences.map { _ in .artifact }
+            return (index, "")
+        }
         let result = EdgeSentenceGuard.filter(text, edge: .tail, windows: windows, reference: referenceWindowsLocked)
         guard !result.drops.isEmpty else { return nil }
         texts[index] = result.text

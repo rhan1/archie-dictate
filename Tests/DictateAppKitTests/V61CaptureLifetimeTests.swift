@@ -527,12 +527,14 @@ struct V61CaptureLifetimeTests {
         print("G10 GREEN seconds=1800 archive_frames=\(recorder.retainedFrameCount) preroll_max_frames=7200 pending_max_frames=\(AudioRecorder.maximumPendingFrames) wrong_turn_frames=0")
     }
 
-    @Test func g10ControlOverflowTerminalCaptureOverrunSilentDropsZero() async throws {
+    /// 62.7.1 B3 F2 (replaces the G10 control "overflow terminal=capture_overrun"): a backlog larger than the
+    /// queue (a stalled consumer, or the 05:1x bridge replay) drops the OLDEST audio and capture continues; the
+    /// next turn's audio is delivered. Both default inputs: the Mac mic and a Bluetooth headset (XM6).
+    @Test(arguments: [CaptureBridge.DefaultInput.builtin, .bluetooth])
+    func b3OverrunDropsOldestAndCaptureContinues(_ input: CaptureBridge.DefaultInput) async throws {
         let log = Log()
-        let (recorder, _, _, _) = Self.makeRecorder(name: "g10-overflow", log: log)
+        let (recorder, _, _, _) = Self.makeRecorder(name: "b3-overrun-\(input)", log: log, input: input)
         recorder.retainsCapturedSamples = false
-        // No pcmCallback installed: consumer stalled
-
         final class FailureTracker: @unchecked Sendable {
             let lock = NSLock()
             var failure: CaptureFailure?
@@ -541,32 +543,26 @@ struct V61CaptureLifetimeTests {
         }
         let tracker = FailureTracker()
         recorder.onCaptureFailure = { tracker.record($0) }
-
         try recorder.offlineStartInput(at: 0.0) { _ in CaptureInputUnit(start: {}, dispose: {}) }
-
+        // No pcmCallback: the consumer is stalled. 1.5 s of audio against a 0.9 s queue.
         let chunk = [Float](repeating: 0.02, count: 2_400)
-        // Feed up to maximumPendingFrames (21,600 = 9 chunks of 2,400)
-        for i in 1...9 {
-            _ = recorder.offlineInputFrames(chunk, at: Double(i) * 0.1)
-        }
-        #expect(recorder.pendingFrameCount == 21_600)
-        #expect(tracker.get == nil)
-
-        // 10th chunk overflows maximumPendingFrames (21,600 + 2,400 = 24,000 > 21,600)
-        _ = recorder.offlineInputFrames(chunk, at: 1.0)
-
-        // Bounded wait for asynchronous health queue failure report
-        let deadline = ProcessInfo.processInfo.systemUptime + 2.0
-        while tracker.get == nil && ProcessInfo.processInfo.systemUptime < deadline {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
-
-        let failure = try #require(tracker.get)
-        #expect(failure.reason == .engine)
-        #expect(failure.sources == "capture_overrun")
-
+        for i in 1...15 { _ = recorder.offlineInputFrames(chunk, at: Double(i) * 0.1) }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.5
+        while tracker.get == nil && ProcessInfo.processInfo.systemUptime < deadline { try? await Task.sleep(nanoseconds: 20_000_000) }
+        let ended = tracker.get != nil
+        // The next turn: a consumer attaches and fresh audio arrives.
+        final class Got: @unchecked Sendable { let lock = NSLock(); var frames = 0; func add(_ n: Int) { lock.withLock { frames += n } } }
+        let got = Got()
+        recorder.onPCMChunk = { got.add($0.count) }
+        _ = recorder.offlineInputFrames(chunk, at: 1.6)
+        recorder.offlineDrainPCM()
+        let next = got.frames > 0
+        print("B3 \(ended ? "RED" : "GREEN") overrun_ends_conversation=\(ended ? 1 : 0) input=\(input) failure=\(tracker.get?.sources ?? "none") dropped_ms=\(recorder.overrunDroppedFrames / 24) pending_frames=\(recorder.pendingFrameCount) next_turn_frames=\(got.frames)")
+        #expect(!ended)
+        // 15 chunks into a 9-chunk queue: 6 oldest dropped; the next turn's chunk lands on the full queue: one more.
+        #expect(recorder.overrunDroppedFrames == 7 * 2_400)
+        #expect(next)
         _ = recorder.stop()
-        print("G10 CONTROL overflow terminal=capture_overrun silent_drops=0")
     }
 
     @Test func g10ControlDictationArchiveFullAudioAndPositiveRejection() throws {

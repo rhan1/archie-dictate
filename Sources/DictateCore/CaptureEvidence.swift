@@ -237,5 +237,9 @@ public final class OrderedDelivery<Item>: @unchecked Sendable {
 
     /// Drops everything not yet delivered (a cancelled dictation).
     public func discardPending() { queueLock.withLock { queue.removeAll() } }
+    /// 62.7.1 B3 F2: drops up to `count` of the OLDEST undelivered items (a capture overflow); returns how many.
+    public func dropOldest(upTo count: Int) -> Int {
+        queueLock.withLock { let n = min(max(0, count), queue.count); queue.removeFirst(n); return n }
+    }
     public var pendingCount: Int { queueLock.withLock { queue.count } }
 }
