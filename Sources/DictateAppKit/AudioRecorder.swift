@@ -63,10 +63,12 @@ public final class AudioRecorder: CaptureEngine {
     /// 1.29 test seam: nil in production (this recorder's AVAudioEngine).
     var offlineConversationEngine: OfflineConversationEngine?
     private var failureReported = false
-    private var streamOverrun = false
     private var keptFrameCount = 0
-    /// Eight queued 100 ms callbacks plus one partial batch; overflow is terminal.
+    /// Eight queued 100 ms callbacks plus one partial batch. 62.7.1 B3 F2: an overflow drops the OLDEST
+    /// queued audio and capture continues; it is never a capture failure (was terminal `capture_overrun`).
     static let maximumPendingFrames = 21_600
+    private var overrunDropped = 0
+    var overrunDroppedFrames: Int { lock.withLock { overrunDropped } }
     var retainedFrameCount: Int { lock.withLock { samples.count } }
     var pendingFrameCount: Int { lock.withLock { pendingPCM.count + delivery.pendingCount * Self.chunkSamples } }
 
@@ -951,7 +953,6 @@ public final class AudioRecorder: CaptureEngine {
             retapNotes.removeAll(); retapErrors.removeAll()   // T5-i: diagnostics are per capture
             keptFrameCount = 0
             failureReported = false
-            streamOverrun = false
             routeGeneration = 0
             appliedRouteGeneration = 0
             routeApplying = false
@@ -2090,7 +2091,6 @@ public final class AudioRecorder: CaptureEngine {
             if retainsCapturedSamples { samples.append(contentsOf: preRoll) }
             keptFrameCount = preRoll.count
             failureReported = false
-            streamOverrun = false
             stats.builtinFramesAfterFallback = stats.voiceProcessing == "fallback" ? preRoll.count : 0
             pendingPCM = WAVEncoder.pcm16(from: preRoll)
             levelTimer?.cancel()
@@ -2289,7 +2289,6 @@ public final class AudioRecorder: CaptureEngine {
             retapNotes.removeAll(); retapErrors.removeAll()   // T5-i: diagnostics are per capture
             keptFrameCount = 0
             failureReported = false
-            streamOverrun = false
             routeGeneration = 0
             appliedRouteGeneration = 0
             routeApplying = false
@@ -2419,7 +2418,7 @@ public final class AudioRecorder: CaptureEngine {
         observedRoute = nil
         routeGeneration = 0; appliedRouteGeneration = 0; routeApplying = false
         boundInput = nil; inPlaceApplies = 0
-        failureReported = false; streamOverrun = false; keptFrameCount = 0
+        failureReported = false; overrunDropped = 0; keptFrameCount = 0
         defaultInputWatch = nil
         inputMoved = false
         feed.cancel() // a lone tap's ring is discarded here
@@ -2674,15 +2673,19 @@ public final class AudioRecorder: CaptureEngine {
 
     /// Accumulation, ordered PCM enqueue and meter updates for frames the feed kept. Caller holds `lock`.
     private func deliverLocked(_ chunk: [Float]) {
-        guard !streamOverrun else { return }
-        if !retainsCapturedSamples,
-           pendingPCM.count + delivery.pendingCount * Self.chunkSamples + chunk.count > Self.maximumPendingFrames {
-            streamOverrun = true
-            let epoch = engineEpoch
-            let failure = CaptureFailure(reason: .engine, framesKept: keptFrameCount, sources: "capture_overrun")
-            // The caller owns lock. Report only after leaving it, never from real-time IO.
-            healthQueue.async { [weak self] in self?.reportFailureOnce(failure, epoch: epoch) }
-            return
+        var chunk = chunk
+        let excess = pendingPCM.count + delivery.pendingCount * Self.chunkSamples + chunk.count - Self.maximumPendingFrames
+        if !retainsCapturedSamples, excess > 0 {
+            // A slow consumer or a bridge replay (11-17 05:1x: `bridge_replay_truncated_ms=537` → `capture_overrun`
+            // → `mic_dead` teardown): drop the oldest undelivered chunks, then the oldest unbatched PCM, then this one's head.
+            var dropped = delivery.dropOldest(upTo: (excess + Self.chunkSamples - 1) / Self.chunkSamples) * Self.chunkSamples
+            let fromPending = min(max(0, excess - dropped), pendingPCM.count)
+            pendingPCM.removeFirst(fromPending); dropped += fromPending
+            let fromChunk = min(max(0, excess - dropped), chunk.count)
+            chunk.removeFirst(fromChunk); dropped += fromChunk
+            overrunDropped += dropped
+            let ms = Int(Double(dropped) * 1000 / Self.sampleRate)
+            healthQueue.async { AppController.note("capture_overrun_dropped_ms=\(ms)") }   // never from real-time IO
         }
         keptFrameCount += chunk.count
         if retainsCapturedSamples { samples.append(contentsOf: chunk) }
@@ -2700,7 +2703,7 @@ public final class AudioRecorder: CaptureEngine {
                 }
                 let epoch = engineEpoch
                 delivery.enqueue(pcm) { [weak self] frames in
-                    guard let self, self.lock.withLock({ self.engineEpoch === epoch && !self.streamOverrun }) else { return }
+                    guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
                     callback(frames)
                 }
             }
@@ -2800,7 +2803,6 @@ public final class AudioRecorder: CaptureEngine {
             stats.voiceProcessing = "off"
             keptFrameCount = 0
             failureReported = false
-            streamOverrun = false
             routeGeneration = 0; appliedRouteGeneration = 0
             routeApplying = false
             boundInput = nil; inPlaceApplies = 0
@@ -3236,7 +3238,7 @@ public final class AudioRecorder: CaptureEngine {
         let epoch = engineEpoch, token = tapEpoch
         delivery.enqueue(pcm) { [weak self] frames in
             guard let self, self.lock.withLock({ self.engineEpoch === epoch && self.tapEpoch === token &&
-                self.builtinBindVerified && !self.failureReported && !self.streamOverrun }) else { return }
+                self.builtinBindVerified && !self.failureReported }) else { return }
             callback(frames)
         }
     }
