@@ -13,6 +13,7 @@ import Testing
             return Int16(clamping: Int(9_000 * sin(2 * .pi * 180 * t) * (0.6 + 0.4 * sin(2 * .pi * 3 * t)) + 300 * noise()))
         }
         return [("one", [7]), ("four", [1, -1, 2, -2]), ("five", [0, 100, -100, 32767, -32768]),
+                ("loud-tail", [Int16](repeating: 0, count: 4_096) + [32767, -32768, 32767, -32768, -32768]),  // Fable read 3: 5-sample last block
                 ("block-1", Array(voice.prefix(4_095))), ("block", Array(voice.prefix(4_096))),
                 ("block+1", Array(voice.prefix(4_097))), ("voice-3s", voice),
                 ("silence", [Int16](repeating: 0, count: 9_000)),

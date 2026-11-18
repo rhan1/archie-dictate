@@ -61,7 +61,7 @@ public enum FLACEncoder {
         // Rice parameter near log2(mean), the cheapest of three.
         let mean = folded.reduce(0, +) / max(1, folded.count)
         let guess = mean > 0 ? Int.bitWidth - mean.leadingZeroBitCount - 1 : 0
-        let (k, bits) = (max(0, guess - 1)...min(14, guess + 1)).map { k in
+        let (k, bits) = (min(14, max(0, guess - 1))...min(14, guess + 1)).map { k in
             (k, folded.reduce(folded.count * (k + 1)) { $0 + ($1 >> k) })
         }.min { $0.1 < $1.1 }!
         // A frame never grows past raw PCM (Apple's decoder rejects one that does): VERBATIM.
