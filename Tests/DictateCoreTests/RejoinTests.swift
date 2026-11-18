@@ -14,7 +14,7 @@ private actor ScriptedSTT: HTTPTransport {
     }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody!
+        let body = UploadBody.asWAV(request.httpBody!)
         let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
         let tag = Int(Int16(bitPattern: UInt16(body[riff + 44]) | UInt16(body[riff + 45]) << 8))
         let bytes = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }

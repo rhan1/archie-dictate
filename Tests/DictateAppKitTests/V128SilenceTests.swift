@@ -51,8 +51,8 @@ private actor FR2HTTP: HTTPTransport {
         let url = request.url!
         let payload: [String: Any]
         if url.path.contains("transcriptions") {
-            if let verbose { payload = verbose(sttRequests, Self.samples(request.httpBody ?? Data())) }
-            else { payload = ["text": stt(sttRequests, request.httpBody?.count ?? 0)] }
+            if let verbose { payload = verbose(sttRequests, Self.samples(UploadBody.asWAV(request.httpBody ?? Data()))) }
+            else { payload = ["text": stt(sttRequests, UploadBody.asWAV(request.httpBody ?? Data()).count)] }
             sttRequests += 1
         } else if url.path.hasSuffix("/models") {
             payload = ["data": []]

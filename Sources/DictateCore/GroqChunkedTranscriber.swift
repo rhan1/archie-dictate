@@ -1,7 +1,7 @@
 import Foundation
 
 /// Thread-safe streaming capture; each cut starts an independent upload.
-/// WAV is encoded in memory using the existing Core encoder. No file APIs.
+/// Uploads are encoded in memory (16 kHz FLAC, WAV fallback). No file APIs.
 public final class GroqChunkedTranscriber: @unchecked Sendable {
     public static let fillerLeadIn = "Um, so, uh, like, Tuesday, no, Wednesday."
     /// v1.27 (B2): a final chunk shorter than this is transcribed with an EMPTY prompt (no lead-in, no
@@ -452,7 +452,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     }
 
     private func upload(_ chunk: PauseChunker.Chunk, model: String, isFinal: Bool, emptyPrompt: Bool = false) async {
-        let wav = WAVEncoder.encode(samples: Self.resampleTo16k(chunk.samples), sampleRate: 16_000)
+        let wav = FLACEncoder.upload16k(Self.resampleTo16k(chunk.samples))
         for attempt in 1...2 {
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
             let start = DispatchTime.now().uptimeNanoseconds
@@ -755,7 +755,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             do {
                 let key = try client.apiKey().trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !key.isEmpty else { throw TranscriptionError.missingKey }
-                let wav = WAVEncoder.encode(samples: Self.resampleTo16k(previous.samples + current.samples), sampleRate: 16_000)
+                let wav = FLACEncoder.upload16k(Self.resampleTo16k(previous.samples + current.samples))
                 let tail = snapshot.1[index - 2].map { String($0.suffix(200)) } ?? ""
                 let prompt = (leadIn.isEmpty ? "" : leadIn + " ") + vocabulary + (tail.isEmpty ? "" : " " + tail)
                 let request = client.makeRequest(wav: wav, prompt: prompt, apiKey: key,

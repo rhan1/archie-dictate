@@ -15,7 +15,7 @@ actor WhisperPromptEchoStub: HTTPTransport {
     private(set) var sent: [Sent] = []
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody ?? Data()
+        let body = UploadBody.asWAV(request.httpBody ?? Data())
         let prompt = Self.field("prompt", in: body)
         let samples = Self.pcm(in: body)
         let seconds = Double(samples.count) / 16_000

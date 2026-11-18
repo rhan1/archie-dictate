@@ -76,7 +76,7 @@ private actor ScribeFakeTransport: HTTPTransport {
     }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let extracted = Self.extractWAV(from: request.httpBody)
+        let extracted = Self.extractWAV(from: request.httpBody.map(UploadBody.asWAV))
         let tag = extracted?.tag
         let isScribe = request.url == ScribeClient.endpoint
         nextOrder += 1
@@ -235,7 +235,7 @@ struct ScribeChunkedTests {
         let scribeBody = try #require(scribeReq.httpBody)
         let scribeText = String(decoding: scribeBody, as: UTF8.self)
         #expect(scribeText.contains("name=\"model_id\"\r\n\r\nscribe_v1\r\n"))
-        #expect(scribeText.contains("name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n"))
+        #expect(scribeText.contains("name=\"file\"; filename=\"audio.flac\"\r\nContent-Type: audio/flac\r\n\r\n"))
         #expect(!scribeText.contains("name=\"prompt\""))
         #expect(!scribeText.contains("name=\"response_format\""))
         #expect(!scribeText.contains("name=\"model\""))

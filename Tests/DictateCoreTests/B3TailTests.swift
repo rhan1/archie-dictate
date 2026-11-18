@@ -9,7 +9,7 @@ private actor B3TailTransport: HTTPTransport {
     init(_ replies: [Int: Reply]) { self.replies = replies }
     static func key(_ samples: [Int16]) -> Int { (samples.count * 2 / 3) * 2 }
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody!
+        let body = UploadBody.asWAV(request.httpBody!)
         let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
         let size = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }
         guard let reply = replies[size] else {

@@ -24,7 +24,7 @@ private actor ScriptedTransport: HTTPTransport {
     static func key(_ samples: [Int16]) -> Int { (samples.count * 2 / 3) * 2 }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody!
+        let body = UploadBody.asWAV(request.httpBody!)
         let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
         let size = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }
         let reply = replies[size] ?? Reply(text: "", status: 500)
@@ -49,7 +49,7 @@ private actor ScriptedTransport: HTTPTransport {
 private actor FormatTransport: HTTPTransport {
     private(set) var formats: [Int: String] = [:]
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody!
+        let body = UploadBody.asWAV(request.httpBody!)
         let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
         let size = (0..<4).reduce(0) { $0 | Int(body[riff + 40 + $1]) << (8 * $1) }
         let text = String(decoding: body[..<riff], as: UTF8.self)
