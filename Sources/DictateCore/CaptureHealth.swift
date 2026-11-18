@@ -91,6 +91,9 @@ public struct CaptureHealth: Sendable {
     private var firstStart = FirstStart.none
     /// 1.29.4 (H): any source delivered a buffer (exact zeros included): the startup grace is over for good.
     private var delivered = false
+    /// 62.7.7 Fix 5 (1.29.4 review MINOR 1): the startup grace's floor, counted from the FIRST buffer of a slow start, so
+    /// zeros right after a slow Mac-mic start get their 1 s instead of failing on the next tick (prompt starts: 2.0 s).
+    private var graceFloor: TimeInterval?
 
     public init(startupPolicy: StartupPolicy = .standard) { self.startupPolicy = startupPolicy }
 
@@ -125,7 +128,7 @@ public struct CaptureHealth: Sendable {
             guard let boundary, headsetInFlight || nothingDelivered else { return base }
             return max(base, boundary + Self.bluetoothNoInputCap)
         }
-        guard let grace = startupGraceDeadline else { return base }
+        guard let grace = startupGraceDeadline ?? graceFloor else { return base }
         return max(base, grace)
     }
 
@@ -179,6 +182,9 @@ public struct CaptureHealth: Sendable {
     @discardableResult
     public mutating func buffer(_ source: Source, at time: TimeInterval, frames: Int, peak: Float) -> Bool {
         guard frames > 0 else { return false }
+        if startupGraceDeadline != nil, let origin = graceBoundary {
+            graceFloor = min(origin + Self.bluetoothNoInputCap, max(origin + Self.failAfter, time + Self.builtinGrace))
+        }
         delivered = true
         var started = false
         update(source) { s in

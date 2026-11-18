@@ -141,12 +141,12 @@ struct V1294StartupGraceTests {
 
     @Test func zerosOnlyStillFailAt2s() {
         let r = Self.run(Scenario(startReturned: 0.08, firstBuffer: 0.1, frames: .zeros))
-        // Exact zeros after a slow start end the grace for good: v1.8's deadline (the boundary + 2.0) applies.
+        // Exact zeros after a slow start end the grace; 62.7.7 Fix 5: they still get 1.0 s counted from that first buffer.
         let slow = Self.run(Scenario(startReturned: 2.011, firstBuffer: 2.12, frames: .zeros))
         print("H CONTROL zeros_only failed_at=\(r.failedText) health=\(r.failure?.health?.rawValue ?? "-");"
               + " after_slow_start failed_at=\(slow.failedText)")
         #expect(r.failedAt == 2.0 && r.failures == 1)
-        #expect(slow.failedAt == 2.2 && slow.failures == 1)
+        #expect(slow.failedAt == 3.2 && slow.failures == 1)   // 1.29.9: 2.2 (one tick after the first buffer)
     }
 
     @Test func bluetoothKeepsTheV127Rule() {
