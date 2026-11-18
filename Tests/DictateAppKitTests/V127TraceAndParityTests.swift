@@ -22,7 +22,7 @@ private final class Apple: EngineAppleSession, @unchecked Sendable {
 /// sentence; short non-speech → "Dictate." when prompted, "" when not. Cleanup echoes its input.
 private actor EchoHTTP: HTTPTransport {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody ?? Data()
+        let body = UploadBody.asWAV(request.httpBody ?? Data())
         let payload: [String: Any]
         if request.url!.path.contains("transcriptions") {
             let text = String(decoding: body, as: UTF8.self)

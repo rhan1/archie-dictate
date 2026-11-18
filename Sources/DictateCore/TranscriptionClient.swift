@@ -109,7 +109,7 @@ public struct TranscriptionClient: Sendable {
         part("response_format", responseFormat)
         part("language", "en")
         if includeEmptyPrompt || !prompt.isEmpty { part("prompt", prompt) }
-        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n")
+        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(FLACEncoder.fileType(wav).name)\"\r\nContent-Type: \(FLACEncoder.fileType(wav).mime)\r\n\r\n")
         body.append(wav)
         append("\r\n--\(boundary)--\r\n")
         request.httpBody = body

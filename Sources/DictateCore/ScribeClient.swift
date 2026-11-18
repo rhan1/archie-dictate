@@ -27,7 +27,7 @@ public struct ScribeClient: Sendable {
             append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
         }
         part("model_id", modelID)
-        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n")
+        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(FLACEncoder.fileType(wav).name)\"\r\nContent-Type: \(FLACEncoder.fileType(wav).mime)\r\n\r\n")
         body.append(wav)
         append("\r\n--\(boundary)--\r\n")
         request.httpBody = body

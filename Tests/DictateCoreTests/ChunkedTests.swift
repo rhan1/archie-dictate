@@ -19,7 +19,7 @@ private actor ChunkTransport: HTTPTransport {
     private var waiters: [Waiter] = []
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let body = request.httpBody!
+        let body = UploadBody.asWAV(request.httpBody!)
         let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
         let offset = riff + 44
         let tag = Int(Int16(bitPattern: UInt16(body[offset]) | UInt16(body[offset + 1]) << 8))
@@ -627,11 +627,11 @@ struct GroqChunkedTests {
         engine.submit(chunk(0, tag: 1000))
         await transport.wait(tag: 1000)
         let request = await transport.request(tag: 1000)
-        let body = try #require(request.httpBody)
+        let body = UploadBody.asWAV(try #require(request.httpBody))
         let text = String(decoding: body, as: UTF8.self)
         for part in ["name=\"model\"\r\n\r\nwhisper-large-v3-turbo", "name=\"response_format\"\r\n\r\nverbose_json",   // v1.28 FR5-A (was json)
                      "name=\"language\"\r\n\r\nen", "name=\"prompt\"\r\n\r\nUm, so, uh, like, Tuesday, no, Wednesday. \r\n",
-                     "name=\"file\"; filename=\"audio.wav\"", "Content-Type: audio/wav"] {
+                     "name=\"file\"; filename=\"audio.flac\"", "Content-Type: audio/flac"] {
             #expect(text.contains(part))
         }
         let riff = try #require(body.range(of: Data("RIFF".utf8)))
@@ -695,7 +695,7 @@ struct GroqChunkedTests {
             engine.append([Int16](repeating: 1000, count: Int(minimum * 24_000) - 2_400))
             engine.append([Int16](repeating: 0, count: 3_600))
             await transport.wait(tag: 0) // The first sample is retained opening silence.
-            let body = await transport.request(tag: 0).httpBody!
+            let body = UploadBody.asWAV(await transport.request(tag: 0).httpBody!)
             let riff = try #require(body.range(of: Data("RIFF".utf8)))
             let bytes = Int(minimum * 16_000) * 2
             let wavHeader = Array(body[riff.lowerBound..<(riff.lowerBound + 44)])
@@ -861,7 +861,7 @@ struct F3ProbeTests {
         let finish = Task { await engine.finish() }
         if enabled {
             await transport.wait(tag: 1000, count: 2)
-            let body = await transport.request(tag: 1000, attempt: 1).httpBody!
+            let body = UploadBody.asWAV(await transport.request(tag: 1000, attempt: 1).httpBody!)
             let riff = try #require(body.range(of: Data("RIFF".utf8)))
             // 4800 samples at 24 kHz -> 3200 at 16 kHz, 44-byte WAV header.
             let lengthOffset = riff.lowerBound + 40
