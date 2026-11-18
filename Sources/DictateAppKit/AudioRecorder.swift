@@ -266,6 +266,8 @@ public final class AudioRecorder: CaptureEngine {
     private var verifying: Verification?
     /// A lifecycle retry the episode queued: `start()` begins it when the lifecycle runs it.
     private var lifecycleAttemptPending = false
+    /// 62.7.7 Fix 1: when this capture's Bluetooth headset IO last started (nil: none running of ours).
+    private var headsetIOStartedAt: TimeInterval?
 
     // v1.12 (L1): the session-scoped capture lease (state under `lock`).
     private let broker: CaptureLeaseBroker
@@ -997,6 +999,7 @@ public final class AudioRecorder: CaptureEngine {
                 try installTapAndStart()
             }
         }
+        if bluetooth, !unitArm, device == .default { lock.withLock { headsetIOStartedAt = ProcessInfo.processInfo.systemUptime } }
         // The MicStartChain built-in path still uses AVAudioEngine: read its device back once.
         if device == .builtIn { checkBuiltinPin() }
         stats.engineStartMs = elapsedMs()
@@ -1091,13 +1094,13 @@ public final class AudioRecorder: CaptureEngine {
                 guard lock.withLock({ engineEpoch === epoch }) else { throw CancellationError() }
                 try start(device: device)
                 guard lock.withLock({ engineEpoch === epoch }) else {
-                    settleDeadHeadsetStart(epoch)
+                    settleHeadsetIO()
                     teardownEngine()
                     throw CancellationError()
                 }
                 completion(.success(()))
             } catch {
-                settleDeadHeadsetStart(epoch)
+                settleHeadsetIO()
                 teardownEngine()
                 lock.withLock { if engineEpoch === epoch, episode.isRunning { settledLocked(.failed) } }
                 // v1.12 (L1): a start that failed for this session ends it — the built-in unit is
@@ -1113,15 +1116,18 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
-    /// 62.7.7 Fix 1 (1.29.2 D1's rule, now for the FIRST start too: ⌥⌥ warming, ⌥ prewarm, 1.29.8's retry): headset IO
-    /// that started for a session ended meanwhile (Esc) is stopped only once its call link had time to form, never
-    /// milliseconds after the start (11-06: that shape left the XM6 on HFP with A2DP gone). Mac mic: no wait.
-    private func settleDeadHeadsetStart(_ epoch: CaptureEpoch) {
-        guard lock.withLock({ engineEpoch !== epoch && engine != nil && selectedDevice == .default }),
-              engineNative.isRunning() == true, route.eligibility()?.0 == .bluetooth else { return }
-        let settle = BluetoothRecoveryEpisode.settleAfterStop
-        Thread.sleep(forTimeInterval: settle)
-        AppController.note("headset_start=1 cancelled=after_start settle_ms=\(Int((settle * 1000).rounded()))")
+    /// 62.7.7 Fix 1 (1.29.2 D1's rule for every stop, not only the restart's): Bluetooth headset IO is never stopped
+    /// within `settleAfterStop` of its start — an Esc while warming, in the ⌥ pre-start or in 1.29.8's retry waits out
+    /// the rest of the 0.3 s so the call link forms before it is released (11-06: a stop inside the link setup left the
+    /// XM6 on HFP with A2DP gone). Runs on the executor before a teardown; the Mac mic never sets the stamp.
+    private func settleHeadsetIO() {
+        let left: TimeInterval? = lock.withLock {
+            defer { headsetIOStartedAt = nil }
+            return headsetIOStartedAt.map { $0 + BluetoothRecoveryEpisode.settleAfterStop - ProcessInfo.processInfo.systemUptime }
+        }
+        guard let left, left > 0 else { return }
+        Thread.sleep(forTimeInterval: left)
+        AppController.note("headset_io_settle=1 waited_ms=\(Int((left * 1000).rounded()))")
     }
 
     public func rebuildAsync() async throws {
@@ -1610,6 +1616,7 @@ public final class AudioRecorder: CaptureEngine {
                     try self.rebuildEngineAndStart(beforeStart: {
                         guard live() else { cancelled = "before_start"; self.teardownEngine(); throw CancellationError() }
                     })
+                    self.lock.withLock { self.headsetIOStartedAt = ProcessInfo.processInfo.systemUptime }
                 }
             }
             let activated = self.lock.withLock {
@@ -1952,6 +1959,7 @@ public final class AudioRecorder: CaptureEngine {
             if engine != nil || headsetUnitActive, !counted { ioGuard.record(.stop) }
             captureRunning = false; converter = nil; tapEpoch = CaptureEpoch()
             boundInput = nil; inPlaceApplies = 0     // 1.29: a disposed engine is bound to nothing
+            headsetIOStartedAt = nil
             defer { headsetUnitActive = false }
             return headsetUnitActive ? headsetUnit : nil
         }
@@ -2503,6 +2511,7 @@ public final class AudioRecorder: CaptureEngine {
             }
         }
         onExecutor { [self] in
+            settleHeadsetIO()
             teardownEngine(counted: live)
             // v1.28 FR1-B: the HFP link starts collapsing now; visible before a waiting start resumes.
             if stampsBluetoothRelease, let serial = releasing?.serial {

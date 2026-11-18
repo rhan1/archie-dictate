@@ -115,6 +115,28 @@ struct V12910EscDuringStartTests {
         return TimingMeasurement(name: "warming", starts: starts, stopAfterStartMs: stopMs, release: release, ioLeft: ioLeft)
     }
 
+    /// Fable read 1: the Esc lands right AFTER the start returned (still warming, no first buffer): the host's
+    /// `lifecycle.end(.cancel)` → `stop()` → its executor teardown.
+    @MainActor
+    private static func runAfterStartReturnedEsc() async -> TimingMeasurement {
+        let rig = V129.Rig()
+        let (recorder, lifecycle, watches) = makeStartRecorder(rig: rig)
+        defer { withExtendedLifetime(watches) {} }
+        let firstEngine = rig.engine
+        recorder.resetCapture()
+        _ = await lifecycle.beginRecordingAsync(
+            at: ProcessInfo.processInfo.systemUptime,
+            start: { try await recorder.startAsync(device: $0) },
+            rebuild: { try await recorder.rebuildAsync() },
+            wait: { s in try? await Task.sleep(nanoseconds: UInt64(min(s, 8.0) * 1e9)) },
+            isCancelled: { false })
+        _ = lifecycle.end(.cancel)                           // Esc at once
+        let release = await recorder.awaitRelease()
+        let (starts, stopMs) = stopAfterStartMs(on: firstEngine)
+        let ioLeft = rig.engines.contains(where: Self.ioLeft) ? 1 : 0
+        return TimingMeasurement(name: "after_start_returned", starts: starts, stopAfterStartMs: stopMs, release: release, ioLeft: ioLeft)
+    }
+
     @MainActor
     private static func runRetryStartEsc() async -> TimingMeasurement {
         let rig = V129.Rig() // Bluetooth defaults: input = .bluetooth, device 77, 16 kHz hardware
@@ -216,6 +238,7 @@ struct V12910EscDuringStartTests {
     @Test @MainActor func esc_during_headset_start_and_restart() async throws {
         let measurements: [TimingMeasurement] = [
             await Self.runWarmingEsc(),
+            await Self.runAfterStartReturnedEsc(),
             await Self.runRetryStartEsc(),
             try await Self.runRestartIdlePollEsc(),
             try await Self.runRestartBeforeStartEsc(),
@@ -225,7 +248,7 @@ struct V12910EscDuringStartTests {
             print(m.line)
         }
         let fails = measurements.filter { !$0.passed }.count
-        print("P \(fails == 0 ? "GREEN" : "RED") esc_during_headset_restart_restores_a2dp fails=\(fails)/5")
+        print("P \(fails == 0 ? "GREEN" : "RED") esc_during_headset_restart_restores_a2dp fails=\(fails)/\(measurements.count)")
         #expect(fails == 0)
     }
 
