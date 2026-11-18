@@ -1319,6 +1319,7 @@ public final class AppController {
                 else if chunked.scribeChunks > 0 { fields.append("stt_lane=scribe chunks_scribe=\(chunked.scribeChunks)") }
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
+                           "scribe_hedge_wins=\(chunked.calls.filter { $0.winningRequest == 3 }.count)",
                            "stt_dropped_low_speech_sentence=\(chunked.droppedLowSpeechSentences + chunked.droppedOpeningSentences + chunked.droppedTailSentences)",
                            "stt_dropped_low_speech_pos=\(Self.droppedPosition(chunked))",
                            "stt_dropped_artifact=\(chunked.droppedArtifacts)",

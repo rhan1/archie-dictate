@@ -9,6 +9,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     /// words ("Dictate.", 2026-11-03 03:13). Longer final chunks keep the full prompt, and so does a dictation
     /// that is one short piece (chunk 0: FR1-D).
     public static let shortFinalSeconds = 1.5
+    /// 1.29.9 (archie-6276 Fix 2): a chunk Groq has not answered by now is also sent to Scribe (the
+    /// fallback Archie 62.7.1 added); the first good answer wins. A fast Groq never pays for Scribe.
+    public static let scribeHedgeAfterMs = 2_000
 
     /// A chunk that starts like this is probably the tail of a split "uh, the X".
     /// Keep this small list public so probe runs can tune it in one place.
@@ -77,7 +80,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public let milliseconds: Int
         public let status: Int?
         public let hedgeFired: Bool
-        /// 1 = primary, 2 = duplicate; nil when neither succeeded.
+        /// 1 = primary, 2 = duplicate, 3 = the Scribe hedge (1.29.9); nil when none succeeded.
         public let winningRequest: Int?
         /// v1.27 (B2): `full` (lead-in + vocabulary + previous text) or `none` (a short final chunk).
         public var prompt: String = "full"
@@ -316,6 +319,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private enum RequestEvent: Sendable {
         case response(Int, Response)
         case hedge
+        case scribeHedge
     }
     private struct AttemptResult {
         let text: String?
@@ -356,7 +360,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 
     /// Unstructured workers let the winner return even if a transport ignores
     /// cancellation. Only this consumer publishes responses; late losers are ignored.
-    private func requestAttempt(_ request: URLRequest, hedged: Bool) async -> AttemptResult {
+    private func requestAttempt(_ request: URLRequest, hedged: Bool, scribeWAV: Data? = nil) async -> AttemptResult {
         let (events, continuation) = AsyncStream<RequestEvent>.makeStream()
         let primary = Task.detached { [self] in
             continuation.yield(.response(1, await send(request)))
@@ -367,14 +371,24 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 if !Task.isCancelled { continuation.yield(.hedge) }
             } catch {}
         } : nil
+        let scribeTimer: Task<Void, Never>? = hedged && scribeClient != nil && scribeWAV != nil ? Task.detached { [clock] in
+            do {
+                try await clock.sleep(until: clock.now().advanced(by: .milliseconds(Self.scribeHedgeAfterMs)))
+                if !Task.isCancelled { continuation.yield(.scribeHedge) }
+            } catch {}
+        } : nil
         var duplicate: Task<Void, Never>?
+        var scribeDuplicate: Task<Void, Never>?
         defer {
             continuation.finish()
             primary.cancel()
             duplicate?.cancel()
+            scribeDuplicate?.cancel()
             timer?.cancel()
+            scribeTimer?.cancel()
         }
         var fired = false
+        var launched = 1
         var completed = 0
         var status: Int?
         for await event in events {
@@ -383,8 +397,18 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             case .hedge:
                 guard !fired else { continue }
                 fired = true
+                launched += 1
                 duplicate = Task.detached { [self] in
                     continuation.yield(.response(2, await send(request)))
+                }
+            case .scribeHedge:
+                guard let scribe = scribeClient, let wav = scribeWAV else { continue }
+                launched += 1
+                scribeDuplicate = Task.detached { [self] in
+                    let key = ((try? scribe.apiKey()) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let response = key.isEmpty ? Response(text: nil, http: nil)
+                        : await sendScribe(scribe.makeRequest(wav: wav, apiKey: key, boundary: "dictate-\(UUID().uuidString)"))
+                    continuation.yield(.response(3, response))
                 }
             case .response(let number, let response):
                 completed += 1
@@ -400,8 +424,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                                          segments: response.segments)
                 }
                 // Failure before the timer goes straight to today's attempt 2.
-                // After a hedge, wait for the other response to have a chance.
-                if !fired || completed == 2 {
+                // After a hedge, wait for the other responses to have a chance.
+                if completed == launched {
                     return AttemptResult(text: nil, status: status, hedgeFired: fired, winningRequest: nil)
                 }
             }
@@ -449,17 +473,20 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 let request = requestClient.makeRequest(wav: wav, prompt: prompt, apiKey: key,
                                                  boundary: "dictate-\(UUID().uuidString)", includeEmptyPrompt: true,
                                                  responseFormat: "verbose_json")
-                outcome = await requestAttempt(request, hedged: attempt == 1)
+                outcome = await requestAttempt(request, hedged: attempt == 1, scribeWAV: wav)
             } catch {
                 outcome = AttemptResult(text: nil, status: nil, hedgeFired: false, winningRequest: nil)
             }
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
+            let viaScribe = outcome.winningRequest == 3
             let accepted: (ok: Bool, segments: String) = lock.withLock {
                 guard !cancelled else { return (false, "") }
-                calls.append(Call(index: chunk.index, attempt: attempt, model: model, isFinal: isFinal, isRejoin: false, milliseconds: Self.ms(from: start),
-                                  status: outcome.status, hedgeFired: outcome.hedgeFired,
-                                  winningRequest: outcome.winningRequest, prompt: emptyPrompt ? "none" : "full"))
+                calls.append(Call(index: chunk.index, attempt: attempt, model: viaScribe ? scribeClient?.modelID ?? model : model, isFinal: isFinal,
+                                  isRejoin: false, milliseconds: Self.ms(from: start),
+                                  status: outcome.status, hedgeFired: outcome.hedgeFired || viaScribe,
+                                  winningRequest: outcome.winningRequest, prompt: emptyPrompt || viaScribe ? "none" : "full"))
                 guard let text = outcome.text else { return (false, "") }
+                if viaScribe { scribeChunks += 1 }
                 // v1.28 FR5-A: segments Whisper itself marks as no speech / a loop go before any other guard.
                 let windows = windowsByIndex[chunk.index] ?? []
                 let confident = SegmentConfidence.filter(text: text, segments: outcome.segments, windows: windows)
@@ -472,7 +499,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 return (true, onChunkSegments == nil ? "" : SegmentConfidence.describe(outcome.segments, windows: windows))
             }
             if accepted.ok, let text = outcome.text {
-                onChunkTrace?(chunk.index, isFinal, emptyPrompt ? "none" : "full", text)
+                onChunkTrace?(chunk.index, isFinal, emptyPrompt || viaScribe ? "none" : "full", text)
                 onChunkSegments?(chunk.index, accepted.segments)
                 emitChunk(chunk, fallbackText: text)
                 return
