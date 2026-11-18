@@ -371,7 +371,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 if !Task.isCancelled { continuation.yield(.hedge) }
             } catch {}
         } : nil
-        let scribeTimer: Task<Void, Never>? = hedged && scribeClient != nil && scribeWAV != nil ? Task.detached { [clock] in
+        // Both Groq attempts get the Scribe hedge (Fable read 2: a fast attempt-1 failure then a slow attempt 2).
+        let scribeTimer: Task<Void, Never>? = scribeClient != nil && scribeWAV != nil ? Task.detached { [clock] in
             do {
                 try await clock.sleep(until: clock.now().advanced(by: .milliseconds(Self.scribeHedgeAfterMs)))
                 if !Task.isCancelled { continuation.yield(.scribeHedge) }
