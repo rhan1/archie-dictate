@@ -1091,11 +1091,13 @@ public final class AudioRecorder: CaptureEngine {
                 guard lock.withLock({ engineEpoch === epoch }) else { throw CancellationError() }
                 try start(device: device)
                 guard lock.withLock({ engineEpoch === epoch }) else {
+                    settleDeadHeadsetStart(epoch)
                     teardownEngine()
                     throw CancellationError()
                 }
                 completion(.success(()))
             } catch {
+                settleDeadHeadsetStart(epoch)
                 teardownEngine()
                 lock.withLock { if engineEpoch === epoch, episode.isRunning { settledLocked(.failed) } }
                 // v1.12 (L1): a start that failed for this session ends it — the built-in unit is
@@ -1109,6 +1111,17 @@ public final class AudioRecorder: CaptureEngine {
                 completion(.failure(error))
             }
         }
+    }
+
+    /// 62.7.7 Fix 1 (1.29.2 D1's rule, now for the FIRST start too: ⌥⌥ warming, ⌥ prewarm, 1.29.8's retry): headset IO
+    /// that started for a session ended meanwhile (Esc) is stopped only once its call link had time to form, never
+    /// milliseconds after the start (11-06: that shape left the XM6 on HFP with A2DP gone). Mac mic: no wait.
+    private func settleDeadHeadsetStart(_ epoch: CaptureEpoch) {
+        guard lock.withLock({ engineEpoch !== epoch && engine != nil && selectedDevice == .default }),
+              engineNative.isRunning() == true, route.eligibility()?.0 == .bluetooth else { return }
+        let settle = BluetoothRecoveryEpisode.settleAfterStop
+        Thread.sleep(forTimeInterval: settle)
+        AppController.note("headset_start=1 cancelled=after_start settle_ms=\(Int((settle * 1000).rounded()))")
     }
 
     public func rebuildAsync() async throws {
