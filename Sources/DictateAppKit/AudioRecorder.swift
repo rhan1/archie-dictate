@@ -87,6 +87,15 @@ public final class AudioRecorder: CaptureEngine {
         set { lock.withLock { pcmCallback = newValue } }
     }
     private var pcmCallback: (([Int16]) -> Void)?
+    /// 1.29.12 (Archie 62.8.3): DISPLAY ONLY — the pcm16 frames each IO buffer kept (built-in unit 256 ≈ 10.7 ms,
+    /// an AVAudioEngine tap ≈ 100 ms), for a meter that need not wait for a 100 ms chunk. Never the transcribers'
+    /// audio: chunks, their size and order are unchanged. In order, on a private serial queue; nil = no copy made.
+    public var onDisplayPCM: (([Int16]) -> Void)? {
+        get { lock.withLock { displayCallback } }
+        set { lock.withLock { displayCallback = newValue } }
+    }
+    private var displayCallback: (([Int16]) -> Void)?
+    private let displayQueue = DispatchQueue(label: "dictate.display-pcm", qos: .userInteractive)
     private var pendingPCM: [Int16] = []
     private let delivery = OrderedDelivery<[Int16]>()
 
@@ -2721,7 +2730,15 @@ public final class AudioRecorder: CaptureEngine {
         if stats.voiceProcessing == "fallback" { stats.builtinFramesAfterFallback += chunk.count }
         // Accumulate even before the transcriber attaches; nothing after the
         // recording boundary is discarded during asynchronous hardware startup.
-        pendingPCM.append(contentsOf: WAVEncoder.pcm16(from: chunk))
+        let pcm16 = WAVEncoder.pcm16(from: chunk)
+        pendingPCM.append(contentsOf: pcm16)
+        if let display = displayCallback, !pcm16.isEmpty {
+            let epoch = engineEpoch
+            displayQueue.async { [weak self] in
+                guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
+                display(pcm16)
+            }
+        }
         if let callback = pcmCallback {
             while pendingPCM.count >= Self.chunkSamples {
                 let pcm = Array(pendingPCM.prefix(Self.chunkSamples))

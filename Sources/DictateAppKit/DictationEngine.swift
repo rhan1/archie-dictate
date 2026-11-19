@@ -45,6 +45,11 @@ public struct DictationTimeline: Sendable, Equatable {
     public var onPCMTap: (([Int16]) -> Void)? {
         didSet { controller.pcmTap.set(onPCMTap) }
     }
+    /// 1.29.12: DISPLAY ONLY — the 24 kHz pcm16 each IO buffer kept (built-in ≈ 10.7 ms, a tap ≈ 100 ms), ahead of
+    /// `onPCMTap`'s 100 ms chunks, for a host meter. The transcribers' chunks are unchanged. Nil by default.
+    public var onDisplayPCMTap: (([Int16]) -> Void)? {
+        didSet { controller.pcmTap.setDisplay(onDisplayPCMTap) }
+    }
     /// Every diagnostic line (timeline, keys, bridge, media; counts only, never text), on any
     /// thread. Standalone Dictate writes these to its stderr log; a host should tee them to its own.
     /// Process-wide: the most recently set engine's sink receives them.
