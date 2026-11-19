@@ -6,7 +6,7 @@ import DictateCore
 
 /// 1.29.12 (Archie 62.8.3): the display-only per-IO-buffer copy (`onDisplayPCM`) leaves the captured audio
 /// byte-identical — same 100 ms chunks, same order, same remainder — on both capture arms: the built-in
-/// conversation unit (256-frame slots, the measured live size) and the engine arm (AVAudioEngine tap, 2 400).
+/// conversation unit (256-frame slots, the measured live size; handed over 768 at a time) and the engine arm (AVAudioEngine tap, 2 400).
 /// Real speech when `D_DISPLAY_FIXTURES` names a dir of 24 kHz mono pcm16 WAVs (`D_DISPLAY_FIXTURE_NAMES`,
 /// default brn-05,raza-passage); otherwise a synthetic voiced signal. No device, engine or microphone.
 @Suite("V12912DisplayPCM", .serialized)
@@ -91,7 +91,7 @@ struct V12912DisplayPCMTests {
             #expect(base.display.isEmpty)
             #expect(check.identical && check.displayMatches)
             #expect(!control.identical)
-            #expect(after.display.allSatisfy { $0.count == 256 } || after.display.dropLast().allSatisfy { $0.count == 256 })
+            #expect(after.display.allSatisfy { $0.count == AudioRecorder.displayMinimumFrames })   // three 256-frame buffers each
             print("P RED control capture_samples_identical=\(control.identical ? 1 : 0) path=builtin fixture=\(f.name) (one sample flipped)")
             print("P GREEN capture_samples_identical=\(check.identical ? 1 : 0) path=builtin fixture=\(f.name) chunks=\(after.chunks.count) chunk_frames=\(after.chunks.map(\.count).max() ?? 0) display_buffers=\(after.display.count) display_frames=\(after.display.first?.count ?? 0) display_is_capture=\(check.displayMatches ? 1 : 0)")
         }

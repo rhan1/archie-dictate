@@ -87,8 +87,9 @@ public final class AudioRecorder: CaptureEngine {
         set { lock.withLock { pcmCallback = newValue } }
     }
     private var pcmCallback: (([Int16]) -> Void)?
-    /// 1.29.12 (Archie 62.8.3): DISPLAY ONLY — the pcm16 frames each IO buffer kept (built-in unit 256 ≈ 10.7 ms,
-    /// an AVAudioEngine tap ≈ 100 ms), for a meter that need not wait for a 100 ms chunk. Never the transcribers'
+    /// 1.29.12 (Archie 62.8.3): DISPLAY ONLY — the pcm16 frames the IO buffers kept, at least 32 ms at a time (the
+    /// built-in unit's 256-frame buffers three at a time; an AVAudioEngine tap's ≈ 100 ms one each), for a meter that
+    /// need not wait for a 100 ms chunk. Never the transcribers'
     /// audio: chunks, their size and order are unchanged. In order, on a private serial queue; nil = no copy made.
     public var onDisplayPCM: (([Int16]) -> Void)? {
         get { lock.withLock { displayCallback } }
@@ -96,6 +97,11 @@ public final class AudioRecorder: CaptureEngine {
     }
     private var displayCallback: (([Int16]) -> Void)?
     private let displayQueue = DispatchQueue(label: "dictate.display-pcm", qos: .userInteractive)
+    /// Shorter IO buffers (the built-in unit's 256) are handed over in ≥ 768-frame (32 ms) batches: one hop per
+    /// 10.7 ms buffer cost ×1.9 the meter's CPU (archie-6283 `logs/cpu4.log`); a 100 ms tap goes one per buffer.
+    static let displayMinimumFrames = 768
+    private var displayPending: [Int16] = []
+    private var displayPendingFence: (CaptureEpoch, CaptureEpoch)?
     private var pendingPCM: [Int16] = []
     private let delivery = OrderedDelivery<[Int16]>()
 
@@ -2468,6 +2474,7 @@ public final class AudioRecorder: CaptureEngine {
         let callback = pcmCallback
         samples.removeAll()
         pendingPCM.removeAll()
+        displayPending.removeAll()
         levelTimer?.cancel()
         levelTimer = nil
         healthTimer?.cancel()
@@ -2732,8 +2739,15 @@ public final class AudioRecorder: CaptureEngine {
         // recording boundary is discarded during asynchronous hardware startup.
         let pcm16 = WAVEncoder.pcm16(from: chunk)
         pendingPCM.append(contentsOf: pcm16)
-        if let display = displayCallback, !pcm16.isEmpty {
+        if displayCallback != nil, !pcm16.isEmpty {
             let epoch = engineEpoch, token = tapEpoch   // fix pass (Fable m3): the chunks' own fences, not just the epoch
+            if displayPendingFence.map({ $0.0 !== epoch || $0.1 !== token }) ?? true { displayPending.removeAll() }
+            displayPendingFence = (epoch, token)
+            displayPending += pcm16
+        }
+        if let display = displayCallback, displayPending.count >= Self.displayMinimumFrames {
+            let pcm16 = displayPending, epoch = engineEpoch, token = tapEpoch
+            displayPending.removeAll(keepingCapacity: true)
             displayQueue.async { [weak self] in
                 guard let self, self.lock.withLock({ self.engineEpoch === epoch && self.tapEpoch === token && !self.failureReported })
                 else { return }
