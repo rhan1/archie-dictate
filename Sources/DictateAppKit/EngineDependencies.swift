@@ -13,6 +13,11 @@ protocol EngineRecorder: CaptureEngine {
     func rebuildAsync() async throws
     func resetCapture()
     var bridgeHasAudio: Bool { get }
+    /// 1.29.12: display-only per-IO-buffer pcm16 (`AudioRecorder.onDisplayPCM`); fakes have none.
+    var onDisplayPCM: (([Int16]) -> Void)? { get set }
+}
+extension EngineRecorder {
+    var onDisplayPCM: (([Int16]) -> Void)? { get { nil } set {} }
 }
 extension AudioRecorder: EngineRecorder {}
 

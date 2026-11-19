@@ -293,6 +293,7 @@ public final class AppController {
             self.pill.push(level: level)
             if self.machine.state == .recording { self.engineOnState?(.recording(level: max(0, min(1, level)))) }
         }
+        recorder.onDisplayPCM = { [pcmTap] pcm in pcmTap.sendDisplay(pcm) }
     }
 
     func engineStart() {
@@ -1513,4 +1514,9 @@ final class PCMTapRelay: @unchecked Sendable {
 
     /// Tests: returns once every chunk sent so far has reached the handler.
     func drain() { queue.sync {} }
+
+    /// 1.29.12: the display-only per-IO-buffer copy (`DictationEngine.onDisplayPCMTap`), on the recorder's display queue.
+    private var displayHandler: (([Int16]) -> Void)?
+    func setDisplay(_ handler: (([Int16]) -> Void)?) { lock.withLock { displayHandler = handler } }
+    func sendDisplay(_ pcm: [Int16]) { lock.withLock { displayHandler }?(pcm) }
 }
