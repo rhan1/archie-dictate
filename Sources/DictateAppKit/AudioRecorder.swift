@@ -2733,9 +2733,10 @@ public final class AudioRecorder: CaptureEngine {
         let pcm16 = WAVEncoder.pcm16(from: chunk)
         pendingPCM.append(contentsOf: pcm16)
         if let display = displayCallback, !pcm16.isEmpty {
-            let epoch = engineEpoch
+            let epoch = engineEpoch, token = tapEpoch   // fix pass (Fable m3): the chunks' own fences, not just the epoch
             displayQueue.async { [weak self] in
-                guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
+                guard let self, self.lock.withLock({ self.engineEpoch === epoch && self.tapEpoch === token && !self.failureReported })
+                else { return }
                 display(pcm16)
             }
         }
