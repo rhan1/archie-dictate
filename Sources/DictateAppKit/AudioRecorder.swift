@@ -1723,6 +1723,13 @@ public final class AudioRecorder: CaptureEngine {
         }
     }
 
+    /// 1.29.14 (Archie 62.8.5 speaker talk-over): the running conversation engine while its voice processing
+    /// is ON, else nil. A host player attached to its main mixer renders through the SAME VPIO unit, so that
+    /// sound is the echo reference VPIO cancels from this capture; another engine's output never is.
+    public func voiceProcessedOutputEngine() -> AVAudioEngine? {
+        lock.withLock { stats.voiceProcessing == "on" ? engine : nil }.flatMap { $0.isRunning ? $0 : nil }
+    }
+
     private func requireEngine() throws -> AVAudioEngine {
         guard let engine else { throw RecorderError.noInput }
         return engine
@@ -1807,6 +1814,9 @@ public final class AudioRecorder: CaptureEngine {
                         guard input.isVoiceProcessingEnabled else {
                             throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
                         }
+                        // 1.29.14: wire VPIO's output (mixer → output) before start, so a host speech player
+                        // joins this unit's echo reference without re-wiring a running graph.
+                        _ = try self.requireEngine().mainMixerNode
                     }
                 } catch {
                     throw CaptureVoiceProcessing.Refusal(reason: "enable_refused")
