@@ -79,7 +79,7 @@ public final class AppController {
     private lazy var capture = CaptureLifecycle(engine: recorder, scheduler: captureScheduler)
     /// Media keeps playing, muted while recording. Pausing is the fallback
     /// for devices without a settable output mute flag.
-    private let muter: OutputMuter
+    let muter: OutputMuter
     private let media = MediaPauser(control: SystemMedia())
     private var muteWatchdog: DispatchWorkItem?
     private var signalSource: DispatchSourceSignal?
@@ -146,7 +146,8 @@ public final class AppController {
 
     init(keyStore: KeyStore, paths: AppPaths, surface: Surface, mode: DictationEngine.Mode,
          dependencies: EngineDependencies? = nil, quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil,
-         stt: DictationSTT? = nil, defaultSTT: DictationSTT = .default, keytermsURL: URL? = nil) {
+         stt: DictationSTT? = nil, defaultSTT: DictationSTT = .default, keytermsURL: URL? = nil,
+         outputMuter: OutputMuter? = nil) {
         self.dependencies = dependencies
         dictationSTT = stt ?? defaultSTT
         self.keytermsURL = keytermsURL ?? paths.keytermsURL
@@ -175,11 +176,16 @@ public final class AppController {
         self.paths = paths
         pill = EnginePanel(surface: surface, factory: dependencies?.panelFactory ?? { PillPanel() })
         engineMode = mode
-        let muter = OutputMuter(device: SystemOutputMute(), stateFile: paths.mutedStateURL)
+        // 1.29.13: a host that mutes the same output for its own captures passes ITS muter, so one owner holds
+        // the flag: two owners' 5 s settle checks each undid the other's fresh mute (Archie 62.8.3, 11-20 22:48:16).
+        // An injected muter keeps the host's own event/note logging.
+        let muter = outputMuter ?? OutputMuter(device: SystemOutputMute(), stateFile: paths.mutedStateURL)
         // Standalone and hosted alike (v1.9): settle events and re-mute notes reach the log.
         // Verified settle events can occur after the dictation timeline is emitted.
-        muter.onEvent = { event in AppController.note(event.rawValue) }
-        muter.onNote = { AppController.note($0) }
+        if outputMuter == nil {
+            muter.onEvent = { event in AppController.note(event.rawValue) }
+            muter.onNote = { AppController.note($0) }
+        }
         self.muter = muter
         let prompt = Vocabulary.buildPrompt(fileURL: paths.vocabularyURL)
         let keys = keyStore

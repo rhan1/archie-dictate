@@ -82,12 +82,15 @@ public struct DictationTimeline: Sendable, Equatable {
 
     public init(keyStore: KeyStore, paths: AppPaths, surface: Surface = .pill, mode: Mode = .dictate,
                 quotaFileURL: URL? = nil, injectedAudioURL: URL? = nil,
-                stt: DictationSTT? = nil, keytermsURL: URL? = nil) {
-        let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode, quotaFileURL: quotaFileURL, injectedAudioURL: injectedAudioURL, stt: stt, keytermsURL: keytermsURL)
+                stt: DictationSTT? = nil, keytermsURL: URL? = nil, outputMuter: OutputMuter? = nil) {
+        let controller = AppController(keyStore: keyStore, paths: paths, surface: surface, mode: mode, quotaFileURL: quotaFileURL, injectedAudioURL: injectedAudioURL, stt: stt, keytermsURL: keytermsURL, outputMuter: outputMuter)
         self.controller = controller
         ownedController = controller
         bind()
     }
+
+    /// 1.29.13: the output-mute owner this engine uses (the host's, when it passed one).
+    public var outputMuter: OutputMuter { controller.muter }
 
     init(controller: AppController) {
         self.controller = controller
