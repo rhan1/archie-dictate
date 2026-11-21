@@ -101,6 +101,8 @@ public final class AppController {
     private var recordingTarget: InsertionTarget?
     /// 1.29.17 M1: the focused window/document when this recording started (read off the main thread).
     private var recordingDestination: FocusDestination?
+    /// Fix pass (Codex M1): the start read has not landed yet (an unresolved start holds; a resolved nil never does).
+    private var recordingDestinationPending = false
     private var lastDictation: String?
     private var lastDictationTimer: Timer?
     private var generation = CaptureEpoch()
@@ -722,10 +724,17 @@ public final class AppController {
         generation = CaptureEpoch()
         let token = generation
         recordingDestination = nil
-        let readDestination = focusDestinationReader
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let destination = readDestination()
-            DispatchQueue.main.async { if let self, self.generation === token { self.recordingDestination = destination } }
+        recordingDestinationPending = dependencies == nil || dependencies?.focusDestination != nil
+        if recordingDestinationPending {
+            let readDestination = focusDestinationReader
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let destination = readDestination()
+                DispatchQueue.main.async {
+                    guard let self, self.generation === token else { return }
+                    self.recordingDestination = destination
+                    self.recordingDestinationPending = false
+                }
+            }
         }
         captureFailure = nil
         if let stale = openSession { noteSessionEnd(id: stale.id, stats: stale.stats ?? recorder.stats, outcome: "abandoned", entry: nil) }
@@ -1125,7 +1134,7 @@ public final class AppController {
                                                        pastedText: text))
                     }
                     let start = self.recordingTarget
-                    let startDestination = self.recordingDestination
+                    let startDestination = self.recordingDestination, startPending = self.recordingDestinationPending
                     let publicTimeline = DictationTimeline(latency_ms: latency, stt_ms: report.sttMs,
                         cleanup_ms: report.cleanupMs, chunks: report.chunks, path: report.path,
                         cleanup_mode: policy.usesCleanup ? report.cleanupMode : "none", fallback: policy.fallbackLabel)
@@ -1156,7 +1165,10 @@ public final class AppController {
                             let now = self.currentTarget()
                             pasteApp = now?.bundleID ?? ""
                             var decision = InsertionTarget.decide(start: start, now: now)
-                            if decision == .paste, startDestination != nil, self.focusDestinationReader()?.moved(from: startDestination) == true {
+                            if decision == .paste, startPending {
+                                decision = .hold
+                                AppController.note("insertion_hold=destination_unresolved")
+                            } else if decision == .paste, startDestination != nil, self.focusDestinationReader()?.moved(from: startDestination) == true {
                                 decision = .hold
                                 AppController.note("insertion_hold=destination_changed")
                             }
@@ -1393,11 +1405,11 @@ public final class AppController {
         generation = CaptureEpoch()
         statusItem?.setRecording(false)
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
+        dropTranscriber()   // fix pass (M8-b): closed before stop() flushes the queued chunks
         capture.end(.cancel) // discard: nothing is kept
         finishingWork?(); finishingWork = nil
         let mediaEvents = resumeMedia()
         if mediaEvents != "-" { AppController.note("cancel media=\(mediaEvents)") }
-        dropTranscriber()
         apple?.cancel()
         apple = nil
         pill.hide()
@@ -1412,8 +1424,8 @@ public final class AppController {
         generation = CaptureEpoch()
         micStarting = false
         machine = DictationStateMachine()
-        capture.end(.fail)
         dropTranscriber()
+        capture.end(.fail)
         apple?.cancel()
         apple = nil
         let mediaEvents = resumeMedia()

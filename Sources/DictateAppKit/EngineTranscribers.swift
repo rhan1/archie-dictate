@@ -62,6 +62,8 @@ extension EnginePolicy {
             return STTResult(result: .success(streamed.text), path: "deepgram-streaming", joined: nil,
                              appleFinal: appleFinal, streamed: streamed)
         }
+        // Fix pass (Fable M6-a): an Esc'd dictation (its task cancelled) starts no whole-recording fallback.
+        if Task.isCancelled { return STTResult(result: .failure(TranscriptionError.rejected("no_stt")), path: "apple", joined: nil, appleFinal: appleFinal, streamed: streamed) }
         if !streamed.complete {
             let reason = streamed.diagnostics.failureReason ?? "incomplete"
             onIncomplete(reason)

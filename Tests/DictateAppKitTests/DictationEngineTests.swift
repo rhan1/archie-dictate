@@ -795,4 +795,46 @@ extension DictationEngineTests {
         let green = verdicts.first?.contains("held=1 posted=0") == true && verdicts.last?.contains("held=0") == true
         print("DR3 M1 \(green ? "GREEN" : "RED") same_app_destination \(verdicts.joined(separator: " | "))")
     }
+
+    /// Fix pass (Codex M1): the start destination read has not landed when the text is ready → held, never pasted blind.
+    @Test func unresolvedStartDestinationHoldsTheText() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-dr3-m1p-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(home: root)
+        let keys = KeyStore(reader: { _ in "fixture" })
+        keys.prefetch(services: ["groq-api"])
+        try await waitFor { keys.key(for: "groq-api") != nil }
+        let pb = NSPasteboard(name: .init("dictate-dr3-m1p-\(UUID().uuidString)"))
+        defer { pb.releaseGlobally() }
+        let clock = V15PasteConfirmationTests.ManualMainScheduler()
+        let ax = V15PasteConfirmationTests.AXMockBox()
+        let words = "Please send the whole report on Tuesday."
+        let recorder = TestRecorder()
+        var posted = 0
+        let gate = DispatchSemaphore(value: 0), first = NSLock()
+        var reads = 0
+        let inserter = TextInserter(pasteboard: pb, postKeystroke: { posted += 1 },
+            schedule: clock.schedule, axReader: { ax.texts }, now: { clock.now })
+        var deps = EngineDependencies(recorder: recorder, makeApple: { TestApple(words) },
+            sttTransport: TestHTTP(words), groqCleanupTransport: TestHTTP(words), localCleanupTransport: TestHTTP(words),
+            inserter: inserter, panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+        deps.focusDestination = {
+            let n = first.withLock { reads += 1; return reads }
+            if n == 1 { _ = gate.wait(timeout: .now() + 10) }          // the start read hangs (a busy app)
+            return FocusDestination(pid: 1, window: AnyHashable("draft-A"), document: nil)
+        }
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate, dependencies: deps)
+        let engine = DictationEngine(controller: controller)
+        engine.start()
+        try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending }
+        engine.finish()
+        try await waitFor { posted > 0 || ((try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? "").contains("outcome=held") }
+        gate.signal()
+        let log = (try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? ""
+        let held = log.contains("outcome=held:focus_changed")
+        print("DR3 M1 \(held && posted == 0 ? "GREEN" : "RED") unresolved_start_destination held=\(held ? 1 : 0) posted=\(posted)")
+        #expect(held && posted == 0)
+        engine.cancel()
+    }
 }

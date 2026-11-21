@@ -79,7 +79,9 @@ struct FocusDestination: Equatable {
     func moved(from start: FocusDestination?) -> Bool {
         guard let start, start.pid == pid else { return false }
         if let a = start.window, let b = window, a != b { return true }
-        if let a = start.document, let b = document, a != b { return true }
+        // Fix pass (Fable M1-a): a document is compared only when a window is unknown (a browser window's
+        // AXDocument is its page URL, which changes in place).
+        if start.window == nil || window == nil, let a = start.document, let b = document, a != b { return true }
         return false
     }
 }
