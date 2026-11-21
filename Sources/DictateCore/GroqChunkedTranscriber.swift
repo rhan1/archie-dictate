@@ -447,20 +447,21 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
 
     /// 1.29.15: the on-device answer, or nil (error, empty, no answer within `localTimeoutMs`, cancelled) so the
     /// caller runs the cloud path exactly as without a local engine.
-    private func localText(_ local: any LocalChunkSTT, chunk: PauseChunker.Chunk, isFinal: Bool) async -> String? {
-        let pcm = Self.resampleTo16k(chunk.samples)
+    private func localText(_ local: any LocalChunkSTT, pcm16k pcm: [Int16], chunk: PauseChunker.Chunk, isFinal: Bool) async -> String? {
         let start = DispatchTime.now().uptimeNanoseconds
-        let answer: String? = await withTaskGroup(of: String?.self) { [clock] group in
-            group.addTask { try? await local.transcribe(pcm16k: pcm) }
+        let answer: String?? = await withTaskGroup(of: String??.self) { [clock] group in
+            group.addTask { .some(try? await local.transcribe(pcm16k: pcm)) }
             group.addTask {
                 try? await clock.sleep(until: clock.now().advanced(by: .milliseconds(Self.localTimeoutMs)))
-                return nil
+                return .none                                    // the deadline won
             }
             let first = await group.next() ?? nil
             group.cancelAll()
             return first
         }
-        let text = answer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if answer == nil, !Task.isCancelled { local.abandon() }     // a late helper is killed, never queued behind
+        let answerText = answer ?? nil
+        let text = answerText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return lock.withLock { () -> String? in
             guard !cancelled, !Task.isCancelled else { return nil }
             guard !text.isEmpty else { localFallbacks += 1; return nil }
@@ -494,11 +495,14 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     }
 
     private func upload(_ chunk: PauseChunker.Chunk, model: String, isFinal: Bool, emptyPrompt: Bool = false) async {
-        if let local, let text = await localText(local, chunk: chunk, isFinal: isFinal) {
+        let pcm16k = Self.resampleTo16k(chunk.samples)
+        if let local, let text = await localText(local, pcm16k: pcm16k, chunk: chunk, isFinal: isFinal) {
+            onChunkTrace?(chunk.index, isFinal, "none", text)
+            onChunkSegments?(chunk.index, "none")
             emitChunk(chunk, fallbackText: text)
             return
         }
-        let wav = FLACEncoder.upload16k(Self.resampleTo16k(chunk.samples))
+        let wav = FLACEncoder.upload16k(pcm16k)
         for attempt in 1...2 {
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
             let start = DispatchTime.now().uptimeNanoseconds
@@ -625,7 +629,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         // No candidate boundary -> no task and no extra await on the hot path.
         let guardTask: Task<Void, Never>? = lock.withLock {
             if let rejoinTask { return rejoinTask }
-            guard rejoinGuard, !cancelled else { return nil }
+            guard rejoinGuard, local == nil, !cancelled else { return nil }     // 1.29.15: no cloud re-upload of local chunks
             let plan = plannedRejoins()
             guard !plan.isEmpty else { originalChunks.removeAll(); return nil }
             let task = Task.detached { [self] in await rejoinBoundaries(plan) }
