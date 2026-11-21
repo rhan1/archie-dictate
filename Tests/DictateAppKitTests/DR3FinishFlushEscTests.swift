@@ -41,6 +41,25 @@ private actor DR3HTTP: HTTPTransport {
     }
 }
 
+/// Holds every request at the wire until `open()`; a request whose task is cancelled first is never sent.
+private actor DR3HeldHTTP: HTTPTransport {
+    private(set) var sent = 0, held = 0, withdrawn = 0
+    private var isOpen = false
+    func open() { isOpen = true }
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        held += 1
+        while !isOpen {
+            if Task.isCancelled { withdrawn += 1; throw CancellationError() }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        sent += 1
+        let payload: [String: Any] = request.url!.path.contains("chat") ? ["choices": [["finish_reason": "stop", "message": ["content": ""]]]]
+            : ["text": "please send the report"]
+        return (try JSONSerialization.data(withJSONObject: payload),
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [:])!)
+    }
+}
+
 @Suite("DR3FinishFlushEsc", .serialized) @MainActor
 struct DR3FinishFlushEscTests {
     /// Fix pass (Codex M8): every 100 ms chunk differs (rising amplitude), so a reordering cannot compare equal.
@@ -187,6 +206,55 @@ struct DR3FinishFlushEscTests {
         let verdict = (sameWindow.moved(from: start), noWindow.moved(from: FocusDestination(pid: 7, window: nil, document: "file:///a.txt")), otherApp.moved(from: start))
         print("DR3 M1 \(verdict == (false, true, false) ? "GREEN" : "RED") same_window_doc_change_holds=\(verdict.0 ? 1 : 0) windowless_doc_change_holds=\(verdict.1 ? 1 : 0) other_pid=\(verdict.2 ? 1 : 0)")
         #expect(verdict == (false, true, false))
+    }
+
+    /// M6 (architect condition): Esc BEFORE the finishing dictation's upload leaves the Mac → it is never sent, the
+    /// session closes exactly once (as cancel), nothing hangs (every wait bounded ≤ 10 s).
+    @Test func escBeforeTheUploadIsSentSendsNothing() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-dr3-pre-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("tone.wav")
+        let pcm = (0..<72_000).map { Int16(8_000 * sin(Double($0) * 2 * .pi * 220 / 24_000)) }
+        try WAVEncoder.encode(samples: pcm, sampleRate: 24_000, channels: 1).write(to: url)
+        let paths = AppPaths(home: dir.appendingPathComponent("home"))
+        let keys = KeyStore(reader: { _ in "fixture" })
+        keys.prefetch(services: ["groq-api"])
+        try await waitFor { keys.key(for: "groq-api") != nil }
+        let clipboard = NSPasteboard(name: .init("dictate-dr3-pre-\(UUID().uuidString)"))
+        defer { clipboard.releaseGlobally() }
+        let recorder = WAVInjectedRecorder(url: url, pace: 0.05)
+        recorder.manualPacing = true
+        recorder.note = { _ in }
+        let stt = DR3HeldHTTP()
+        let notes = NSMutableArray()
+        let dependencies = EngineDependencies(recorder: recorder, makeApple: { DR3Apple() },
+            sttTransport: stt, groqCleanupTransport: DR3HTTP(delayMs: 0), localCleanupTransport: DR3HTTP(delayMs: 0),
+            inserter: TextInserter(pasteboard: clipboard, postKeystroke: {}),
+            panelFactory: { DR3Panel() }, requestMicrophoneAccess: { $0(true) },
+            frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+        let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .captureOnly, dependencies: dependencies)
+        controller.onSessionNote = { line in DispatchQueue.main.async { notes.add(line) } }
+        let engine = DictationEngine(controller: controller)
+        var states: [DictateAppKit.DictationState] = []
+        engine.onState = { states.append($0) }
+        engine.start()
+        try await drive(recorder, ticks: 12)
+        engine.finish()
+        try await waitFor { states.contains(.transcribing) }
+        try await waitForAsync { await stt.held >= 1 }          // the upload is at the wire, not yet sent
+        engine.cancel()                                         // Esc
+        let bound = ContinuousClock.now + .seconds(2)
+        while await stt.withdrawn < 1, ContinuousClock.now < bound { try await Task.sleep(nanoseconds: 2_000_000) }
+        await stt.open()                                        // anything still held is sent now
+        try await Task.sleep(nanoseconds: 300_000_000); await MainActor.run {}
+        let sent = await stt.sent, withdrawn = await stt.withdrawn
+        let ends = notes.compactMap { $0 as? String }.filter { $0.contains("event=end") }
+        let log = (try? String(contentsOf: paths.logURL, encoding: .utf8))?.split(separator: "\n") ?? []
+        let once = ends.count == 1 && ends.first?.contains("outcome=cancel") == true && log.count == 1
+        print("DR3 M6 \(sent == 0 && once ? "GREEN" : "RED") esc_before_send requests_sent=\(sent) withdrawn=\(withdrawn) session_ends=\(ends.count) log_lines=\(log.count)")
+        #expect(sent == 0)
+        #expect(once)
     }
 
     private func waitFor(_ condition: () -> Bool) async throws {
