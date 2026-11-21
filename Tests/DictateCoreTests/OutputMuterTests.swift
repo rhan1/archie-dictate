@@ -389,7 +389,8 @@ struct OutputMuterTests {
         h.out.mute["speakers"] = nil         // gone before the end
         #expect(h.muter.restore() == .restoreFailed)
         #expect(h.out.mute["headset"] == false)
-        #expect(h.muter.mutedUIDs == ["speakers"])
+        // 1.29.16 (H6): a device that is gone is carried (record kept on disk), not held.
+        #expect(h.muter.mutedUIDs.isEmpty)
         #expect(h.exists)
     }
     @Test func hfpWithoutMuteIsNotedAndTheA2DPFlagKept() {

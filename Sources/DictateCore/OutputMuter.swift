@@ -127,9 +127,17 @@ public final class OutputMuter {
     }
 
     /// A transient profile's true flag during OUR window is not the user's prior.
+    /// 1.29.16 fix pass (Codex H6-1): a carried record (deadline nil: the device left while this app held its
+    /// mute, or a crash record for an absent device) is still ours when the device returns reading muted —
+    /// adopted with its recorded prior, never deleted as "the user's mute" — unless it was taken on another
+    /// profile (L6, as `recover()`).
     private func prior(_ old: State?, current: Bool) -> Bool {
         old.flatMap { state in
-            state.deadline.map { clock.now <= $0 ? state.prior : current }
+            guard let deadline = state.deadline else {
+                if let taken = state.profile, let now = device.outputProfile(uid: state.uid), now != taken { return nil }
+                return state.prior
+            }
+            return clock.now <= deadline ? state.prior : current
         } ?? current
     }
 
