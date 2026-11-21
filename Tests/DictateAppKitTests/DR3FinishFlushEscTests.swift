@@ -43,8 +43,39 @@ private actor DR3HTTP: HTTPTransport {
 
 @Suite("DR3FinishFlushEsc", .serialized) @MainActor
 struct DR3FinishFlushEscTests {
+    /// Fix pass (Codex M8): every 100 ms chunk differs (rising amplitude), so a reordering cannot compare equal.
     private static func tone(_ count: Int) -> [Float] {
-        (0..<count).map { Float(0.25 * sin(Double($0) * 2 * .pi * 220 / 24_000)) }
+        (0..<count).map { (i: Int) -> Float in
+            let amplitude: Double = 0.05 + 0.02 * Double(i / 2_400)
+            let phase: Double = Double(i) * 2 * Double.pi * 220 / 24_000
+            return Float(amplitude * sin(phase))
+        }
+    }
+
+    /// Fix pass (Fable M8-a, Codex M8): ⌘⌘ on the Mac mic (built-in conversation path). Two verified full chunks are
+    /// queued by one IO buffer; the first one's callback stops the recorder (the finish landing mid-drain) → the
+    /// second still reaches its session.
+    @Test func builtinConversationStopFlushesTheQueuedChunk() async throws {
+        let r = V1296BuiltinConversationTests.Rig()
+        try await r.start()
+        r.emit(at: 100.1); r.emit(at: 100.2)
+        _ = await V1296BuiltinConversationTests.eventually { r.chunks.value.count >= 2 }
+        let warm = r.chunks.value.count
+        let got = V1296BuiltinConversationTests.Box<[[Int16]]>([])
+        r.recorder.onPCMChunk = { frames in
+            got.update { $0.append(frames) }
+            if got.value.count == 1 { _ = r.recorder.stop() }
+        }
+        let two = (0..<4_800).map { Float($0 < 2_400 ? 0.1 : 0.2) }
+        r.clock.value = 100.4
+        r.units.value.last!.emit(two, at: r.clock.value)
+        _ = await V1296BuiltinConversationTests.eventually { got.value.count >= 2 }
+        let delivered = got.value.count
+        print("DR3 M8 \(delivered >= 2 ? "GREEN" : "RED") builtin_conversation_flush warm_chunks=\(warm) delivered_after_stop_tap=\(delivered)")
+        #expect(warm >= 2)
+        #expect(delivered >= 2)
+        if delivered >= 2 { #expect(got.value[0] != got.value[1]) }   // in order: the 0.1 chunk, then the 0.2 chunk
+        _ = await r.recorder.awaitRelease()
     }
 
     /// M8 (A2-A6): chunks admitted before stop() but not yet drained reach the old session, in order, once each.
@@ -144,6 +175,18 @@ struct DR3FinishFlushEscTests {
         let log = try String(contentsOf: paths.logURL, encoding: .utf8).split(separator: "\n")
         print("DR3 M6 CONTROL new_session_outcome=\(log.last.map { $0.contains("outcome=cancel") ? "cancel" : "finished" } ?? "none")")
         #expect(log.first?.contains("outcome=cancel") == true && log.last?.contains("outcome=cancel") == false)
+    }
+
+    /// Fix pass (Fable M1-a): one window whose AXDocument (a browser page URL) changes in place never holds;
+    /// a document change with an unknown window still does.
+    @Test func documentChangeInTheSameWindowDoesNotHold() {
+        let start = FocusDestination(pid: 7, window: AnyHashable("w"), document: "https://a")
+        let sameWindow = FocusDestination(pid: 7, window: AnyHashable("w"), document: "https://a/redirected")
+        let noWindow = FocusDestination(pid: 7, window: nil, document: "file:///b.txt")
+        let otherApp = FocusDestination(pid: 8, window: AnyHashable("x"), document: nil)
+        let verdict = (sameWindow.moved(from: start), noWindow.moved(from: FocusDestination(pid: 7, window: nil, document: "file:///a.txt")), otherApp.moved(from: start))
+        print("DR3 M1 \(verdict == (false, true, false) ? "GREEN" : "RED") same_window_doc_change_holds=\(verdict.0 ? 1 : 0) windowless_doc_change_holds=\(verdict.1 ? 1 : 0) other_pid=\(verdict.2 ? 1 : 0)")
+        #expect(verdict == (false, true, false))
     }
 
     private func waitFor(_ condition: () -> Bool) async throws {

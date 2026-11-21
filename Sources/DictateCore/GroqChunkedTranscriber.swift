@@ -659,11 +659,18 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
                           droppedSilentChunks: droppedSilent).withLoops(loopEvents).withScribe(chunks: scribeChunks, noKey: scribeNoKey)
                 .withSegmentConf(droppedSegmentConf).withLocal(chunks: localChunks, fallbacks: localFallbacks)
-                .withFailedVoiced(failures.filter { !EdgeSentenceGuard.isSilent(windowsByIndex[$0] ?? [], reference: referenceWindowsLocked) }.count)
+                .withFailedVoiced(failures.filter { !Self.verifiedSilent(windowsByIndex[$0] ?? [], reference: referenceWindowsLocked) }.count)
         }
     }
 
     private static func seconds(_ samples: Int) -> Double { Double(samples) / Double(PauseChunker.sampleRate) }
+
+    /// 1.29.17 H8 fix pass (Codex): a FAILED chunk is silent only by the dictation's rule AND below an absolute
+    /// −46 dBFS (soft speech in a quiet capture can sit under the relative floor; room tone stays below this).
+    static let failedSilenceCeiling: Float = 0.005
+    static func verifiedSilent(_ windows: [Float], reference: [Float]) -> Bool {
+        EdgeSentenceGuard.isSilent(windows, reference: reference) && (windows.max() ?? 1) < failedSilenceCeiling
+    }
 
     /// The first non-empty text after `index`, or nil while an index between them is still in flight.
     private func adjacentNextTextLocked(after index: Int) -> String? {
