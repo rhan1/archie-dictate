@@ -382,9 +382,15 @@ struct MicDeadTests {
         try await drive(recorder, ticks: 12)                                 // 1.2 s of media, then finish
         engine.finish()
         try await waitFor { states.contains(.transcribing) }
+        // 1.29.17 (M6): Esc now cancels the finishing dictation's uploads, so a request that has not started never
+        // starts; wait until it is in flight (the scenario: Esc while the slow STT is outstanding), bounded.
+        let sent = ContinuousClock.now + .seconds(10)
+        while await stt.requests < 1, ContinuousClock.now < sent { try await Task.sleep(nanoseconds: 2_000_000) }
         engine.cancel()                                                      // Escape while transcribing
         // The slow STT has returned (counted, not timed), then the main queue drained twice.
-        while await stt.completed < 1 { try await Task.sleep(nanoseconds: 2_000_000) }
+        let back = ContinuousClock.now + .seconds(10)
+        while await stt.completed < 1, ContinuousClock.now < back { try await Task.sleep(nanoseconds: 2_000_000) }
+        #expect(await stt.completed >= 1)
         await MainActor.run {}
         try await Task.sleep(nanoseconds: 50_000_000)
         await MainActor.run {}
