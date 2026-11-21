@@ -198,16 +198,25 @@ public final class OutputMuter {
         // Every device this dictation muted, in mute order; one that fails stays owned (retried
         // by the next restore, its crash record kept) exactly like a single device before v1.9.
         var failed: [State] = []
+        var absent = 0
         for state in active {
             if verifyRestore(state) {
                 active.removeAll { $0 === state }
                 beginSettling(state)
+            } else if !device.isPresent(uid: state.uid) {
+                // 1.29.16 (H6): the device left while muted (nothing to write or read back). Carried like
+                // recover()'s absent record (deadline nil, kept on disk, restored when it returns): it no
+                // longer counts as held by this session and does not block muting the current output.
+                state.cancel(); state.deadline = nil
+                settling[state.uid] = state
+                absent += 1
             } else {
                 failed.append(state)
             }
         }
         active = failed
-        return failed.isEmpty ? .restored : .restoreFailed
+        if absent > 0 { persistRemaining(); onNote?("mute_record_absent=\(absent)") }
+        return failed.isEmpty && absent == 0 ? .restored : .restoreFailed
     }
 
     @discardableResult
