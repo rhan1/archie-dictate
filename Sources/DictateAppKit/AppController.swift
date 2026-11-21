@@ -70,6 +70,8 @@ public final class AppController {
     private var transcriptTrace: TranscriptTrace?
     /// v1.27 (B3): a host's pass-through of the `DictateTranscriptTrace` preference (nil: the Dictate domain).
     var transcriptTraceDefaults: UserDefaults?
+    /// 1.29.15: the host's on-device engine, asked at each dictation start (nil or no provider = cloud only).
+    var localSTTProvider: (@Sendable () -> (any LocalChunkSTT)?)?
     /// v1.27 FR1-F: every open trace by session id; closed when that session's end line is written.
     private var transcriptTraces: [String: TranscriptTrace] = [:]
     /// Tests: traces still open (0 once every session has ended).
@@ -821,7 +823,7 @@ public final class AppController {
                        trace.chunk(index: index, final: final, prompt: prompt, raw: raw)
                    } },
                    onChunkSegments: trace.map { trace in { index, description in trace.segments(index: index, description) } },
-                   onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) })
+                   onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) }, local: localSTTProvider?())
                 chunked = streaming
                 recorder.onPCMChunk = { [pcmTap] pcm in
                     engine.append(pcm)
@@ -1324,6 +1326,9 @@ public final class AppController {
             if let chunked {
                 if chunked.scribeNoKey { fields.append("stt_lane=scribe:no_key") }
                 else if chunked.scribeChunks > 0 { fields.append("stt_lane=scribe chunks_scribe=\(chunked.scribeChunks)") }
+                if chunked.localChunks + chunked.localFallbacks > 0 {
+                    fields.append("stt_local=\(chunked.localChunks) stt_local_fallbacks=\(chunked.localFallbacks)")
+                }
                 fields += ["chunks=\(chunked.chunks)", "last_chunk_ms=\(chunked.lastChunkMs)",
                            "hedges=\(chunked.hedges)", "hedge_wins=\(chunked.hedgeWins)", "rejoins=\(chunked.rejoins)",
                            "scribe_hedge_wins=\(chunked.calls.filter { $0.winningRequest == 3 }.count)",

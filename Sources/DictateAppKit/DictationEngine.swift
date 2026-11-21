@@ -127,6 +127,9 @@ public struct DictationTimeline: Sendable, Equatable {
     /// Hosts pass the preference through here, as they pass their launch environment to `enableRig`; without
     /// this call the Dictate domain (`com.razakhan.dictate`) is read. Off unless that key is true.
     public func transcriptTrace(defaults: UserDefaults?) { controller.transcriptTraceDefaults = defaults }
+    /// 1.29.15 (Archie 62.8.8): an on-device engine tried first per chunk, asked at each dictation start; nil =
+    /// cloud only (the default). Its failures fall back to Groq → Scribe in the same dictation.
+    public func localSTT(_ provider: (@Sendable () -> (any LocalChunkSTT)?)?) { controller.localSTTProvider = provider }
     public func pasteHeld() { controller.enginePasteHeld() }
     public func copyHeld() { controller.engineCopyHeld() }
 
