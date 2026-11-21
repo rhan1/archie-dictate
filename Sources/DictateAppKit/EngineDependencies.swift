@@ -39,5 +39,7 @@ struct EngineDependencies {
     var onStreamingSegment: (@Sendable (Int, String) -> Void)? = nil
     /// v1.19 (ST2): the learner's focused-element reader and its delay scheduler (nil reader = no focus).
     var focusSnapshot: (() -> FocusSnapshot?)? = nil
+    /// 1.29.17 M1: the paste destination reader (nil reader = unknown destination, never holds).
+    var focusDestination: (() -> FocusDestination?)? = nil
     var learnerSchedule: ((TimeInterval, @escaping () -> Void) -> Void)? = nil
 }
