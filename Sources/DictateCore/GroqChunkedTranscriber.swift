@@ -113,6 +113,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public var droppedLoops: Int = 0
         public var scribeChunks: Int = 0
         public var scribeNoKey: Bool = false
+        /// 1.29.17 H8: failed chunks NOT verified silent by the dictation's floor (voiced, or no evidence).
+        /// A partial text may stand for the whole utterance only when this is 0.
+        public var failedVoicedCount: Int = 0
         /// 1.29.15: chunks the on-device engine answered / handed to the cloud (error, empty, timeout).
         public var localChunks: Int = 0
         public var localFallbacks: Int = 0
@@ -656,6 +659,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
                           droppedSilentChunks: droppedSilent).withLoops(loopEvents).withScribe(chunks: scribeChunks, noKey: scribeNoKey)
                 .withSegmentConf(droppedSegmentConf).withLocal(chunks: localChunks, fallbacks: localFallbacks)
+                .withFailedVoiced(failures.filter { !EdgeSentenceGuard.isSilent(windowsByIndex[$0] ?? [], reference: referenceWindowsLocked) }.count)
         }
     }
 
@@ -868,6 +872,7 @@ extension GroqChunkedTranscriber.Result {
     /// M2: the same result with the loop count set (keeps the long memberwise init unchanged).
     func withLoops(_ loops: Int) -> Self { var copy = self; copy.droppedLoops = loops; return copy }
     func withSegmentConf(_ dropped: Int) -> Self { var copy = self; copy.droppedSegmentConf = dropped; return copy }
+    func withFailedVoiced(_ count: Int) -> Self { var copy = self; copy.failedVoicedCount = count; return copy }
     func withLocal(chunks: Int, fallbacks: Int) -> Self {
         var copy = self
         copy.localChunks = chunks

@@ -87,6 +87,8 @@ public final class AudioRecorder: CaptureEngine {
         set { lock.withLock { pcmCallback = newValue } }
     }
     private var pcmCallback: (([Int16]) -> Void)?
+    /// 1.29.17 M8: the epoch `stop()` is flushing — chunks it admitted before the stop still reach their own session, in order.
+    private var flushEpoch: CaptureEpoch?
     /// 1.29.12 (Archie 62.8.3): DISPLAY ONLY — the pcm16 frames the IO buffers kept, at least 32 ms at a time (the
     /// built-in unit's 256-frame buffers three at a time; an AVAudioEngine tap's ≈ 100 ms one each), for a meter that
     /// need not wait for a 100 ms chunk. Never the transcribers'
@@ -2421,6 +2423,7 @@ public final class AudioRecorder: CaptureEngine {
         lock.lock()
         let now = ProcessInfo.processInfo.systemUptime
         let stoppedEpoch = engineEpoch
+        flushEpoch = stoppedEpoch
         engineEpoch = CaptureEpoch()
         voiceProcessingFallbackPending = false
         verifying = nil
@@ -2518,6 +2521,7 @@ public final class AudioRecorder: CaptureEngine {
         if let restartResult { AppController.note("headset_restart=1 result=\(restartResult)") }
         if !remainder.isEmpty, let callback { delivery.enqueue(remainder, to: callback) }
         delivery.drain()
+        lock.withLock { if flushEpoch === stoppedEpoch { flushEpoch = nil } }
         if let (unit, queue) = stopUnit, abandonedMs == nil { stopBuiltinUnit(unit, queue: queue, epoch: stoppedEpoch) }
         if let releasing {
             releasing.whenSettled { state in
@@ -2774,7 +2778,7 @@ public final class AudioRecorder: CaptureEngine {
                 }
                 let epoch = engineEpoch
                 delivery.enqueue(pcm) { [weak self] frames in
-                    guard let self, self.lock.withLock({ self.engineEpoch === epoch }) else { return }
+                    guard let self, self.lock.withLock({ self.engineEpoch === epoch || self.flushEpoch === epoch }) else { return }
                     callback(frames)
                 }
             }

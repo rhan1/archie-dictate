@@ -102,6 +102,8 @@ public final class AppController {
     private var lastDictation: String?
     private var lastDictationTimer: Timer?
     private var generation = CaptureEpoch()
+    /// 1.29.17 M6: cancels the last finished-tap dictation's transcription (task + sessions); Esc runs it.
+    private var finishingWork: (() -> Void)?
     private let captureScheduler = CaptureDispatchScheduler()
     private var micStarting = false
     private var micAvailable = false
@@ -916,7 +918,7 @@ public final class AppController {
                                 capturedSeconds: Double(samples.count) / AudioRecorder.sampleRate,
                                 peakDBFS: AudioLevel.peakDBFS(samples))
         timeline.keepWarmPings = keepWarmPings
-        Task {
+        let work = Task {
             var pipeline = PipelineReport()
             var shadow: Task<(appleNames: Int, groqNames: Int, milliseconds: Int)?, Never>?
             var result: Result<String, Error>
@@ -1205,6 +1207,8 @@ public final class AppController {
                 }
             }
         }
+        // 1.29.17 M6: Esc during transcription cancels this dictation's own task and provider sessions.
+        finishingWork = { work.cancel(); appleSession?.cancel(); chunkedSession?.cancel(); streamingSession?.cancel(); incrementalSession?.cancel() }
     }
 
     /// Groq first (fastest + best measured). If Groq fails or is slower than
@@ -1376,6 +1380,7 @@ public final class AppController {
         statusItem?.setRecording(false)
         let duration = Date().timeIntervalSince(recordingStarted ?? Date())
         capture.end(.cancel) // discard: nothing is kept
+        finishingWork?(); finishingWork = nil
         let mediaEvents = resumeMedia()
         if mediaEvents != "-" { AppController.note("cancel media=\(mediaEvents)") }
         dropTranscriber()
