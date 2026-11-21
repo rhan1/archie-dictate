@@ -144,7 +144,9 @@ struct V1296FR1Tests {
 
     @Test func override_malformed_deleted() throws {
         let lookups = V.Box<[String]>([]), notes = V.Box<[String]>([])
-        let now = Self.epoch
+        // 1.29.18 (Archie dr9): every resolve reads the same fixed clock as the expiries below; the
+        // wall clock crossing a second made "now + 901" read as 900 s away (live, not deleted).
+        let now = Self.epoch, at = Date(timeIntervalSince1970: TimeInterval(now))
         let values: [(String, Any)] = [
             ("not_string", 42), ("bare_uid", "override-uid"), ("empty", ""), ("no_expiry", "override-uid|"),
             ("text_expiry", "override-uid|soon"), ("empty_uid", "|\(now + 300)"), ("too_far", "override-uid|\(now + 901)"),
@@ -155,7 +157,7 @@ struct V1296FR1Tests {
             defaults.set(value, forKey: Self.key)
             let unit = Self.unit(defaults, lookups: lookups, notes: notes)
             unit.allowConversationSeamForNextStart()
-            let resolved = try unit.resolveStartDevice()
+            let resolved = try unit.resolveStartDevice(now: at)
             #expect(resolved.id == 81 && resolved.overrideUID == nil)
             if defaults.object(forKey: Self.key) == nil { deleted += 1 }
         }
@@ -163,7 +165,6 @@ struct V1296FR1Tests {
         #expect(lookups.value.isEmpty && notes.value.isEmpty)
         // Boundary control: expiry = now + 900 is still live.
         let (defaults, name) = Self.suite(); defer { defaults.removePersistentDomain(forName: name) }
-        let at = Date(timeIntervalSince1970: TimeInterval(now))
         defaults.set("override-uid|\(now + 900)", forKey: Self.key)
         let unit = Self.unit(defaults, lookups: lookups, notes: notes)
         unit.allowConversationSeamForNextStart()
