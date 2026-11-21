@@ -745,3 +745,54 @@ struct V18TypedEngineTests {
         engine.cancel()
     }
 }
+
+/// 1.29.17 M1 (A2-A5): ⌥⌥ started in one window/document of an app; he switches to another of the SAME app (same pid)
+/// before the text lands → held (recoverable), nothing posted. Staying in the same destination pastes as before.
+extension DictationEngineTests {
+    @Test func sameAppDestinationChangeHoldsTheText() async throws {
+        final class Box: @unchecked Sendable { var value: FocusDestination?; var reads = 0 }
+        let a = FocusDestination(pid: 1, window: AnyHashable("draft-A"), document: nil)
+        let b = FocusDestination(pid: 1, window: AnyHashable("draft-B"), document: nil)
+        var verdicts: [String] = []
+        for switches in [true, false] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("dictate-dr3-m1-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(home: root)
+            let keys = KeyStore(reader: { _ in "fixture" })
+            keys.prefetch(services: ["groq-api"])
+            try await waitFor { keys.key(for: "groq-api") != nil }
+            let pb = NSPasteboard(name: .init("dictate-dr3-m1-\(UUID().uuidString)"))
+            defer { pb.releaseGlobally() }
+            pb.clearContents(); pb.setString("ORIGINAL", forType: .string)
+            let clock = V15PasteConfirmationTests.ManualMainScheduler()
+            let ax = V15PasteConfirmationTests.AXMockBox()
+            let words = "Please send the whole report on Tuesday."
+            let recorder = TestRecorder()
+            var posted = 0
+            let focus = Box(); focus.value = a
+            let inserter = TextInserter(pasteboard: pb, postKeystroke: { posted += 1 },
+                schedule: clock.schedule, axReader: { ax.texts }, now: { clock.now })
+            var deps = EngineDependencies(recorder: recorder, makeApple: { TestApple(words) },
+                sttTransport: TestHTTP(words), groqCleanupTransport: TestHTTP(words), localCleanupTransport: TestHTTP(words),
+                inserter: inserter, panelFactory: { TestPanel() }, requestMicrophoneAccess: { $0(true) },
+                frontmostTarget: { InsertionTarget(pid: 1, bundleID: "test.host") }, manageMedia: false)
+            deps.focusDestination = { focus.reads += 1; return focus.value }
+            let controller = AppController(keyStore: keys, paths: paths, surface: .none, mode: .dictate, dependencies: deps)
+            let engine = DictationEngine(controller: controller)
+            engine.start()
+            try await waitFor { recorder.ready && recorder.starts > 0 && !controller.micStartPending && focus.reads >= 1 }
+            try await Task.sleep(nanoseconds: 20_000_000); await MainActor.run {}   // the start reading lands on main
+            if switches { focus.value = b }
+            engine.finish()
+            try await waitFor { posted > 0 || ((try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? "").contains("outcome=held") }
+            let log = (try? String(contentsOf: paths.logURL, encoding: .utf8)) ?? ""
+            let held = log.contains("outcome=held:focus_changed")
+            verdicts.append("\(switches ? "switched" : "stayed") held=\(held ? 1 : 0) posted=\(posted) clipboard_has_text=\(pb.string(forType: .string) == words ? 1 : 0)")
+            if switches { #expect(held && posted == 0 && pb.string(forType: .string) == words) }
+            else { #expect(!held && posted > 0) }
+            engine.cancel()
+        }
+        let green = verdicts.first?.contains("held=1 posted=0") == true && verdicts.last?.contains("held=0") == true
+        print("DR3 M1 \(green ? "GREEN" : "RED") same_app_destination \(verdicts.joined(separator: " | "))")
+    }
+}

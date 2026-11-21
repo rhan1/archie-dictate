@@ -17,7 +17,7 @@ public final class TextInserter {
 
     private let keyEventPosting: KeyEventPosting
     private let typingEligibility: (() -> TypingEligibility)?
-    private let pasteboard: NSPasteboard
+    let pasteboard: NSPasteboard
     private var cancelActiveTyping: (() -> Void)?
     /// Recovery copy; a cancelled partial insertion retains only its unposted remainder.
     public private(set) var heldText: String?

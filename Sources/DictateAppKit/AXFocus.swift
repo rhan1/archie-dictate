@@ -53,9 +53,33 @@ enum AXFocus {
         return FocusIdentity(pid: pid, role: role, document: document, element: AnyHashable(element))
     }
 
+    /// 1.29.17 M1: the focused element's window and AXDocument (each nil when the app does not say). Metadata only.
+    static func destination() -> FocusDestination? {
+        guard let element = focusedElement() else { return nil }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else { return nil }
+        let window = attribute(element, kAXWindowAttribute).flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
+        let document = (attribute(element, kAXDocumentAttribute) as? String) ?? window.flatMap { attribute($0, kAXDocumentAttribute) as? String }
+        return FocusDestination(pid: pid, window: window.map { AnyHashable($0) }, document: document)
+    }
+
     /// The learner's observation: the focused element's identity now, and its value on demand (one read).
     static func snapshot() -> FocusSnapshot? {
         guard let element = focusedElement(), let identity = identity(of: element) else { return nil }
         return FocusSnapshot(identity: identity, readValue: { readTexts(from: element).first })
+    }
+}
+
+/// 1.29.17 M1 (A2-A5): where ⌥⌥ text lands inside the app it started in.
+struct FocusDestination: Equatable {
+    let pid: pid_t
+    let window: AnyHashable?
+    let document: String?
+    /// Same app, but another window or document than at the start (both sides known; unknown never holds).
+    func moved(from start: FocusDestination?) -> Bool {
+        guard let start, start.pid == pid else { return false }
+        if let a = start.window, let b = window, a != b { return true }
+        if let a = start.document, let b = document, a != b { return true }
+        return false
     }
 }

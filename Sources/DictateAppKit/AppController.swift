@@ -99,6 +99,8 @@ public final class AppController {
     private var foreignHFP = ForeignHFPLatch()
     private var foreignHFPPoll: Timer?
     private var recordingTarget: InsertionTarget?
+    /// 1.29.17 M1: the focused window/document when this recording started (read off the main thread).
+    private var recordingDestination: FocusDestination?
     private var lastDictation: String?
     private var lastDictationTimer: Timer?
     private var generation = CaptureEpoch()
@@ -719,6 +721,12 @@ public final class AppController {
         else { recordingTarget = Self.frontmostTarget() }
         generation = CaptureEpoch()
         let token = generation
+        recordingDestination = nil
+        let readDestination = focusDestinationReader
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let destination = readDestination()
+            DispatchQueue.main.async { if let self, self.generation === token { self.recordingDestination = destination } }
+        }
         captureFailure = nil
         if let stale = openSession { noteSessionEnd(id: stale.id, stats: stale.stats ?? recorder.stats, outcome: "abandoned", entry: nil) }
         let session = String(UUID().uuidString.prefix(8)).lowercased()
@@ -1117,6 +1125,7 @@ public final class AppController {
                                                        pastedText: text))
                     }
                     let start = self.recordingTarget
+                    let startDestination = self.recordingDestination
                     let publicTimeline = DictationTimeline(latency_ms: latency, stt_ms: report.sttMs,
                         cleanup_ms: report.cleanupMs, chunks: report.chunks, path: report.path,
                         cleanup_mode: policy.usesCleanup ? report.cleanupMode : "none", fallback: policy.fallbackLabel)
@@ -1146,7 +1155,12 @@ public final class AppController {
                         self.inserter.insert(text, shouldInsert: {
                             let now = self.currentTarget()
                             pasteApp = now?.bundleID ?? ""
-                            switch InsertionTarget.decide(start: start, now: now) {
+                            var decision = InsertionTarget.decide(start: start, now: now)
+                            if decision == .paste, startDestination != nil, self.focusDestinationReader()?.moved(from: startDestination) == true {
+                                decision = .hold
+                                AppController.note("insertion_hold=destination_changed")
+                            }
+                            switch decision {
                             case .paste:
                                 self.clearOutcome()
                                 self.pill.show(.transcribing, status: "pasting")
@@ -1154,8 +1168,8 @@ public final class AppController {
                                 self.traceFocus("pasting")
                                 return true
                             case .hold:
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(text, forType: .string)
+                                self.inserter.pasteboard.clearContents()   // NSPasteboard.general live; a test's own board
+                                self.inserter.pasteboard.setString(text, forType: .string)
                                 return false
                             }
                         }, onResult: { result in
@@ -1477,6 +1491,11 @@ public final class AppController {
     private func currentTarget() -> InsertionTarget? {
         if let dependencies { return dependencies.frontmostTarget() }
         return Self.frontmostTarget()
+    }
+
+    private var focusDestinationReader: () -> FocusDestination? {
+        guard let dependencies else { return AXFocus.destination }
+        return dependencies.focusDestination ?? { nil }
     }
 
     private static func frontmostTarget() -> InsertionTarget? {
