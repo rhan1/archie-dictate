@@ -66,4 +66,59 @@ struct DR2AbsentRestoreTests {
         print("P H6 CONTROL present_failure_held=\(rig.muter.mutedUIDs == ["headset"] ? 1 : 0)")
         #expect(rig.muter.mutedUIDs == ["headset"])
     }
+
+    /// Fix pass (Codex H6-1): the headset returns still muted by us and becomes the default DURING a speakers
+    /// capture → adopted (kept muted for the capture) and unmuted at its end, not left muted as "the user's".
+    @Test func headsetReturningMidCaptureIsAdoptedAndUnmuted() {
+        let rig = Rig()
+        _ = rig.muter.mute()
+        rig.out.mute["headset"] = nil; rig.out.defaultUID = "speakers"
+        _ = rig.muter.restore()
+        #expect(rig.muter.mute() == .muted)                                     // speakers capture
+        rig.out.mute["headset"] = true; rig.out.defaultUID = "headset"
+        rig.out.notifyOutput(.defaultChanged)
+        let held = rig.muter.mutedUIDs
+        #expect(rig.muter.restore() == .restored)
+        rig.clock.advance(5)
+        print("P H6 mid_capture_return held=\(held) headset_after=\(rig.out.mute["headset"].map { $0 ? 1 : 0 } ?? -1) record_left=\(FileManager.default.fileExists(atPath: rig.file.path) ? 1 : 0)")
+        #expect(held == ["speakers", "headset"])
+        #expect(rig.out.mute["headset"] == false)                              // RED: true (left muted)
+        #expect(rig.out.mute["speakers"] == false)
+        #expect(!FileManager.default.fileExists(atPath: rig.file.path))
+    }
+
+    /// Fix pass (Codex H6-1): a capture on the returned headset starts inside the speakers' 5 s settle window
+    /// (launch-style recovery is skipped then) → the carried record is adopted, never deleted as "already muted".
+    @Test func headsetReturningInsideAnotherSettleWindowKeepsItsRecord() {
+        let rig = Rig()
+        _ = rig.muter.mute()
+        rig.out.mute["headset"] = nil; rig.out.defaultUID = "speakers"
+        _ = rig.muter.restore()
+        _ = rig.muter.mute(); _ = rig.muter.restore()                           // speakers now settling
+        rig.clock.advance(1)
+        rig.out.mute["headset"] = true; rig.out.defaultUID = "headset"
+        let next = rig.muter.mute()
+        let kept = rig.text.contains("headset\t0")
+        _ = rig.muter.restore(); rig.clock.advance(5)
+        print("P H6 return_in_settle_window next=\(next.rawValue) record_kept=\(kept ? 1 : 0) headset_after=\(rig.out.mute["headset"].map { $0 ? 1 : 0 } ?? -1)")
+        #expect(next == .muted)                                                 // RED: already_muted (record deleted)
+        #expect(kept)
+        #expect(rig.out.mute["headset"] == false)
+        #expect(!FileManager.default.fileExists(atPath: rig.file.path))
+    }
+
+    /// L6 control: a carried record taken on another profile is not adopted (the returned flag is not ours).
+    @Test func carriedRecordFromAnotherProfileIsNotAdopted() {
+        let rig = Rig()
+        rig.out.reportsProfile = true; rig.out.profile = "a2dp"
+        _ = rig.muter.mute()
+        rig.out.mute["headset"] = nil; rig.out.defaultUID = "speakers"
+        _ = rig.muter.restore()
+        _ = rig.muter.mute(); _ = rig.muter.restore(); rig.clock.advance(1)
+        rig.out.profile = "hfp"; rig.out.mute["headset"] = true; rig.out.defaultUID = "headset"
+        let next = rig.muter.mute()
+        print("P H6 CONTROL other_profile next=\(next.rawValue) headset_flag=\(rig.out.mute["headset"] == true ? 1 : 0)")
+        #expect(next == .alreadyMuted)
+        #expect(rig.out.mute["headset"] == true)
+    }
 }
