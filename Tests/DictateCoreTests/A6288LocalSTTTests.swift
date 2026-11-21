@@ -78,8 +78,14 @@ struct A6288LocalSTTTests {
         let dead = LocalSTTProcess(executable: URL(fileURLWithPath: "/usr/bin/false"), model: URL(fileURLWithPath: "/dev/null"))
         let first = await Self.run(dead)
         let second = await Self.run(dead)
-        let ok = [first, second].allSatisfy { $0.result.text == "from groq" && $0.result.localFallbacks == 1 && $0.ms < 1_500 }
-        print("P \(ok ? "GREEN" : "RED") dead_helper_falls_back=\(ok ? 1 : 0) first_ms=\(first.ms) second_ms=\(second.ms)")
+        // The dead helper's closed stdout must not keep a reader spinning (idle CPU over 1 s after it died).
+        func cpuMs() -> Int { var u = rusage(); getrusage(RUSAGE_SELF, &u)
+            return Int(u.ru_utime.tv_sec + u.ru_stime.tv_sec) * 1_000 + Int(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1_000 }
+        let cpu0 = cpuMs()
+        try? await Task.sleep(for: .seconds(1))
+        let idleCPU = cpuMs() - cpu0
+        let ok = [first, second].allSatisfy { $0.result.text == "from groq" && $0.result.localFallbacks == 1 && $0.ms < 1_500 } && idleCPU < 300
+        print("P \(ok ? "GREEN" : "RED") dead_helper_falls_back=\(ok ? 1 : 0) first_ms=\(first.ms) second_ms=\(second.ms) idle_cpu_ms_after=\(idleCPU)")
         #expect(ok)
     }
 

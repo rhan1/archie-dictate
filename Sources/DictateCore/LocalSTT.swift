@@ -27,9 +27,7 @@ public final class LocalSTTProcess: LocalChunkSTT, @unchecked Sendable {
     private var pending = Data()
 
     public init(executable: URL, model: URL, modelID: String = "parakeet-tdt-0.6b-v2") {
-        self.executable = executable
-        self.model = model
-        self.modelID = modelID
+        (self.executable, self.model, self.modelID) = (executable, model, modelID)
     }
 
     /// Starts the helper (loads the model) ahead of the first chunk.
@@ -68,11 +66,8 @@ public final class LocalSTTProcess: LocalChunkSTT, @unchecked Sendable {
         if let input, process?.isRunning == true { return input }
         let child = Process()
         let stdin = Pipe(), stdout = Pipe()
-        child.executableURL = executable
-        child.arguments = [model.path]
-        child.standardInput = stdin
-        child.standardOutput = stdout
-        child.standardError = FileHandle.nullDevice
+        (child.executableURL, child.arguments) = (executable, [model.path])
+        (child.standardInput, child.standardOutput, child.standardError) = (stdin, stdout, FileHandle.nullDevice)
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in self?.received(handle.availableData) }
         child.terminationHandler = { [weak self] ended in self?.exited(ended) }
         // A write to a helper that just died must fail with EPIPE, never kill the host with SIGPIPE.
@@ -102,8 +97,7 @@ public final class LocalSTTProcess: LocalChunkSTT, @unchecked Sendable {
     private func exited(_ ended: Process) {
         let orphans: [CheckedContinuation<String, Error>] = lock.withLock {
             guard process === ended else { return [] }
-            process = nil
-            input = nil
+            (process, input) = (nil, nil)
             pending.removeAll()
             defer { waiting.removeAll() }
             return Array(waiting.values)
