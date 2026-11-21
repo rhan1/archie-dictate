@@ -1,0 +1,69 @@
+import Foundation
+import Testing
+import DictateCore
+
+/// 1.29.16 (Archie 62.8.10, deep review H6 = F1-A5/A2-A7): the headset leaves while its output is muted.
+/// Before: `restore()` kept the gone device in `active` → `mutedUIDs == [headset]` (Archie: every answer
+/// "output unavailable") and the next `mute()` returned `.muted` without touching the speakers.
+@Suite("DR2 absent device at restore (H6)")
+struct DR2AbsentRestoreTests {
+    final class Rig {
+        let out = FakeOutput()
+        let clock = MuteClock()
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("dr2-h6-\(UUID().uuidString)")
+        var notes: [String] = []
+        lazy var muter: OutputMuter = {
+            let m = OutputMuter(device: out, stateFile: file, clock: clock, retryWait: { [clock] in clock.wait($0) })
+            m.onNote = { [weak self] in self?.notes.append($0) }
+            return m
+        }()
+        var text: String { (try? String(contentsOf: file, encoding: .utf8)) ?? "" }
+        deinit { try? FileManager.default.removeItem(at: file) }
+    }
+
+    @Test func headsetGoneWhileMutedIsCarriedAndTheSpeakersMuteNext() {
+        let rig = Rig()
+        #expect(rig.muter.mute() == .muted)
+        #expect(rig.out.mute["headset"] == true)
+        rig.out.mute["headset"] = nil; rig.out.defaultUID = "speakers"        // powered off / out of range
+        let event = rig.muter.restore()
+        let held = rig.muter.mutedUIDs
+        rig.out.writes = []
+        let next = rig.muter.mute()
+        let speakerWrites = rig.out.writes.filter { $0.0 == "speakers" && $0.1 }.count
+        print("P H6 restore=\(event?.rawValue ?? "nil") muted_uids=\(held) next=\(next.rawValue) speaker_mute_writes=\(speakerWrites) record_kept=\(rig.text.contains("headset\t0") ? 1 : 0)")
+        #expect(held.isEmpty)                                                   // RED: ["headset"]
+        #expect(next == .muted)
+        #expect(speakerWrites == 1)                                            // RED: 0 (nothing muted)
+        #expect(rig.out.mute["speakers"] == true)
+        #expect(rig.text.contains("headset\t0"))                               // carried for its return
+        #expect(rig.notes.contains("mute_record_absent=1"))
+        #expect(rig.muter.restore() == .restored)
+        #expect(rig.out.mute["speakers"] == false)
+        rig.clock.advance(5)
+        #expect(rig.text == "headset\t0")
+    }
+
+    @Test func headsetReturningAfterwardIsUnmuted() {
+        let rig = Rig()
+        _ = rig.muter.mute()
+        rig.out.mute["headset"] = nil; rig.out.defaultUID = "speakers"
+        _ = rig.muter.restore()
+        rig.out.mute["headset"] = true; rig.out.defaultUID = "headset"         // back, with our flag on it
+        #expect(rig.muter.recoverIfNeeded() == .unmuteRecovered)
+        #expect(rig.out.mute["headset"] == false)
+        rig.clock.advance(5)
+        #expect(!FileManager.default.fileExists(atPath: rig.file.path))
+        print("P H6 headset_returns_unmuted=\(rig.out.mute["headset"] == false ? 1 : 0)")
+    }
+
+    @Test func presentDeviceThatFailsToRestoreStillHeld() {
+        // Control: a device that is still connected but will not unmute stays owned (unchanged).
+        let rig = Rig()
+        _ = rig.muter.mute()
+        rig.out.silentlyFail = true
+        #expect(rig.muter.restore() == .restoreFailed)
+        print("P H6 CONTROL present_failure_held=\(rig.muter.mutedUIDs == ["headset"] ? 1 : 0)")
+        #expect(rig.muter.mutedUIDs == ["headset"])
+    }
+}
