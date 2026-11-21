@@ -12,6 +12,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     /// 1.29.9 (archie-6276 Fix 2): a chunk Groq has not answered by now is also sent to Scribe (the
     /// fallback Archie 62.7.1 added); the first good answer wins. A fast Groq never pays for Scribe.
     public static let scribeHedgeAfterMs = 2_000
+    /// 1.29.15 (Archie 62.8.8): a host's on-device engine (`local:`) gets this long per chunk; then the cloud path.
+    public static let localTimeoutMs = 1_500
 
     /// A chunk that starts like this is probably the tail of a split "uh, the X".
     /// Keep this small list public so probe runs can tune it in one place.
@@ -111,6 +113,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         public var droppedLoops: Int = 0
         public var scribeChunks: Int = 0
         public var scribeNoKey: Bool = false
+        /// 1.29.15: chunks the on-device engine answered / handed to the cloud (error, empty, timeout).
+        public var localChunks: Int = 0
+        public var localFallbacks: Int = 0
         /// v1.28 FR5-A: Whisper segments dropped on their own confidence (`stt_dropped_segment_conf`).
         public var droppedSegmentConf: Int = 0
 
@@ -139,6 +144,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let lock = NSLock()
     private let client: TranscriptionClient
     private let scribeClient: ScribeClient?
+    private let local: (any LocalChunkSTT)?
+    private var localChunks = 0
+    private var localFallbacks = 0
     private let vocabulary: String
     private let hedgeAfterMs: Int
     private let clock: any DictateClock
@@ -201,13 +209,14 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                             onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
                             onChunkSegments: (@Sendable (Int, String) -> Void)? = nil,
                             onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
+                            local: (any LocalChunkSTT)? = nil,
                             clock: any DictateClock = SystemClock()) {
         self.init(transport: transport, apiKey: apiKey, prompt: prompt, fillerLeadIn: fillerLeadIn, leadIn: leadIn,
                   firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds,
                   hedgeAfterMs: hedgeAfterMs, finalSplitSeconds: finalSplitSeconds, finalModel: finalModel,
                   rejoinGuard: rejoinGuard, lowSpeechGuard: lowSpeechGuard, edgeGuard: edgeGuard,
                   scribeAPIKey: scribeAPIKey, onChunkText: onChunkText, onChunkTrace: onChunkTrace,
-                  onChunkSegments: onChunkSegments, onGroqRateLimit: onGroqRateLimit, clock: clock)
+                  onChunkSegments: onChunkSegments, onGroqRateLimit: onGroqRateLimit, local: local, clock: clock)
     }
 
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
@@ -220,7 +229,9 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
                 onChunkSegments: (@Sendable (Int, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
+                local: (any LocalChunkSTT)? = nil,
                 clock: any DictateClock = SystemClock()) {
+        self.local = local
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
@@ -434,6 +445,37 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
         return AttemptResult(text: nil, status: status, hedgeFired: fired, winningRequest: nil)
     }
 
+    /// 1.29.15: the on-device answer, or nil (error, empty, no answer within `localTimeoutMs`, cancelled) so the
+    /// caller runs the cloud path exactly as without a local engine.
+    private func localText(_ local: any LocalChunkSTT, chunk: PauseChunker.Chunk, isFinal: Bool) async -> String? {
+        let pcm = Self.resampleTo16k(chunk.samples)
+        let start = DispatchTime.now().uptimeNanoseconds
+        let answer: String? = await withTaskGroup(of: String?.self) { [clock] group in
+            group.addTask { try? await local.transcribe(pcm16k: pcm) }
+            group.addTask {
+                try? await clock.sleep(until: clock.now().advanced(by: .milliseconds(Self.localTimeoutMs)))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        let text = answer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return lock.withLock { () -> String? in
+            guard !cancelled, !Task.isCancelled else { return nil }
+            guard !text.isEmpty else { localFallbacks += 1; return nil }
+            localChunks += 1
+            lastResponse = DispatchTime.now().uptimeNanoseconds
+            calls.append(Call(index: chunk.index, attempt: 1, model: local.modelID, isFinal: isFinal, isRejoin: false,
+                              milliseconds: Self.ms(from: start), status: 200, hedgeFired: false, winningRequest: 1,
+                              prompt: "none"))
+            let guarded = RepetitionGuard.guardChunk(text, audioSeconds: Self.seconds(chunk.samples.count))
+            texts[chunk.index] = guarded.text
+            loopEvents += guarded.loops
+            return guarded.text
+        }
+    }
+
     private func emitChunk(_ chunk: PauseChunker.Chunk, fallbackText: String) {
         // v1.10 L3: the incremental cleaner cleans a chunk once the next one arrives, so a
         // low-speech chunk's dropped sentence is replaced BEFORE the next chunk is emitted.
@@ -452,6 +494,10 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     }
 
     private func upload(_ chunk: PauseChunker.Chunk, model: String, isFinal: Bool, emptyPrompt: Bool = false) async {
+        if let local, let text = await localText(local, chunk: chunk, isFinal: isFinal) {
+            emitChunk(chunk, fallbackText: text)
+            return
+        }
         let wav = FLACEncoder.upload16k(Self.resampleTo16k(chunk.samples))
         for attempt in 1...2 {
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
@@ -605,7 +651,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                           droppedOpeningSentences: openingDrops.filter { $0 == .lowSpeech }.count,
                           droppedArtifacts: (tailDrops + openingDrops).filter { $0 == .artifact }.count,
                           droppedSilentChunks: droppedSilent).withLoops(loopEvents).withScribe(chunks: scribeChunks, noKey: scribeNoKey)
-                .withSegmentConf(droppedSegmentConf)
+                .withSegmentConf(droppedSegmentConf).withLocal(chunks: localChunks, fallbacks: localFallbacks)
         }
     }
 
@@ -818,6 +864,12 @@ extension GroqChunkedTranscriber.Result {
     /// M2: the same result with the loop count set (keeps the long memberwise init unchanged).
     func withLoops(_ loops: Int) -> Self { var copy = self; copy.droppedLoops = loops; return copy }
     func withSegmentConf(_ dropped: Int) -> Self { var copy = self; copy.droppedSegmentConf = dropped; return copy }
+    func withLocal(chunks: Int, fallbacks: Int) -> Self {
+        var copy = self
+        copy.localChunks = chunks
+        copy.localFallbacks = fallbacks
+        return copy
+    }
     func withScribe(chunks: Int, noKey: Bool) -> Self {
         var copy = self
         copy.scribeChunks = chunks
