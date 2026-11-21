@@ -16,8 +16,8 @@ public enum LocalSTTError: Error, Equatable { case unavailable, engine(String), 
 /// Frames on stdin: UInt32 LE id, UInt32 LE sample count, PCM16 LE. Lines on stdout: `id\tOK\ttext` / `id\tERR\tcode`.
 public final class LocalSTTProcess: LocalChunkSTT, @unchecked Sendable {
     public let modelID: String
-    private let executable: URL
-    private let model: URL
+    public let executable: URL
+    public let model: URL
     private let lock = NSLock()
     private let writes = DispatchQueue(label: "dictate.local-stt.write")
     private var process: Process?
