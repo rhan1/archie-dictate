@@ -72,6 +72,7 @@ public final class AppController {
     var transcriptTraceDefaults: UserDefaults?
     /// 1.29.15: the host's on-device engine, asked at each dictation start (nil or no provider = cloud only).
     var localSTTProvider: (@Sendable () -> (any LocalChunkSTT)?)?
+    var localSTTShadowProvider: (@Sendable () -> LocalSTTShadow?)?
     /// v1.27 FR1-F: every open trace by session id; closed when that session's end line is written.
     private var transcriptTraces: [String: TranscriptTrace] = [:]
     /// Tests: traces still open (0 once every session has ended).
@@ -822,6 +823,8 @@ public final class AppController {
                 let qStore = quotaStore
                 let incremental = sessionPolicy.usesCleanup && sessionPolicy.usesGroqCleanup ? IncrementalCleaner(cleaner: groqCleaner, quotaProvider: { qStore.current }) : nil
                 let trace = transcriptTrace
+                let shadow = localSTTShadowProvider?()
+                shadow?.trace = trace.map { trace in { trace.shadow(index: $0, cloud: $1, local: $2) } }
                 if let trace { incremental?.onCleaned = { trace.cleaned($0) }; incremental?.onCleanerInput = { trace.cleanerIn($0) } }
                 incrementalCleaner = incremental
                 let streaming = GroqChunkedTranscriber(transport: sttTransport, apiKey: {
@@ -842,7 +845,7 @@ public final class AppController {
                        trace.chunk(index: index, final: final, prompt: prompt, raw: raw)
                    } },
                    onChunkSegments: trace.map { trace in { index, description in trace.segments(index: index, description) } },
-                   onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) }, local: localSTTProvider?())
+                   onGroqRateLimit: { [rateLimitRelay] in rateLimitRelay.observe($0) }, local: localSTTProvider?(), shadow: shadow)
                 chunked = streaming
                 recorder.onPCMChunk = { [pcmTap] pcm in
                     engine.append(pcm)

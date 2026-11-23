@@ -63,12 +63,18 @@ public final class TranscriptTrace: @unchecked Sendable {
     public func cleaned(_ text: String) { write("cleaned=\(text)") }
     public func pasted(_ text: String) { write("pasted=\(text)") }
 
-    private func write(_ line: String) {
-        let flat = line.replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\n", with: "\\n")
+    /// 1.29.19 (Archie 62.8.19): chunk `index` as the cloud heard it (used) and the side-by-side local engine
+    /// (never used), on adjacent lines.
+    public func shadow(index: Int, cloud: String, local: String) {
+        write("chunk=\(index) shadow_cloud=\(cloud)", "chunk=\(index) shadow_local=\(local)")
+    }
+
+    private func write(_ entries: String...) {
+        let flat = entries.map { $0.replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\n", with: "\\n") }
         lock.withLock {
             guard let handle else { return }
-            try? handle.write(contentsOf: Data((flat + "\n").utf8))
-            lines += 1
+            try? handle.write(contentsOf: Data(flat.map { $0 + "\n" }.joined().utf8))
+            lines += flat.count
         }
     }
 }

@@ -130,6 +130,8 @@ public struct DictationTimeline: Sendable, Equatable {
     /// 1.29.15 (Archie 62.8.8): an on-device engine tried first per chunk, asked at each dictation start; nil =
     /// cloud only (the default). Its failures fall back to Groq → Scribe in the same dictation.
     public func localSTT(_ provider: (@Sendable () -> (any LocalChunkSTT)?)?) { controller.localSTTProvider = provider }
+    /// 1.29.19 (Archie 62.8.19): a side-by-side engine asked at each dictation start; it only measures (nil = none).
+    public func localSTTShadow(_ provider: (@Sendable () -> LocalSTTShadow?)?) { controller.localSTTShadowProvider = provider }
     public func pasteHeld() { controller.enginePasteHeld() }
     public func copyHeld() { controller.engineCopyHeld() }
 

@@ -148,6 +148,8 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
     private let client: TranscriptionClient
     private let scribeClient: ScribeClient?
     private let local: (any LocalChunkSTT)?
+    /// 1.29.19 (Archie 62.8.19): measures only; its answer is never used (`LocalSTTShadow`).
+    private let shadow: LocalSTTShadow?
     private var localChunks = 0
     private var localFallbacks = 0
     private let vocabulary: String
@@ -212,14 +214,14 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                             onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
                             onChunkSegments: (@Sendable (Int, String) -> Void)? = nil,
                             onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
-                            local: (any LocalChunkSTT)? = nil,
+                            local: (any LocalChunkSTT)? = nil, shadow: LocalSTTShadow? = nil,
                             clock: any DictateClock = SystemClock()) {
         self.init(transport: transport, apiKey: apiKey, prompt: prompt, fillerLeadIn: fillerLeadIn, leadIn: leadIn,
                   firstMinimumSeconds: firstMinimumSeconds, firstMaximumSeconds: firstMaximumSeconds,
                   hedgeAfterMs: hedgeAfterMs, finalSplitSeconds: finalSplitSeconds, finalModel: finalModel,
                   rejoinGuard: rejoinGuard, lowSpeechGuard: lowSpeechGuard, edgeGuard: edgeGuard,
                   scribeAPIKey: scribeAPIKey, onChunkText: onChunkText, onChunkTrace: onChunkTrace,
-                  onChunkSegments: onChunkSegments, onGroqRateLimit: onGroqRateLimit, local: local, clock: clock)
+                  onChunkSegments: onChunkSegments, onGroqRateLimit: onGroqRateLimit, local: local, shadow: shadow, clock: clock)
     }
 
     public init(transport: HTTPTransport, apiKey: @escaping @Sendable () throws -> String, prompt: String,
@@ -232,9 +234,10 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 onChunkTrace: (@Sendable (Int, Bool, String, String) -> Void)? = nil,
                 onChunkSegments: (@Sendable (Int, String) -> Void)? = nil,
                 onGroqRateLimit: (@Sendable (GroqRateLimit) -> Void)? = nil,
-                local: (any LocalChunkSTT)? = nil,
+                local: (any LocalChunkSTT)? = nil, shadow: LocalSTTShadow? = nil,
                 clock: any DictateClock = SystemClock()) {
         self.local = local
+        self.shadow = local == nil ? shadow : nil       // 1.29.19: local on = local is the real path, no shadow
         var client = TranscriptionClient(transport: transport, apiKey: apiKey)
         client.endpointURL = TranscriptionClient.groqEndpoint
         client.modelName = "whisper-large-v3-turbo"
@@ -506,6 +509,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
             return
         }
         let wav = FLACEncoder.upload16k(pcm16k)
+        let shadowed = shadow?.begin(index: chunk.index, pcm16k: pcm16k), cloudStart = DispatchTime.now().uptimeNanoseconds
         for attempt in 1...2 {
             if Task.isCancelled || lock.withLock({ cancelled }) { return }
             let start = DispatchTime.now().uptimeNanoseconds
@@ -553,6 +557,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 return (true, onChunkSegments == nil ? "" : SegmentConfidence.describe(outcome.segments, windows: windows))
             }
             if accepted.ok, let text = outcome.text {
+                shadow?.finish(shadowed, cloudText: text, cloudMs: Self.ms(from: cloudStart), provider: viaScribe ? "scribe" : "groq")
                 onChunkTrace?(chunk.index, isFinal, emptyPrompt || viaScribe ? "none" : "full", text)
                 onChunkSegments?(chunk.index, accepted.segments)
                 emitChunk(chunk, fallbackText: text)
@@ -607,6 +612,7 @@ public final class GroqChunkedTranscriber: @unchecked Sendable {
                 return false
             }
             if accepted, let text = response.text {
+                shadow?.finish(shadowed, cloudText: text, cloudMs: Self.ms(from: cloudStart), provider: "scribe")
                 onChunkTrace?(chunk.index, isFinal, "none", text)    // Scribe takes no prompt
                 onChunkSegments?(chunk.index, "none")                // FR5-B: Scribe sends no confidences
                 emitChunk(chunk, fallbackText: text)

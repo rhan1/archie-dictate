@@ -1,6 +1,12 @@
 #!/bin/bash
 set -u
 
+archie_log_subsystem() {
+    local value="${ARCHIE_LOG_SUBSYSTEM:-}" file="$HOME/Library/Application Support/Dictate/build.env" LC_ALL=C
+    if [[ -z "$value" && -f "$file" ]]; then value=$(sed -nE "s/^(export )?ARCHIE_LOG_SUBSYSTEM=(.*)$/\2/p" "$file" | head -n 1 | sed -E -e "s/^\"(.*)\"$/\1/" -e t -e "s/^'(.*)'$/\1/"); fi
+    if [[ -z "$value" ]]; then value=com.example.archie; elif ! [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then printf '%s\n' 'WARNING: invalid ARCHIE_LOG_SUBSYSTEM; using com.example.archie' >&2; value=com.example.archie; fi
+    printf '%s\n' "$value"
+}
 # Analysis function callable by tests or main flow
 analyse() {
     local stderr_file="${1:-}"
@@ -1083,6 +1089,7 @@ esco_from_files() {
 esco_log_window() {
     local start="$1"
     local end="$2"
+    local subsystem; subsystem=$(archie_log_subsystem)
 
     local start_clean="${start%%.*}"
     local end_clean="${end%%.*}"
@@ -1103,14 +1110,14 @@ esco_log_window() {
     stream_tmp=$(mktemp "${TMPDIR:-/tmp}/bt-proof-stream.XXXXXX")
     trap 'rm -f "$ca_tmp" "$notes_tmp" "$stderr_tmp" "$dict_tmp" "$combined_tmp" "$stream_tmp"' EXIT
 
-    /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
+    "${ARCHIE_LOG_BIN:-/usr/bin/log}" show --start "$start" --end "$end" --info --debug --style compact \
         --predicate 'process == "coreaudiod" AND subsystem == "com.apple.bluetooth"' 2>/dev/null \
         | grep -E 'Dropping eSCO creation|operat(i)?on type = Creation' \
         > "$ca_tmp"
     local status_ca=${PIPESTATUS[0]}
 
-    /usr/bin/log show --start "$start" --end "$end" --info --debug --style compact \
-        --predicate 'subsystem == "com.example.archie" AND category == "voice"' 2>/dev/null \
+    "${ARCHIE_LOG_BIN:-/usr/bin/log}" show --start "$start" --end "$end" --info --debug --style compact \
+        --predicate "subsystem == \"$subsystem\" AND category == \"voice\"" 2>/dev/null \
         | grep -E 'session=[A-Za-z0-9_-]+[[:space:]]+event=(start|end)|bridge_src=builtin_fallback|builtin_fresh_at_fallback=|headset_signal_start=1|dict_start|bridge_switch=' \
         > "$notes_tmp"
     local status_notes=${PIPESTATUS[0]}

@@ -21,6 +21,13 @@
 set -euo pipefail
 zmodload zsh/datetime
 
+archie_log_subsystem() {
+    local value="${ARCHIE_LOG_SUBSYSTEM:-}" file="$HOME/Library/Application Support/Dictate/build.env" LC_ALL=C
+    if [[ -z "$value" && -f "$file" ]]; then value=$(sed -nE "s/^(export )?ARCHIE_LOG_SUBSYSTEM=(.*)$/\2/p" "$file" | head -n 1 | sed -E -e "s/^\"(.*)\"$/\1/" -e t -e "s/^'(.*)'$/\1/"); fi
+    if [[ -z "$value" ]]; then value=com.example.archie; elif ! [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then printf '%s\n' 'WARNING: invalid ARCHIE_LOG_SUBSYSTEM; using com.example.archie' >&2; value=com.example.archie; fi
+    printf '%s\n' "$value"
+}
+[[ "${1:-}" == --print-subsystem ]] && { archie_log_subsystem; exit 0; }
 REPO="${0:A:h:h:h}"
 FIXTURE="$REPO/tools/fixtures/rig/live-ab-2026-10-13"
 DRY_RUN=0 PLAN_FILE="" VOICE_LOG="" HAL_LOG="" OUT_DIR="$REPO/tools/rig/out"
@@ -229,10 +236,11 @@ else
     ! pmset -g assertions | grep -Eq 'Resources:.*audio-out|"Playing audio"' || precondition_fail "something is playing"
     mv "$GO_FILE" "$GO_FILE.used-$(date +%Y%m%d-%H%M%S)"
     log_step - preconditions "live go=consumed headset=$HEADSET_NAME ref=${REF:t}$([[ -f $REF ]] || print ' (missing: words=no-ref)')"
-    /usr/bin/log stream --style compact --predicate 'subsystem == "com.example.archie" AND category == "voice"' > "$VOICE_LOG" 2>/dev/null &
+    subsystem=$(archie_log_subsystem)
+    "${ARCHIE_LOG_BIN:-/usr/bin/log}" stream --style compact --predicate "subsystem == \"$subsystem\" AND category == \"voice\"" > "$VOICE_LOG" 2>/dev/null &
     STREAM_PIDS+=($!)
     # coreaudiod unfiltered (one process, one pid to stop); the HAL counts match their own lines.
-    /usr/bin/log stream --style compact --predicate 'process == "coreaudiod"' > "$HAL_LOG" 2>/dev/null &
+    "${ARCHIE_LOG_BIN:-/usr/bin/log}" stream --style compact --predicate 'process == "coreaudiod"' > "$HAL_LOG" 2>/dev/null &
     STREAM_PIDS+=($!)
     sleep 2
 fi
