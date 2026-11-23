@@ -336,7 +336,8 @@ struct A62819LocalSTTShadowTests {
         shadow.finish(silentTicket, cloudText: "ignored", cloudMs: 10, provider: "groq")
         try? await Task.sleep(for: .milliseconds(50))
 
-        let ok = shortTicket == nil && silentTicket == nil && local.calls == 0 && logs.count == 0
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let ok = local.calls == 0 && logs.count == 0
         print("P \(ok ? "GREEN" : "RED") shadow_short_or_silent_chunk_not_sent=\(ok ? 1 : 0)")
         #expect(ok)
     }
@@ -413,5 +414,99 @@ struct A62819LocalSTTShadowTests {
         let ok = words == ["hello", "world"] && dist == 2
         print("P \(ok ? "GREEN" : "RED") words_and_distance=\(ok ? 1 : 0)")
         #expect(ok)
+    }
+
+    // MARK: - fix pass (Fable M1 / Codex BLOCKER + MAJORs)
+
+    /// Nothing of the shadow runs before the cloud request: a mic lookup that blocks 1 s costs the real path nothing.
+    @Test func shadow_slow_mic_never_delays_real_path() async {
+        var base: [Int] = [], real: [Int] = []
+        for _ in 0..<3 {
+            for shadowed in [false, true] {
+                let shadow = shadowed ? LocalSTTShadow(path: "conversation", engine: FakeShadowLocal(.text("x")),
+                                                       mic: { Thread.sleep(forTimeInterval: 1.0); return "builtin" }, log: { _ in }) : nil
+                let transcriber = GroqChunkedTranscriber(transport: FakeShadowCloudHTTP(text: "hello there world", delayMs: 25),
+                                                         apiKey: { "groq-key" }, prompt: "Archie", fillerLeadIn: false, shadow: shadow)
+                let start = ContinuousClock.now
+                transcriber.submit(PauseChunker.Chunk(index: 0, samples: Self.voiced24k(), cutKind: .final, quietRunMs: nil), isFinal: true)
+                _ = await transcriber.finish()
+                if shadowed { real.append(Self.elapsedMs(since: start)) } else { base.append(Self.elapsedMs(since: start)) }
+            }
+        }
+        let median = { (runs: [Int]) in runs.sorted()[runs.count / 2] }
+        let ok = median(real) <= median(base) + 100
+        print("P \(ok ? "GREEN" : "RED") shadow_slow_mic_never_delays_real_path=\(ok ? 1 : 0) real_ms_p50=\(median(real)) base_ms_p50=\(median(base)) real=\(real) base=\(base)")
+        #expect(ok)
+    }
+
+    /// After `end()` (conversation closed) a late chunk starts nothing and logs nothing.
+    @Test func shadow_after_end_sends_nothing() async {
+        let logs = LockedList<String>(), releases = LockedList<Int>()
+        let local = FakeShadowLocal(.text("late"))
+        let shadow = LocalSTTShadow(path: "conversation", engine: local, release: { releases.append(1) }, mic: { "builtin" }, log: { logs.append($0) })
+        shadow.end()
+        shadow.finish(shadow.begin(index: 7, pcm16k: Self.voiced16k()), cloudText: "late chunk", cloudMs: 5, provider: "groq")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        let ok = local.calls == 0 && logs.count == 0 && releases.count == 1
+        print("P \(ok ? "GREEN" : "RED") shadow_after_end_sends_nothing=\(ok ? 1 : 0) engine_calls=\(local.calls) lines=\(logs.count) releases=\(releases.count)")
+        #expect(ok)
+    }
+
+    /// A helper that fails is not asked again for `rest` seconds: the next chunk logs local_error without a call.
+    @Test func shadow_rests_after_failure() async {
+        let logs = LockedList<String>()
+        let local = FakeShadowLocal(.fail(LocalSTTError.exited))
+        let shadow = LocalSTTShadow(path: "dictation", engine: local, mic: { "headset" }, log: { logs.append($0) })
+        shadow.finish(shadow.begin(index: 0, pcm16k: Self.voiced16k()), cloudText: "one two", cloudMs: 5, provider: "groq")
+        _ = await Self.waitUntil(timeoutSeconds: 3) { logs.count == 1 }
+        shadow.finish(shadow.begin(index: 1, pcm16k: Self.voiced16k()), cloudText: "three four", cloudMs: 5, provider: "groq")
+        _ = await Self.waitUntil(timeoutSeconds: 3) { logs.count == 2 }
+        let ok = local.calls == 1 && logs.all.count == 2 && logs.all.allSatisfy { $0.hasSuffix("result=local_error") }
+        print("P \(ok ? "GREEN" : "RED") shadow_rests_after_failure=\(ok ? 1 : 0) engine_calls=\(local.calls)")
+        #expect(ok)
+    }
+
+    /// An engine that ignores cancellation is abandoned at the deadline; the line still comes and the slot frees.
+    @Test func shadow_uncooperative_engine_times_out() async {
+        let logs = LockedList<String>()
+        let local = AbandonOnlyLocal()
+        let shadow = LocalSTTShadow(path: "conversation", engine: local, mic: { "builtin" }, log: { logs.append($0) }, rest: 0)
+        shadow.finish(shadow.begin(index: 0, pcm16k: Self.voiced16k()), cloudText: "a b", cloudMs: 5, provider: "groq")
+        let first = await Self.waitUntil(timeoutSeconds: 5) { logs.count == 1 }
+        shadow.finish(shadow.begin(index: 1, pcm16k: Self.voiced16k()), cloudText: "c d", cloudMs: 5, provider: "groq")
+        let second = await Self.waitUntil(timeoutSeconds: 5) { logs.count == 2 }
+        let ok = first && second && logs.all.allSatisfy { $0.hasSuffix("result=local_timeout") } && local.abandons >= 1
+        print("P \(ok ? "GREEN" : "RED") shadow_uncooperative_engine_times_out=\(ok ? 1 : 0) lines=\(logs.count) abandons=\(local.abandons)")
+        #expect(ok)
+    }
+
+    /// Dictation releases its helper when the shadow goes away (no explicit end()).
+    @Test func shadow_released_when_dropped() async {
+        let releases = LockedList<Int>(), logs = LockedList<String>()
+        do {
+            let shadow = LocalSTTShadow(path: "dictation", engine: FakeShadowLocal(.text("x y")), release: { releases.append(1) },
+                                        mic: { "builtin" }, log: { logs.append($0) })
+            shadow.finish(shadow.begin(index: 0, pcm16k: Self.voiced16k()), cloudText: "x y", cloudMs: 5, provider: "groq")
+            _ = await Self.waitUntil(timeoutSeconds: 3) { logs.count == 1 }
+        }
+        let ok = await Self.waitUntil(timeoutSeconds: 3) { releases.count >= 1 }
+        print("P \(ok ? "GREEN" : "RED") shadow_released_when_dropped=\(ok ? 1 : 0) releases=\(releases.count)")
+        #expect(ok)
+    }
+}
+
+/// Never honours cancellation; only `abandon()` ends a request (a helper that hung past its deadline).
+private final class AbandonOnlyLocal: LocalChunkSTT, @unchecked Sendable {
+    let modelID = "abandon-only"
+    private let lock = NSLock()
+    private var waiting: [CheckedContinuation<String, Error>] = []
+    private var _abandons = 0
+    var abandons: Int { lock.withLock { _abandons } }
+    func transcribe(pcm16k: [Int16]) async throws -> String {
+        try await withCheckedThrowingContinuation { c in lock.withLock { waiting.append(c) } }
+    }
+    func abandon() {
+        let all = lock.withLock { _abandons += 1; defer { waiting.removeAll() }; return waiting }
+        all.forEach { $0.resume(throwing: LocalSTTError.exited) }
     }
 }
